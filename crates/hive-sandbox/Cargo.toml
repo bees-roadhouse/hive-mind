@@ -24,6 +24,7 @@ tokio-util.workspace = true
 clap.workspace = true
 humantime.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 hive-identity = { path = "../hive-identity" }
 hive-trust = { path = "../hive-trust" }
 hive-store = { path = "../hive-store" }
@@ -35,9 +36,12 @@ hive-egress = { path = "../hive-egress" }
 hive-httpapi = { path = "../hive-httpapi" }
 hive-wasmhost = { path = "../hive-wasmhost" }
 hive-webui = { path = "../hive-webui" }
+hive-mcp = { path = "../hive-mcp" }
+hive-surfaces = { path = "../hive-surfaces" }
 
 [dev-dependencies]
 tempfile.workspace = true
+hive-identity = { path = "../hive-identity" }
 socket2.workspace = true
 reqwest.workspace = true
 hive-testdb = { path = "../hive-testdb" }

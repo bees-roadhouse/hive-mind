@@ -23,6 +23,7 @@ Phase 0, and honest about the gap. What exists:
 | `crates/hive-blob` | the driver seam — disk and S3-compatible (Garage) drivers — and the reference layer |
 | `crates/hive-bus` | the events table as transport, NOTIFY as wakeup, SSE fan-out |
 | `crates/hive-mcp` | the tools tier: what `tools/list` shows is what `tools/call` accepts |
+| `crates/hive-surfaces` | hive-mcp's collaborators over the store and the wasm host, and the app routes |
 | `crates/hive-manifest` | the app declaration and everything derivable from it; pure, no I/O |
 | `crates/hive-registry` | manifest + module + Postgres = an installed app |
 | `crates/hive-harness` | hosted agent runs under Podman, persisted in Postgres |
@@ -54,8 +55,9 @@ the bus, and refuses until the bus has tailed once — serving before that
 publishes a replica whose stream resumes from a watermark it never established.
 
 Chat is built end to end: `docs/chat.md` covers the turn worker, the stream,
-and the browser client at `/`. What is still ahead: the workflow runner, app
-installs over the API, the MCP tools tier over HTTP, a container test that a
+and the browser client at `/`. The tool surface and app routes are served:
+`docs/surfaces.md` covers `POST /mcp` and `/apps/{app}/...`. What is still
+ahead: the workflow runner, app installs over the API, a container test that a
 real `claude` run resumes its session, and the journal app.
 [Issue #29](https://github.com/bees-roadhouse/hive-sandbox/issues/29)
 tracks the lot.

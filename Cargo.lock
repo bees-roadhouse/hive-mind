@@ -1866,6 +1866,7 @@ dependencies = [
 name = "hive-httpapi"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "chrono",
  "futures",
@@ -1875,12 +1876,15 @@ dependencies = [
  "hive-harness",
  "hive-httpauth",
  "hive-identity",
+ "hive-manifest",
+ "hive-mcp",
  "hive-sse",
  "hive-store",
  "hive-testdb",
  "hive-trust",
  "http 1.5.0",
  "mime",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
@@ -1971,6 +1975,7 @@ name = "hive-sandbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "clap",
  "futures",
@@ -1981,7 +1986,9 @@ dependencies = [
  "hive-harness",
  "hive-httpapi",
  "hive-identity",
+ "hive-mcp",
  "hive-store",
+ "hive-surfaces",
  "hive-testdb",
  "hive-trust",
  "hive-wasmhost",
@@ -2047,6 +2054,29 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "hive-surfaces"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hive-blob",
+ "hive-identity",
+ "hive-manifest",
+ "hive-mcp",
+ "hive-registry",
+ "hive-store",
+ "hive-testdb",
+ "hive-trust",
+ "hive-wasmhost",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",

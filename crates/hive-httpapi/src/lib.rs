@@ -7,10 +7,12 @@
 //! trigger (D19.3) and who may see data is enforced by the store's guard; the
 //! handlers below resolve facts from the presented token and pass them on.
 
+pub mod apps;
 mod blobs;
 mod chat;
 mod chatstream;
 mod credentials;
+pub mod mcp;
 mod readyz;
 mod session;
 
@@ -27,6 +29,7 @@ use hive_httpauth::Auth;
 use hive_store::{Chat, Store};
 use http::{HeaderMap, StatusCode, Uri, header};
 
+pub use apps::{AppError, AppRequest, AppResponse, AppRouter};
 pub use blobs::parse_range;
 
 /// What the daemon owns and the router borrows.
@@ -50,6 +53,11 @@ pub struct Options {
     /// Secure, or no browser would ever send it. Off by default; the operator
     /// says so once, deliberately (D26).
     pub plain_http: bool,
+    /// Enables `POST /mcp`. Absent, the endpoint is not mounted: a daemon with
+    /// no tool surface answers 404 rather than an empty list.
+    pub mcp: Option<Arc<hive_mcp::Server>>,
+    /// Enables `/apps/{app}/...`. Same rule.
+    pub apps: Option<Arc<dyn AppRouter>>,
 }
 
 #[derive(Clone)]
@@ -63,6 +71,8 @@ pub struct AppState {
     pub(crate) wake: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(crate) plain_http: bool,
     pub(crate) version: String,
+    pub(crate) mcp: Option<Arc<hive_mcp::Server>>,
+    pub(crate) apps: Option<Arc<dyn AppRouter>>,
 }
 
 impl FromRef<AppState> for Auth {
@@ -97,6 +107,8 @@ pub fn router(store: Option<Store>, bus: Option<Bus>, opts: Options) -> Router {
         wake: opts.wake,
         plain_http: opts.plain_http,
         version: opts.version,
+        mcp: opts.mcp,
+        apps: opts.apps,
     };
     // Liveness only, and deliberately so: see readyz for why this one must
     // not learn to check dependencies.
@@ -123,6 +135,20 @@ pub fn router(store: Option<Store>, bus: Option<Bus>, opts: Options) -> Router {
             // capability does. HEAD shares the handler so a client can size an
             // object before pulling it.
             app = app.route("/blobs/{hash}", get(blobs::read).head(blobs::read));
+        }
+        if state.mcp.is_some() {
+            // Stateless JSON-RPC. No GET: this server keeps no per-client
+            // stream, so there is nothing to subscribe to.
+            app = app.route("/mcp", post(mcp::rpc));
+        }
+        if state.apps.is_some() {
+            // Any method: the manifest decides which ones a route answers, and
+            // a method the app did not mount is a 404 from the router, not a
+            // 405 from here, because "does this route exist" is not a question
+            // this layer answers for a stranger.
+            app = app
+                .route("/apps/{app}", axum::routing::any(apps::root))
+                .route("/apps/{app}/{*rest}", axum::routing::any(apps::route));
         }
         if state.chat.is_some() {
             app = app

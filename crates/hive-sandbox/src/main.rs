@@ -216,6 +216,8 @@ async fn run() -> anyhow::Result<()> {
     let mut catalog: Option<Arc<Catalog>> = None;
     let mut chat: Option<Arc<Chat>> = None;
     let mut host: Option<Host> = None;
+    let mut mcp: Option<Arc<hive_mcp::Server>> = None;
+    let mut apps: Option<Arc<dyn hive_httpapi::AppRouter>> = None;
     let hub = Hub::default();
     let mut wake: Option<Arc<dyn Fn() + Send + Sync>> = None;
 
@@ -255,6 +257,21 @@ async fn run() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow!("wasm host: {e}"))?;
         tracing::info!(blob_driver = driver_name, "wasm host ready");
+
+        // The tool surface and the app routes, over this store and this host.
+        // One `Surfaces` is all three of hive-mcp's collaborators, so tools/list
+        // and tools/call cannot be given different answers by construction.
+        let surfaces = Arc::new(hive_surfaces::Surfaces::new(
+            st.clone(),
+            h.clone(),
+            cat.clone(),
+        ));
+        mcp = Some(Arc::new(hive_mcp::Server::new(
+            surfaces.clone(),
+            surfaces.clone(),
+            surfaces.clone(),
+        )));
+        apps = Some(Arc::new(AppRoutes(surfaces)) as Arc<dyn hive_httpapi::AppRouter>);
         host = Some(h);
 
         let b = Bus::new(st.pool().clone(), hive_bus::Config::default());
@@ -312,6 +329,8 @@ async fn run() -> anyhow::Result<()> {
                 hub: Some(hub.clone()),
                 wake: wake.clone(),
                 plain_http: args.plain_http,
+                mcp: mcp.clone(),
+                apps: apps.clone(),
             },
         )
         // The browser client, at the root. Two patterns that no API route
@@ -575,4 +594,41 @@ fn egress_proxy(
             ..Default::default()
         },
     )))
+}
+
+/// The app-route seam of the HTTP surface, over the surfaces crate. The daemon
+/// is the composition root, so the adapter lives here and both libraries stay
+/// ignorant of each other.
+struct AppRoutes(Arc<hive_surfaces::Surfaces>);
+
+#[async_trait::async_trait]
+impl hive_httpapi::AppRouter for AppRoutes {
+    async fn call(
+        &self,
+        req: hive_httpapi::AppRequest,
+    ) -> Result<hive_httpapi::AppResponse, hive_httpapi::AppError> {
+        use hive_httpapi::{AppError, AppResponse};
+        use hive_surfaces::{RouteCall, RouteError};
+        let res = self
+            .0
+            .call_route(RouteCall {
+                cred: req.cred,
+                app: req.app,
+                method: req.method,
+                path: req.path,
+                query: req.query,
+                body: req.body,
+            })
+            .await
+            .map_err(|e| match e {
+                RouteError::NotFound => AppError::NotFound,
+                RouteError::BadRequest(d) => AppError::BadRequest(d),
+                RouteError::Failed(d) => AppError::Failed(d),
+            })?;
+        Ok(AppResponse {
+            body: res.output,
+            trust: res.trust,
+            tainted_by: res.tainted_by,
+        })
+    }
 }

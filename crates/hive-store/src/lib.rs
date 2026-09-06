@@ -65,8 +65,8 @@ pub use events::{
     resolve_cursor, tail, tail_window, valid_event_kind,
 };
 pub use grants::{
-    Access, GrantSource, GrantSpec, Guard, Reason, Subject, SubjectKind, UnshareResult,
-    enter_break_glass, materialize_inherited, revoke_grant, unshare, write_grant,
+    Access, ActingInstall, GrantSource, GrantSpec, Guard, Reason, Subject, SubjectKind,
+    UnshareResult, enter_break_glass, materialize_inherited, revoke_grant, unshare, write_grant,
 };
 pub use guestblobs::GuestBlobs;
 pub use guestevents::{GuestEvents, platform_kind, visible_to};

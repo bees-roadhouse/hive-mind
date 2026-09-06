@@ -108,6 +108,12 @@ pub enum Reason {
     Grant,
     Org,
     Override,
+    /// D33: the principal was allowed AND the asking install holds a grant for
+    /// this collection. It is reported in place of the principal's own reason
+    /// because the install grant is the narrower of the two, so provenance
+    /// names the row a person can revoke to shut one app out without touching
+    /// their own access.
+    InstallGrant,
 }
 
 impl Reason {
@@ -117,6 +123,7 @@ impl Reason {
             Reason::Grant => "grant",
             Reason::Org => "org_grant",
             Reason::Override => "override",
+            Reason::InstallGrant => "install_grant",
         }
     }
 
@@ -126,6 +133,11 @@ impl Reason {
             "grant" => Reason::Grant,
             "org_grant" => Reason::Org,
             "override" => Reason::Override,
+            "install_grant" => Reason::InstallGrant,
+            // A reason the predicate returns and this enum does not know is a
+            // deny here, which is fail-closed but silent: an allowed access
+            // would be reported as denied and look like a policy bug. The
+            // migration and this match are edited together.
             _ => return None,
         })
     }
@@ -189,6 +201,24 @@ impl Subject {
     }
 }
 
+/// Which install a call is being made THROUGH, when it is being made through
+/// one at all (D33).
+///
+/// This is the dimension `access_decision` was missing: a `collection` subject
+/// resolves its owner to the INSTALL's owner, so without this the predicate
+/// cannot tell one of a principal's apps from another and every collection
+/// grant it derives decides nothing (invariant 14).
+///
+/// `None` means the call is not being made through an install ... a person on
+/// the HTTP surface reading their own data. It does NOT mean "unrestricted",
+/// and the difference matters: SQL cannot tell an argument that was omitted
+/// from one that was deliberately absent, so `authorize` REFUSES a collection
+/// subject outright and `authorize_collection` is the only way to decide one.
+/// That is a runtime refusal with a test behind it, not a type-level barrier,
+/// and it is written down as such rather than dressed up as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ActingInstall(pub Uuid);
+
 /// Answers "may this actor do this" and is the only thing in the platform
 /// allowed to. It holds no policy of its own: every decision comes from
 /// `access_decision()`, the SQL function migration one installs.
@@ -227,9 +257,10 @@ impl Guard {
         cred: &Credential,
         subj: &Subject,
         access: Access,
+        acting: Option<ActingInstall>,
     ) -> Result<(Option<Reason>, Option<Uuid>)> {
         let row = sqlx::query(
-            "SELECT reason, grant_id FROM access_decision($1, $2, $3, $4, $5, $6, $7, now())",
+            "SELECT reason, grant_id FROM access_decision($1, $2, $3, $4, $5, $6, $7, now(), $8)",
         )
         .bind(subj.kind.as_str())
         .bind(subj.id)
@@ -238,6 +269,7 @@ impl Guard {
         .bind(cred.principal_id)
         .bind(cred.actor_id)
         .bind(access.as_str())
+        .bind(acting.map(|a| a.0))
         .fetch_one(&mut *db)
         .await
         .map_err(|e| StoreError::db("access_decision", e))?;
@@ -256,7 +288,65 @@ impl Guard {
         access: Access,
         note: &str,
     ) -> Result<Reason> {
-        let (reason, grant_id) = self.decision(db, cred, subj, access).await?;
+        // D33. A collection decision depends on which install is asking, and
+        // this signature has nowhere to say. Refusing here is what stops the
+        // dimension being dropped by a caller who simply did not know about
+        // it: the alternative default, "no acting install means no
+        // restriction", is the fail-open one and it is invisible at the call
+        // site. Every collection goes through `authorize_collection`.
+        if subj.kind == SubjectKind::Collection {
+            return Err(StoreError::Other(
+                "collection access must go through Guard::authorize_collection, \
+                 which requires the acting install (D33)"
+                    .into(),
+            ));
+        }
+        self.decide_and_audit(db, cred, subj, access, None, note)
+            .await
+    }
+
+    /// The collection decision, which is the only one that needs to know which
+    /// app is asking (D33).
+    ///
+    /// `acting` is not optional-by-omission: a caller has to write `None` and
+    /// mean it. `None` is the person-on-the-HTTP-surface case; a guest
+    /// invocation always has an install and always passes it.
+    pub async fn authorize_collection(
+        &self,
+        db: &mut PgConnection,
+        cred: &Credential,
+        subj: &Subject,
+        acting: Option<ActingInstall>,
+        access: Access,
+        note: &str,
+    ) -> Result<Reason> {
+        // The mirror of the refusal in `authorize`, so the pair is exhaustive:
+        // a collection can only be decided here, and only a collection is.
+        // Without this the method would quietly accept a tool or entity subject
+        // and silently ignore `acting`, which is a worse failure than either
+        // refusal because it looks like it did something.
+        if subj.kind != SubjectKind::Collection {
+            return Err(StoreError::Other(format!(
+                "authorize_collection got a {} subject; use Guard::authorize",
+                subj.kind
+            )));
+        }
+        self.decide_and_audit(db, cred, subj, access, acting, note)
+            .await
+    }
+
+    /// What both of the above are: one decision, one audit obligation. Kept
+    /// private so there is still no exported entry point that skips the audit.
+    async fn decide_and_audit(
+        &self,
+        db: &mut PgConnection,
+        cred: &Credential,
+        subj: &Subject,
+        access: Access,
+        acting: Option<ActingInstall>,
+        note: &str,
+    ) -> Result<Reason> {
+        let (reason, grant_id) = self.decision(db, cred, subj, access, acting).await?;
         let reason = reason.ok_or(StoreError::Denied)?;
         if reason == Reason::Override {
             // Refuse the access rather than let it happen unaudited.
@@ -353,7 +443,9 @@ impl Guard {
         };
         if r == Reason::Override {
             let subj = Subject::tool(install_id, tool);
-            let (_, grant_id) = self.decision(db, cred, &subj, Access::Call).await?;
+            // A tool subject, never a collection: D33's dimension does not
+            // apply and `None` here is the fact, not a default.
+            let (_, grant_id) = self.decision(db, cred, &subj, Access::Call, None).await?;
             self.record_override(cred, &subj, Access::Call, grant_id, "tool call")
                 .await
                 .map_err(|e| {
@@ -389,7 +481,8 @@ impl Guard {
         };
         if r == Reason::Override {
             let subj = Subject::named(SubjectKind::Route, install_id, route);
-            let (_, grant_id) = self.decision(db, cred, &subj, Access::Call).await?;
+            // A route subject, never a collection. As above.
+            let (_, grant_id) = self.decision(db, cred, &subj, Access::Call, None).await?;
             self.record_override(cred, &subj, Access::Call, grant_id, "route call")
                 .await
                 .map_err(|e| {
@@ -495,7 +588,9 @@ impl Guard {
         // do not leave this function.
         for id in overrides {
             let subj = Subject::new(kind, id);
-            let (_, grant_id) = self.decision(db, cred, &subj, access).await?;
+            // `kind` is Entity or Conversation on every path that reaches here;
+            // neither is install-scoped, so there is no asking install to name.
+            let (_, grant_id) = self.decision(db, cred, &subj, access, None).await?;
             self.record_override(cred, &subj, access, grant_id, "list")
                 .await
                 .map_err(|e| {

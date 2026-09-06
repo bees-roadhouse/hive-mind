@@ -1,6 +1,6 @@
 # The toolchain the born-green gate runs in.
 #
-# This exists so the gate does not require a Rust toolchain, node and the wasm
+# This exists so the gate does not require a Rust toolchain and the wasm
 # target installed on the machine ... only Podman, which the harness and egress
 # tiers already require. `scripts/gate-container.sh` mounts the checkout into
 # this and runs the ordinary `scripts/gate-rust.sh` inside it, so there is one
@@ -16,15 +16,13 @@ FROM docker.io/library/rust:1.98-bookworm AS gate
 RUN rustup component add clippy rustfmt \
     && rustup target add wasm32-wasip1
 
-# The browser client's build, so the gate can rebuild web/dist and refuse a
-# diff. Node from Debian's repository rather than nodesource: the gate needs
-# `npm ci` and `vite build`, nothing version-sensitive.
+# The browser client is server-rendered (D32); the gate needs no node.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm git \
+    && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
 # The gate shells out to these. Failing here beats failing three minutes into
 # a run with a confusing message from a script that assumed a coreutil.
-RUN command -v git >/dev/null && command -v cargo >/dev/null && command -v npm >/dev/null
+RUN command -v git >/dev/null && command -v cargo >/dev/null
 
 WORKDIR /src

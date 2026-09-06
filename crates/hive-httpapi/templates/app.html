@@ -1,0 +1,22 @@
+{% extends "layout.html" %}
+{% block content %}
+<main id="app" class="app">
+  <aside class="sidebar">
+    <form id="new-conversation" class="new" hx-post="/ui/conversations" hx-target="#conversations" hx-swap="outerHTML">
+      <select id="runtime" name="runtime" aria-label="Runtime">
+        <option value="claude">claude</option>
+        <option value="codex">codex</option>
+        <option value="opencode">opencode</option>
+      </select>
+      <input id="model" name="model" placeholder="model (optional)" maxlength="100">
+      <input id="title" name="title" placeholder="title (optional)" maxlength="200">
+      <button class="primary" type="submit">New conversation</button>
+    </form>
+    {{ conversations|safe }}
+  </aside>
+  <section id="thread" class="thread">
+    <div id="empty" class="hint center">Pick a conversation, or start one.</div>
+  </section>
+</main>
+{% endblock %}
+{% block scripts %}<script src="/assets/stream.js"></script>{% endblock %}

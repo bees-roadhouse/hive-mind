@@ -10,7 +10,7 @@ travels through them:
 | data layer | `crates/hive-store/src/chat.rs` | every read and write on the chat tables; the only code that touches them |
 | worker | `crates/hive-chat` | a turn becomes one harness run; the hub that makes a stream live |
 | HTTP | `crates/hive-httpapi/src/chat.rs`, `chatstream.rs`, `session.rs` | the routes, the stream, the browser's cookie |
-| page | `web/` (Solid.js), served by `crates/hive-webui` | the browser client, built into `web/dist`, embedded, served at `/` |
+| page | `crates/hive-httpapi/src/ui.rs` and `templates/`, assets from `crates/hive-webui` | the browser client: pages and fragments rendered by the daemon, swapped by htmx, served at `/` |
 
 ## A turn is one run
 
@@ -107,25 +107,30 @@ header: a security property the network can shape is not a property
 
 ## The page
 
-`web/` is a Solid.js shell built by Vite into `web/dist` (three files: the
-page, `app.js`, `styles.css`), which `crates/hive-webui` embeds into the daemon
-and serves at `/` and `/ui/*`. The token is pasted once, exchanged for the
-cookie over `POST /session`, and never held by the page again: not in storage,
-not in a URL. Solid renders every interpolation as a text node, never markup,
-and the daemon's Content-Security-Policy is `default-src 'none'` with `'self'`
-for script, style and connections, so a message that somehow became markup
-would still have nowhere to go. Tests fail if `index.html` grows an inline
-script or style, or if the bundle starts touching `localStorage`.
+The client is server-rendered (D32). `GET /` answers the sign-in card to a
+browser without a session and the app to one with a cookie; `hive-httpapi`'s
+`ui.rs` renders both from askama templates, and every list, thread, message
+and composer is a fragment under `/ui/...` that htmx swaps in. Two scripts,
+embedded by `crates/hive-webui` under `/assets/`, do what a page cannot:
+`login.js` presents the token once over the Authorization header and reloads,
+so the cookie carries the session from then on and the page never holds the
+credential; `stream.js` keeps a conversation's SSE stream open and appends
+the agent's text as it arrives, through `textContent` only.
 
-`web/dist` is committed because the daemon embeds it at compile time and a
-checkout with no node must still build. The gate rebuilds it when npm is
-present and refuses a diff; CI always rebuilds it.
+Escaping is the template engine's and the policy is the daemon's:
+`default-src 'none'` with `'self'` for script, style and connections, no
+inline anything, htmx configured with `allowEval` off. A message that somehow
+became markup would still be text on the page and would still have nowhere to
+go. Mutating fragment routes require htmx's `HX-Request` header, which a
+cross-site form cannot set, on top of the cookie's `SameSite=Strict`.
 
-`test/e2e/specs/chat.spec.ts` drives it in a real browser: sign in, start a
-thread, post, see the message waiting for an agent, reload and still see it,
-sign out. The daemon under that suite runs with `--run-chat=false`, so nothing
-answers; a spec that wants an answered turn needs a fixture with a harness
-image and is not written yet.
+Tests: `crates/hive-httpapi/tests/ui.rs` asserts the pages, the fragments and
+the escaping without a browser; `crates/hive-webui/tests` the assets and that
+the scripts never touch storage; `test/e2e/specs/chat.spec.ts` drives the real
+thing in chromium: sign in, start a thread, post, see the message waiting for
+an agent, reload and still see it, sign out. The daemon under that suite runs
+with `--run-chat=false`, so nothing answers; a spec that wants an answered turn
+needs a fixture with a harness image and is not written yet.
 
 ## Running the worker
 

@@ -24,6 +24,8 @@ sqlx.workspace = true
 mime.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+askama.workspace = true
+serde_urlencoded.workspace = true
 hive-identity = { path = "../hive-identity" }
 hive-trust = { path = "../hive-trust" }
 hive-store = { path = "../hive-store" }
@@ -34,6 +36,7 @@ hive-harness = { path = "../hive-harness" }
 hive-httpauth = { path = "../hive-httpauth" }
 hive-sse = { path = "../hive-sse" }
 hive-mcp = { path = "../hive-mcp" }
+hive-webui = { path = "../hive-webui" }
 
 [dev-dependencies]
 reqwest.workspace = true

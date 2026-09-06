@@ -1,0 +1,3 @@
+{% for m in items %}    <div class="msg {{ m.role }}" data-seq="{{ m.seq }}"><span class="who">{{ m.who }}</span><span>{{ m.body }}</span></div>
+{% endfor %}{% for t in live %}    <div class="msg agent live" data-request="{{ t.request_seq }}"><span class="who thinking">{{ t.label }}</span><span class="text"></span></div>
+{% endfor %}

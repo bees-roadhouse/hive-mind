@@ -36,25 +36,6 @@ step() {
   "$@" || failed+=("$name")
 }
 
-# The browser client is a committed build (web/dist) embedded into the daemon.
-# When node is present the gate rebuilds it and refuses a diff, so a change to
-# web/ that nobody rebuilt cannot ship stale bytes. Without node the committed
-# build is what gets embedded, and CI has node.
-if command -v npm >/dev/null 2>&1; then
-  echo "==> web"
-  if (cd web && npm ci --no-fund --no-audit --silent && npm run --silent typecheck && npm run --silent build); then
-    if ! git diff --quiet -- web/dist; then
-      echo "web/dist is out of date with web/src; commit the rebuilt files:" >&2
-      git --no-pager diff --stat -- web/dist >&2
-      failed+=("web-dist")
-    fi
-  else
-    failed+=("web")
-  fi
-else
-  echo "==> web (npm not found; embedding the committed web/dist as is)"
-fi
-
 step fmt cargo fmt --all -- --check
 step clippy cargo clippy --workspace --all-targets -- -D warnings
 step build cargo build --workspace --all-targets

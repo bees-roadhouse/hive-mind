@@ -30,9 +30,8 @@ Phase 0, and honest about the gap. What exists:
 | `crates/hive-egress` | the allowlisting proxy a run reaches the internet through |
 | `crates/hive-httpapi` | liveness, readiness, events, enrollment, blob reads, session and chat |
 | `crates/hive-chat` | a message becomes one hosted agent run; the worker, its heartbeat and the reclaimers |
-| `crates/hive-webui` | the browser client, embedded and served at `/` |
+| `crates/hive-webui` | the browser client's static assets: stylesheet, vendored htmx, two scripts |
 | `crates/hive-sandbox` | the daemon: every role in one process, on a port and a unix socket |
-| `web/` | the Solid.js client, built into `web/dist` |
 | `guest/`, `apps/hello` | the guest SDK and the reference guest |
 
 **The daemon composes.** It opens the store, migrates, bootstraps an empty
@@ -55,7 +54,7 @@ the bus, and refuses until the bus has tailed once — serving before that
 publishes a replica whose stream resumes from a watermark it never established.
 
 Chat is built end to end: `docs/chat.md` covers the turn worker, the stream,
-and the browser client at `/`. The tool surface and app routes are served:
+and the browser client at `/`, which the daemon renders and htmx swaps (D32). The tool surface and app routes are served:
 `docs/surfaces.md` covers `POST /mcp` and `/apps/{app}/...`. What is still
 ahead: the workflow runner, app installs over the API, a container test that a
 real `claude` run resumes its session, and the journal app.
@@ -122,14 +121,11 @@ fixture and never rebuilt.
 
 ## Browser client
 
-`web/` is Solid.js on Vite. `npm run build` there writes `web/dist`, which is
-committed because `crates/hive-webui` embeds it at compile time. The gate
-rebuilds it when npm is present and refuses a diff, so a change to `web/src`
-that nobody rebuilt cannot ship stale bytes.
-
-```bash
-cd web && npm install && npm run build
-```
+Server-rendered by the daemon and swapped by htmx (D32). Pages and fragments
+are askama templates in `crates/hive-httpapi/templates/`; the stylesheet, a
+vendored htmx and two small scripts are embedded from
+`crates/hive-webui/assets/`. There is nothing to build and no node in the
+gate; `docs/chat.md` says how the pieces fit.
 
 ## Development
 

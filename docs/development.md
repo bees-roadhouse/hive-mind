@@ -9,7 +9,7 @@ From nothing to a passing test suite. Assumes you have none of this installed.
 | **Rust** via rustup | the daemon; `rust-toolchain.toml` pins 1.98 with clippy and rustfmt, rustup installs it on first `cargo` | https://rustup.rs | `winget install Rustlang.Rustup` |
 | **`wasm32-wasip1`** | building guests (`rustup target add wasm32-wasip1`); not needed to run the tests, the built guests are checked in | same | same |
 | **Podman 5+**       | local Postgres (Docker works too); the harness and egress tiers | `brew install podman` / your package manager | `winget install RedHat.Podman-Desktop` |
-| **Node 20+**        | the browser client's build and the Playwright suite | `brew install node` / nvm | `winget install OpenJS.NodeJS.LTS` |
+| **Node 20+**        | the Playwright suite only | `brew install node` / nvm | `winget install OpenJS.NodeJS.LTS` |
 
 One PATH note that has already bitten someone: rustup installs to
 `~/.cargo/bin`, and a shell opened before the install does not have it. The
@@ -68,7 +68,6 @@ refuses to run without the variable.
 ./scripts/gate-rust.sh
 ```
 
-Rebuilds `web/dist` when npm is present and refuses a diff, then
 `cargo fmt --check`, `cargo clippy -D warnings`, `cargo build --all-targets`,
 `cargo test --workspace`, then a named list of every test that printed
 `SKIPPED:`. It prints `GATE GREEN` or `GATE RED: <steps>`.
@@ -77,7 +76,7 @@ Read the output, not an exit code. A piped `| tail` or a chained `&&` reports
 the status of the last thing in the pipe, which is how a red gate gets pushed.
 
 No toolchain? `./scripts/gate-container.sh` builds a Podman image with Rust,
-clippy, rustfmt, the wasm target and node, and runs the same script inside it.
+clippy, rustfmt and the wasm target, and runs the same script inside it.
 Anything after `--` runs there in place of the gate:
 
 ```bash
@@ -131,18 +130,38 @@ Two things worth knowing before you write a store test:
 were written against the migrations alone, before any Rust behaviour existed,
 which is the tests-first rule of D24 in practice.
 
-## Build the browser client
+## The browser client
 
-```bash
-cd web
-npm install
-npm run typecheck
-npm run build        # writes web/dist, which is committed
-```
+There is nothing to build. Pages are rendered by `crates/hive-httpapi` from
+`crates/hive-httpapi/templates/`; the stylesheet, the vendored htmx and the two
+scripts live in `crates/hive-webui/assets/` and are embedded at compile time.
+Edit a template or an asset and `cargo build`; `docs/chat.md` says how the
+pieces fit.
 
-`crates/hive-webui` embeds `web/dist` at compile time, so a checkout with no
-node still builds the daemon. Commit the rebuilt `web/dist` with any change to
-`web/src`; the gate and CI refuse a diff.
+## Working on the fleet desktop (trh-lib-dsk001)
+
+Rules that were paid for, so they are in git rather than in one profile's
+memory:
+
+- Rust lives at `~/.cargo/bin`, which a Claude shell does not have on `PATH`.
+  `export PATH="$HOME/.cargo/bin:$PATH"` first.
+- The test database is the podman container `hive-sandbox-pg-rust` on
+  **55434** (user and database `hive_sandbox`), because `nectar-p3-pg` holds
+  the 55432 that `db-up.sh` uses. It does not autostart: `podman start
+  hive-sandbox-pg-rust` after a reboot. Read the password from the container
+  (`podman inspect ... Config.Env`); never type it into a transcript.
+- **The box dies on disk, not CPU.** Three sessions linking Rust at once on the
+  single LUKS NVMe froze the desktop with the CPU half idle. Pinning cargo to
+  four cores was the wrong dimension. The rule: one cargo at a time across
+  every session, `-j 4` (or `CARGO_BUILD_JOBS=4`), `pgrep -x rust-lld` before
+  starting and wait if another session is linking, and targeted suites
+  (`cargo test -p crate --test file`) rather than `--workspace` loops; CI runs
+  the whole gate.
+- Keep the whole output of a long run in a file and grep it afterwards. A
+  `| tail` on the gate threw away the one failure and cost a rerun.
+- `pkill -f` with a pattern that appears in your own command line kills the
+  Claude shell itself (exit 144). Kill by pid.
+- No chromium here, so the e2e suite is typechecked locally and run by CI.
 
 ## Run the e2e tests
 

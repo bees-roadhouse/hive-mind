@@ -19,8 +19,9 @@ ARG VERSION=dev
 # The binary reports this from --version and /healthz; scripts/image-build.sh
 # reads it back out of the image to prove it reached the build.
 ENV HIVE_SANDBOX_VERSION=${VERSION}
-# web/dist is committed and embedded at compile time (crates/hive-webui), so
-# the build needs no node. The release profile carries lto and strip.
+# The browser client is server-rendered and its assets are embedded at compile
+# time (crates/hive-webui), so the build needs no node. The release profile
+# carries lto and strip.
 RUN cargo build --release -p hive-sandbox \
     && cp target/release/hive-sandbox /out-hive-sandbox
 

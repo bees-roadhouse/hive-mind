@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"selfRequestsOnly":true,"historyCacheSize":0,"includeIndicatorStyles":false}'>
+<title>hive</title>
+<link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+<header>
+  <span class="brand">hive</span>
+  <span id="identity" class="identity">{{ identity }}</span>
+  {% if signed_in %}<form id="logout-form" hx-post="/ui/logout" hx-swap="none"><button id="logout" class="ghost" type="submit">sign out</button></form>{% endif %}
+</header>
+{% block content %}{% endblock %}
+<p id="notice" class="notice" hidden></p>
+<script src="/assets/htmx.min.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

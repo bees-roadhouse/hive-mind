@@ -363,6 +363,42 @@ impl Guard {
         Ok(Some(r))
     }
 
+    /// The route twin of `tool_reason`, over `route_access_reason` (migration
+    /// 0004): an install grant with no route allowlist implies every route the
+    /// app mounts; with one, exactly those. A route is named
+    /// `"<METHOD> <path template>"`, which the manifest keeps unique per app.
+    pub async fn route_reason(
+        &self,
+        db: &mut PgConnection,
+        cred: &Credential,
+        install_id: Uuid,
+        route: &str,
+    ) -> Result<Option<Reason>> {
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT route_access_reason($1, $2, $3, $4, $5, now())")
+                .bind(install_id)
+                .bind(route)
+                .bind(cred.principal_kind.as_str())
+                .bind(cred.principal_id)
+                .bind(cred.actor_id)
+                .fetch_one(&mut *db)
+                .await
+                .map_err(|e| StoreError::db("route_access_reason", e))?;
+        let Some(r) = reason.as_deref().and_then(Reason::parse) else {
+            return Ok(None);
+        };
+        if r == Reason::Override {
+            let subj = Subject::named(SubjectKind::Route, install_id, route);
+            let (_, grant_id) = self.decision(db, cred, &subj, Access::Call).await?;
+            self.record_override(cred, &subj, Access::Call, grant_id, "route call")
+                .await
+                .map_err(|e| {
+                    StoreError::Other(format!("override audit failed, access refused: {e}"))
+                })?;
+        }
+        Ok(Some(r))
+    }
+
     /// The set-read form, and it carries the same audit obligation as the point
     /// check.
     ///

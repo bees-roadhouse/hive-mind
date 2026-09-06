@@ -1,0 +1,31 @@
+[package]
+name = "hive-surfaces"
+description = "Where the MCP tool surface and the app routes meet the store and the wasm host"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+hive-identity = { path = "../hive-identity" }
+hive-trust = { path = "../hive-trust" }
+hive-manifest = { path = "../hive-manifest" }
+hive-store = { path = "../hive-store" }
+hive-blob = { path = "../hive-blob" }
+hive-wasmhost = { path = "../hive-wasmhost" }
+hive-mcp = { path = "../hive-mcp" }
+
+[dev-dependencies]
+tempfile.workspace = true
+hive-testdb = { path = "../hive-testdb" }
+hive-registry = { path = "../hive-registry" }

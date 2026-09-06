@@ -38,6 +38,10 @@ pub struct Setup {
     pub run_bus: bool,
     /// No bus at all: the /events route is not mounted.
     pub no_bus: bool,
+    /// Mounts POST /mcp over this server.
+    pub mcp: Option<Arc<hive_mcp::Server>>,
+    /// Mounts /apps/{app}/... over this router.
+    pub apps: Option<Arc<dyn hive_httpapi::AppRouter>>,
 }
 
 impl Api {
@@ -99,6 +103,8 @@ impl Api {
                     w.fetch_add(1, Ordering::SeqCst);
                 })),
                 plain_http: setup.plain_http,
+                mcp: setup.mcp.clone(),
+                apps: setup.apps.clone(),
                 ..Default::default()
             },
         );

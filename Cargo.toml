@@ -16,6 +16,7 @@ members = [
     "crates/hive-wasmhost",
     "crates/hive-registry",
     "crates/hive-mcp",
+    "crates/hive-surfaces",
     "crates/hive-sse",
     "crates/hive-httpauth",
     "crates/hive-bus",

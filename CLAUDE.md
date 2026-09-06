@@ -246,6 +246,9 @@ crates/hive-harness/   hosted agent runs (claude / codex / opencode), rootless P
                        supervisor that drains, deadlines and terminates
 crates/hive-egress/    the allowlisting proxy a harness run reaches the internet through
 crates/hive-mcp/       the tool surface. Everything tools/list shows, tools/call accepts
+crates/hive-surfaces/  hive-mcp's three collaborators over the store and the wasm host, plus the
+                       app routes: the candidate installs, the predicate, the dispatcher. The
+                       daemon composes it; nothing here listens
 crates/hive-chat/      a message becomes one hosted agent run. The turn worker, its heartbeat,
                        the reclaimers, and the in-process hub a stream subscribes to
 crates/hive-sse/       the SSE frame writer, shared by /events and the chat stream

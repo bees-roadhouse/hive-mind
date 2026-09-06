@@ -555,14 +555,22 @@ async fn events_reject_a_timestamp_ahead_of_the_clock() {
 // --- the migrator -----------------------------------------------------------
 
 /// Migrating twice applies nothing the second time, and what it recorded is
-/// what the Go migrator would have recorded: the same versions, sha256 hex.
+/// every embedded migration in order, with sha256 hex checksums. The expected
+/// list is the embedded one rather than a literal: the literal was a parity
+/// check against the Go migrator (D31 removed it), and hive-schema's own test
+/// keeps the embedded list honest against the directory.
 #[tokio::test]
 async fn migrate_is_idempotent_and_records_checksums() {
     let Some(db) = TestDb::new("migrate_is_idempotent").await else {
         return;
     };
+    let expected: Vec<&str> = hive_store::MIGRATIONS.iter().map(|m| m.version).collect();
+    assert!(
+        expected.len() >= 4,
+        "the embedded list lost entries: {expected:?}"
+    );
     let first = hive_store::migrate(db.pool()).await.expect("first migrate");
-    assert_eq!(first, vec!["0001", "0002", "0003"]);
+    assert_eq!(first, expected);
     let second = hive_store::migrate(db.pool())
         .await
         .expect("second migrate");
@@ -573,7 +581,7 @@ async fn migrate_is_idempotent_and_records_checksums() {
             .fetch_all(db.pool())
             .await
             .expect("read schema_migrations");
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), expected.len());
     for (version, _, checksum) in &rows {
         let m = hive_store::MIGRATIONS
             .iter()

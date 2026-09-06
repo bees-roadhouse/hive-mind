@@ -43,6 +43,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "chat",
         sql: include_str!("../migrations/0003_chat.sql"),
     },
+    Migration {
+        version: "0004",
+        name: "route_access",
+        sql: include_str!("../migrations/0004_route_access.sql"),
+    },
 ];
 
 /// The shared directory, for the test that keeps `MIGRATIONS` honest.

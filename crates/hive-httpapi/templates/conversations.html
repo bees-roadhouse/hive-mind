@@ -1,0 +1,3 @@
+<ul id="conversations" class="list"{% if oob %} hx-swap-oob="true"{% endif %}>
+{% for c in items %}  <li data-id="{{ c.id }}"{% if c.active %} class="active"{% endif %} hx-get="/ui/conversations/{{ c.id }}" hx-target="#thread" hx-swap="outerHTML"><span>{{ c.title }}</span><span class="meta">{{ c.meta }}</span></li>
+{% endfor %}</ul>

@@ -24,9 +24,6 @@
 /guest/target/
 /apps/*/target/
 
-# The browser client's build is committed (web/dist, embedded by
-# crates/hive-webui); its dependencies are not.
-/web/node_modules/
 
 # gate-container.sh's cargo caches, mounted into the container from here so
 # they survive between runs. Never source code.

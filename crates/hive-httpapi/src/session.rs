@@ -57,7 +57,7 @@ pub(crate) async fn end(State(s): State<AppState>) -> Response {
 /// Secure by default. The flag, not the request, decides: a security property
 /// read off the request's scheme or a forwarded header is a property the
 /// network gets to choose, and it is silent.
-fn cookie(value: &str, clear: bool, plain_http: bool) -> HeaderValue {
+pub(crate) fn cookie(value: &str, clear: bool, plain_http: bool) -> HeaderValue {
     let mut c = format!("{SESSION_COOKIE}={value}; Path=/");
     if clear {
         c.push_str("; Max-Age=0");

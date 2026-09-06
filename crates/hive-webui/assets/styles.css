@@ -82,3 +82,6 @@ label input { margin-top: .3rem; }
   .app { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
   .sidebar { max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
 }
+
+/* htmx: the element being swapped, and the request in flight. */
+.htmx-request .primary { opacity: .6; }

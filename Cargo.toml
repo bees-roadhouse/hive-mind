@@ -79,6 +79,8 @@ clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"
 rust-embed = { version = "8", features = ["include-exclude", "debug-embed"] }
 mime_guess = "2"
+askama = "0.16"
+serde_urlencoded = "0.7"
 socket2 = "0.6"
 wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "async", "std", "parallel-compilation", "cache", "wat"] }
 wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }

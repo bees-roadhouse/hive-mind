@@ -1,4 +1,5 @@
-//! Ported from webui_test.go.
+//! The asset server: the right bytes, under the policy, and nothing an API
+//! route owns. The pages are rendered by hive-httpapi and tested there.
 
 use axum::Router;
 use axum::routing::get;
@@ -19,19 +20,21 @@ async fn serve(app: Router) -> (String, CancellationToken) {
 }
 
 #[tokio::test]
-async fn page_and_assets_are_served_under_policy() {
-    // A route the API would own must not be shadowed by the file server.
-    let app =
-        hive_webui::router().route("/conversations", get(|| async { StatusCode::IM_A_TEAPOT }));
+async fn assets_are_served_under_policy_and_shadow_nothing() {
+    let app = hive_webui::router()
+        .route("/conversations", get(|| async { StatusCode::IM_A_TEAPOT }))
+        .route("/", get(|| async { StatusCode::IM_A_TEAPOT }));
     let (url, cancel) = serve(app).await;
     let client = reqwest::Client::new();
     for (path, status, content_type, contains) in [
-        ("/", 200, "text/html", "<title>hive</title>"),
-        ("/ui/app.js", 200, "text/javascript", "EventSource"),
-        ("/ui/styles.css", 200, "text/css", "body"),
-        ("/ui/nope.js", 404, "", ""),
-        ("/ui/index.html/../Cargo.toml", 404, "", ""),
+        ("/assets/htmx.min.js", 200, "text/javascript", "htmx"),
+        ("/assets/login.js", 200, "text/javascript", "/session"),
+        ("/assets/stream.js", 200, "text/javascript", "EventSource"),
+        ("/assets/styles.css", 200, "text/css", "body"),
+        ("/assets/nope.js", 404, "", ""),
+        ("/assets/styles.css/../Cargo.toml", 404, "", ""),
         ("/conversations", 418, "", ""),
+        ("/", 418, "", ""),
     ] {
         let res = client.get(format!("{url}{path}")).send().await.unwrap();
         assert_eq!(res.status().as_u16(), status, "{path}");
@@ -71,42 +74,32 @@ async fn page_and_assets_are_served_under_policy() {
     cancel.cancel();
 }
 
-/// The page must not carry inline script or style, or the policy that keeps a
-/// rendered message inert would have to be loosened to run the page itself.
+/// The scripts never put a token in a URL or in script-readable storage: the
+/// sign-in script exchanges it once for the cookie. Asserted against the
+/// embedded bytes, so a change that starts remembering a credential fails
+/// here.
 #[test]
-fn page_has_no_inline_script_or_style() {
-    let page =
-        String::from_utf8(hive_webui::page("index.html").expect("index.html is embedded")).unwrap();
-    for forbidden in [
-        "<script>",
-        "<style>",
-        " onclick=",
-        " onload=",
-        "javascript:",
-        "style=\"",
-    ] {
-        assert!(
-            !page.contains(forbidden),
-            "index.html contains {forbidden:?}"
-        );
+fn scripts_keep_the_credential_out_of_storage() {
+    for name in ["login.js", "stream.js"] {
+        let js = String::from_utf8(hive_webui::asset_bytes(name).expect("embedded")).unwrap();
+        for forbidden in ["localStorage", "sessionStorage", "access_token=", "eval("] {
+            assert!(!js.contains(forbidden), "{name} contains {forbidden:?}");
+        }
     }
-    // And it loads exactly the two files the daemon serves, from the prefix
-    // the daemon mounts.
-    assert!(page.contains("src=\"/ui/app.js\""), "{page}");
-    assert!(page.contains("href=\"/ui/styles.css\""), "{page}");
+    let login = String::from_utf8(hive_webui::asset_bytes("login.js").unwrap()).unwrap();
+    assert!(
+        login.contains("'/session'") && login.contains("Authorization"),
+        "login.js does not exchange the token over the header"
+    );
 }
 
-/// The client never puts a token in a URL or in script-readable storage: it
-/// exchanges it once for the cookie. Asserted against the built bundle, so a
-/// change in web/ that starts remembering a credential fails here.
+/// htmx is pinned by content, not by a CDN: the page's policy allows scripts
+/// from 'self' only, and a vendored copy is what makes that true.
 #[test]
-fn bundle_keeps_the_credential_out_of_storage() {
-    let js = String::from_utf8(hive_webui::page("app.js").expect("app.js is embedded")).unwrap();
-    for forbidden in ["localStorage", "sessionStorage", "access_token="] {
-        assert!(!js.contains(forbidden), "app.js contains {forbidden:?}");
-    }
+fn htmx_is_vendored_and_pinned() {
+    let js = String::from_utf8(hive_webui::asset_bytes("htmx.min.js").unwrap()).unwrap();
     assert!(
-        js.contains("/session"),
-        "app.js does not exchange the token for a session"
+        js.contains("version:\"2.0.6\""),
+        "htmx version changed; update this test and the doc"
     );
 }

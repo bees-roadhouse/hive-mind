@@ -19,9 +19,9 @@ use crate::{AppState, fail, json};
 /// the rest of the schema is a few short strings.
 const MAX_MESSAGE_BODY: usize = 256 << 10;
 const MAX_CONVERSATION: usize = 4 << 10;
-const MAX_TITLE_LENGTH: usize = 200;
-const MAX_MODEL_LENGTH: usize = 100;
-const MAX_MESSAGE_LENGTH: usize = 200_000;
+pub(crate) const MAX_TITLE_LENGTH: usize = 200;
+pub(crate) const MAX_MODEL_LENGTH: usize = 100;
+pub(crate) const MAX_MESSAGE_LENGTH: usize = 200_000;
 
 #[derive(Serialize)]
 pub(crate) struct ConversationJson {

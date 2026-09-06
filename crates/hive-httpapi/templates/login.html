@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+{% block content %}
+<main id="login" class="card">
+  <h1>Sign in to your hive</h1>
+  <p class="hint">Paste a credential. It is exchanged once for a session cookie and never kept by this page.</p>
+  <form id="login-form">
+    <label>Credential
+      <input id="token" type="password" autocomplete="off" placeholder="token">
+    </label>
+    <button id="signin" class="primary" type="submit">Sign in</button>
+  </form>
+  <p id="login-error" class="error" hidden></p>
+</main>
+{% endblock %}
+{% block scripts %}<script src="/assets/login.js"></script>{% endblock %}

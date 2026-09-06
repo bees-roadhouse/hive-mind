@@ -15,7 +15,7 @@ concurrency:
 jobs:
   # The born-green gate: the same script a laptop runs, against the same shape
   # of Postgres. scripts/gate-rust.sh refuses without a database, names every
-  # test that skipped, and rebuilds web/dist to refuse a stale committed build.
+  # test that skipped.
   gate:
     runs-on: ubuntu-latest
     services:
@@ -44,12 +44,6 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: web/package-lock.json
 
       # Mirrors what scripts/db-up.sh does locally. Extensions live in their own
       # schema so `public` stays empty and a test's private schema is the only

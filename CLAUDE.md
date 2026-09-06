@@ -7,8 +7,8 @@ compose them. It replaces `bees-roadhouse/hive`.
 **The daemon is Rust** (D24, decided 2026-09-02; the Go tree it replaced was
 removed 2026-09-05, D31). A Cargo workspace at `crates/*`, wasmtime for the
 guests, axum for the HTTP surface, sqlx for Postgres. The browser client is a
-Solid.js shell under `web/`, built into `web/dist` and embedded in the daemon;
-apps may contribute UI as htmx fragments. The guest SDK and the reference guest
+server-rendered by the daemon and swapped by htmx (D32); its static assets are
+embedded by `crates/hive-webui`, and apps contribute UI as HTML fragments. The guest SDK and the reference guest
 are Rust too, built for `wasm32-wasip1`. The reasons and the picks are in
 `docs/design/D24-rust-rewrite.md`; what the removal of the Go tree changed and
 what it deliberately kept is in `docs/design/D31-go-removed.md`.
@@ -191,10 +191,10 @@ prove the checked-in bytes still match. `hello-tinygo.wasm` in that directory
 is the frozen TinyGo build from the Go era and is never rebuilt: it is the ABI
 conformance fixture (D31).
 
-The browser client is a separate build too: `web/dist` is committed and
-embedded by `crates/hive-webui`, so a checkout with no node still builds the
-daemon. The gate rebuilds it when npm is present and refuses a diff, and CI
-always has npm.
+The browser client needs no build: pages are rendered by `hive-httpapi` from
+askama templates, and the four static assets (the stylesheet, a vendored
+htmx, two small scripts) are embedded by `crates/hive-webui`. Node is needed
+only for the e2e suite.
 
 ## This file is under test
 
@@ -255,12 +255,12 @@ crates/hive-sse/       the SSE frame writer, shared by /events and the chat stre
 crates/hive-httpauth/  request-to-credential resolution and THE one 401 shape
 crates/hive-httpapi/   the daemon's HTTP surface: healthz, readyz, events, whoami, device
                        enrollment, blob reads, session, chat
-crates/hive-webui/     serves web/dist at / and /ui/ under a strict CSP, embedded at build time
+crates/hive-webui/     the browser client's static assets under /assets/, embedded, under the strict
+                       CSP every HTML response also carries; the pages themselves are hive-httpapi's
 crates/hive-identity/  the credential every layer passes around. Types and validation only
 crates/hive-trust/     provenance carried across every layer (invariants 3 and 12)
 crates/hive-testdb/    schema-per-test Postgres for the integration tests
 crates/hive-repodocs/  no code. The gate's assertions about this repo's own documentation
-web/                   the browser client: Solid.js + Vite, built into web/dist (committed)
 guest/                 the SDK a WASM guest links against, and the root of the guest workspace
                        (wasm32-wasip1 only; the release profile every guest builds with is here)
 apps/                  first-party guest apps, members of the guest workspace. apps/hello is

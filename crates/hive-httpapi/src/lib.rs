@@ -15,6 +15,7 @@ mod credentials;
 pub mod mcp;
 mod readyz;
 mod session;
+pub mod ui;
 
 use std::sync::Arc;
 
@@ -151,6 +152,17 @@ pub fn router(store: Option<Store>, bus: Option<Bus>, opts: Options) -> Router {
                 .route("/apps/{app}/{*rest}", axum::routing::any(apps::route));
         }
         if state.chat.is_some() {
+            // The browser client: pages and fragments rendered here, static
+            // assets from hive-webui, both under the same policy (D32).
+            app = app
+                .route("/", get(ui::index))
+                .route("/ui/conversations", get(ui::list).post(ui::create))
+                .route("/ui/conversations/{id}", get(ui::open))
+                .route(
+                    "/ui/conversations/{id}/messages",
+                    get(ui::messages).post(ui::post_message),
+                )
+                .route("/ui/logout", post(ui::logout));
             app = app
                 .route("/conversations", post(chat::create).get(chat::list))
                 .route("/conversations/{id}", get(chat::get_one))

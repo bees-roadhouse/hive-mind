@@ -1,0 +1,4 @@
+<section id="thread" class="thread"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <div id="messages" class="messages" data-conversation="{{ id }}">
+{{ messages|safe }}  </div>
+{{ composer|safe }}</section>

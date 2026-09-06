@@ -1,0 +1,4 @@
+  <form id="composer" class="composer" hx-post="/ui/conversations/{{ id }}/messages" hx-target="#messages" hx-swap="beforeend"{% if oob %} hx-swap-oob="true"{% endif %}>
+    <textarea id="body" name="body" rows="3" placeholder="Message" required></textarea>
+    <button class="primary" type="submit">Send</button>
+  </form>

@@ -191,6 +191,32 @@ impl World {
         id
     }
 
+    /// The predicate for an install-scoped subject that needs a name:
+    /// collection, tool, route. Same function, same rules; only `subject_name`
+    /// is non-NULL.
+    async fn decision_named(
+        &self,
+        c: Cred,
+        s: Subject,
+        name: &str,
+        access: &str,
+    ) -> Option<String> {
+        let (reason,): (Option<String>,) = sqlx::query_as(
+            "SELECT reason FROM access_decision($1, $2, $3, $4, $5, $6, $7, now())",
+        )
+        .bind(s.kind)
+        .bind(s.id)
+        .bind(name)
+        .bind(c.principal_kind)
+        .bind(c.principal)
+        .bind(c.actor)
+        .bind(access)
+        .fetch_one(self.pool())
+        .await
+        .expect("access_decision");
+        reason
+    }
+
     /// The predicate itself. `None` is deny. This is the one call every
     /// enforcement funnels through (invariant 1), and it resolves the owner
     /// from the subject rather than taking one (invariant 11): there is no
@@ -590,4 +616,102 @@ async fn migrate_is_idempotent_and_records_checksums() {
         assert_eq!(checksum, &m.checksum(), "{version}");
         assert!(checksum.len() == 64 && checksum.chars().all(|c| c.is_ascii_hexdigit()));
     }
+}
+
+// --- invariant 14: the collection key omits which app is asking -------------
+//
+// #86 opens a door that does not exist yet: a guest naming another install's
+// collection (`core/contacts`). Everything below is about what the predicate
+// answers the moment that door exists, and it is written before the door is
+// built, because the answer decides the shape of the door.
+//
+// A `collection` subject resolves its owner through `subject_owner()`, which
+// for install-scoped kinds is the INSTALL's owner. So the predicate's first
+// branch ... "the principal owns the row" ... fires on the owner of the install
+// being read, and it never learns which install is doing the reading. One
+// principal's apps are therefore indistinguishable to it.
+//
+// That is invariant 14 exactly: a key that omits a dimension the decision
+// depends on. The dimension is "which app is asking", and it is the whole
+// content of D32's `uses` declaration.
+//
+// The collision question from CLAUDE.md ... what happens when two keys collide
+// ... has the bad answer here. It does not fail closed. It resolves to
+// 'owner' and the read succeeds, and the audit trail records it honestly as
+// the principal's own access, because it IS the principal's own access. An
+// AI-built app (#19: those start with no capabilities at all) installed by Nate
+// would read Nate's contacts, and nothing anywhere would look wrong afterwards.
+
+/// The control. Without this, the test below cannot distinguish "the predicate
+/// denied cross-app access" from "the predicate cannot see collections at all",
+/// which is failure shape 1 from `CLAUDE.md`.
+#[tokio::test]
+async fn an_owner_reaches_their_own_apps_collection() {
+    let Some(w) = World::new("an_owner_reaches_their_own_apps_collection").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let journal = w.install("journal", "user", alice, alice).await;
+
+    let reason = w
+        .decision_named(
+            cred(alice, "user", alice),
+            Subject {
+                kind: "collection",
+                id: journal,
+            },
+            "contacts",
+            "read",
+        )
+        .await;
+    assert_eq!(
+        reason.as_deref(),
+        Some("owner"),
+        "an owner reading their own app's collection is the case that must keep working"
+    );
+}
+
+/// The reproduction for #86, and it fails against the predicate as it stands.
+///
+/// Alice owns two installs. The mail app asks for the journal app's `contacts`.
+/// Nothing has been declared and no grant has been written, so this must be
+/// deny ... and today it is `owner`, because the predicate has no argument
+/// through which the asking install could reach it.
+///
+/// Asserting the message rather than merely "not allowed" is deliberate: a
+/// refusal is over-determined here (a missing install, a bad name and a real
+/// denial are all falsy), so the assertion names which refusal it wants.
+#[tokio::test]
+async fn owning_two_apps_is_not_a_reason_for_one_to_read_the_other() {
+    let Some(w) = World::new("owning_two_apps_is_not_a_reason_for_one_to_read_the_other").await
+    else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let journal = w.install("journal", "user", alice, alice).await;
+    let mail = w.install("mail", "user", alice, alice).await;
+    assert_ne!(journal, mail, "the fixture needs two distinct installs");
+
+    // The mail app, running for alice, naming the journal app's collection.
+    // The acting install is `mail`; the predicate is never told so.
+    let reason = w
+        .decision_named(
+            cred(alice, "user", alice),
+            Subject {
+                kind: "collection",
+                id: journal,
+            },
+            "contacts",
+            "read",
+        )
+        .await;
+
+    assert_eq!(
+        reason, None,
+        "one app reached another app's collection with no grant, because the \
+         predicate decided on the install's OWNER and never learned which \
+         install was asking (invariant 14). Both installs are alice's, so the \
+         owner branch fires and D32's `uses` declaration decides nothing. This \
+         is the door #86 has to build correctly, not a bug in existing code."
+    );
 }

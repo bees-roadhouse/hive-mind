@@ -27,6 +27,8 @@ pub const REQUIRED_PHRASES: &[&str] = &[
     "verdict on the pair",
     "Check that the package built",
     "the contradiction was in the instrument",
+    "Check which refusal",
+    "you have found the second kind",
 ];
 
 /// The numbered invariants' positions, in order. Anchored at column zero on

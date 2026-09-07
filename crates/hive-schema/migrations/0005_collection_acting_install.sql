@@ -269,6 +269,18 @@ $fn$;
 -- the acting install threaded through `visible_events` in the same migration.
 -- The two belong together: the CHECK is what makes it safe for the feed to
 -- assume the question never arises.
+--
+-- **This is the only guard, and adding a second one in Rust would be a
+-- regression.** `SubjectKind::Collection` is still expressible on an `Event`,
+-- so the first attempt fails here as a constraint violation rather than as a
+-- compile error, and that reads like an unfinished job. It is not. Two
+-- enforcement points deciding one property can disagree, and the one people
+-- read is whichever fires first ... a type-side check would fire earlier and
+-- this constraint would rot silently behind it, still passing its own test.
+-- That is invariant 1's shape, and it is the redundancy warning from the
+-- seventh detector running the other way: the same defence in depth that makes
+-- a single-site mutation harmless is what lets one half drift unnoticed. One
+-- guard, in the database, at the write.
 ALTER TABLE events DROP CONSTRAINT events_subject_kind_check;
 ALTER TABLE events ADD CONSTRAINT events_subject_kind_check
     CHECK (subject_kind IN ('install', 'tool', 'route', 'entity', 'conversation'));

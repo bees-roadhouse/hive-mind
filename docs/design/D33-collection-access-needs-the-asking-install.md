@@ -108,6 +108,30 @@ the install, and every read is refused. Recorded here and on `ActingInstall`
 so the afternoon that would otherwise be spent debugging correct behaviour is
 spent on the registry instead.
 
+## One guard per property, at the write
+
+The events CHECK that keeps a collection subject off the feed is the **only**
+guard on that property, deliberately. `SubjectKind::Collection` remains
+expressible on an `Event` in Rust, so the first attempt fails as a constraint
+violation rather than a compile error, and the obvious follow-up is to "also"
+check it type-side.
+
+That follow-up would be a regression. Two enforcement points deciding one
+property can disagree, and the one that fires first is the one people read: a
+type-side check would fire earlier and the constraint would rot behind it,
+still green in its own test, until somebody removed the Rust half and
+discovered the SQL half had drifted. Invariant 1 is the general form. The
+seventh detector is the specific one, running backwards ... the defence in
+depth that makes a single-site mutation harmless is exactly what lets one half
+drift unnoticed.
+
+The rule this generalises to, which is why it is here rather than only in a
+comment: **one enforcement point per property, placed where the write happens,
+and a redundant guard earlier in the path is a liability rather than a
+belt.** Where genuine defence in depth is wanted, the layers must decide
+*different* questions ... which is what the principal check and the install
+check in this decision do, and why both are required rather than either.
+
 ## Left open
 
 - Whether a `write` grant to another app's collection is offered at all in

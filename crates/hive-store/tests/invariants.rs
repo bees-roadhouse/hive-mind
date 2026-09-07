@@ -992,3 +992,54 @@ async fn the_composable_form_will_not_decide_a_collection_blind() {
     .expect("the 9-argument form should answer");
     assert_eq!(ok.as_deref(), Some("owner"));
 }
+
+/// The events CHECK refuses a collection-subject row, in front of the writer.
+///
+/// This is the guard; the `RAISE` in `access_reason` is the backstop, and the
+/// distinction is about blast radius rather than belt-and-braces for its own
+/// sake. `visible_events` calls `access_reason` inside a set read over
+/// `events`, so a RAISE there aborts the whole statement instead of skipping
+/// one row: a single bad row would break the event feed for every reader until
+/// someone found it, and the person seeing the error would not be the person
+/// who caused it. The CHECK fails the one INSERT that is wrong, at the moment
+/// it is wrong.
+#[tokio::test]
+async fn a_collection_subject_event_is_refused_at_the_insert() {
+    let Some(w) = World::new("a_collection_subject_event_is_refused_at_the_insert").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let inst = w.install("journal", "user", alice, alice).await;
+
+    let insert = |kind: &'static str| {
+        sqlx::query(
+            "INSERT INTO events (kind, subject_kind, subject_id, subject_name,
+                                 owner_kind, owner_id, author_actor,
+                                 principal_kind, principal_id, body)
+             VALUES ('app.journal.touched', $1, $2, $3, 'user', $4, $4, 'user', $4, '{}'::jsonb)",
+        )
+        .bind(kind)
+        .bind(inst)
+        .bind(if kind == "collection" {
+            Some("entries")
+        } else {
+            None
+        })
+        .bind(alice)
+        .execute(w.pool())
+    };
+
+    let err = insert("collection")
+        .await
+        .expect_err("a collection-subject event was accepted");
+    assert!(
+        format!("{err}").contains("events_subject_kind_check"),
+        "refused by something other than the events CHECK: {err}"
+    );
+
+    // The control: an install-subject event still writes, so the assertion
+    // above is about `collection` and not about the fixture being wrong.
+    insert("install")
+        .await
+        .expect("an install-subject event should still be accepted");
+}

@@ -216,10 +216,17 @@ $fn$;
 --
 -- The refusal is not paranoia about a hypothetical caller. Of the three, only
 -- visible_events passes a subject kind it did not write literally ... it takes
--- `e.subject_kind` off the row, and the events table's CHECK permits
--- 'collection'. No writer produces one today, so this raises for nobody now
--- and raises loudly for whoever writes the first one, which is the moment the
--- question actually needs answering.
+-- `e.subject_kind` off the row. No writer produces a collection-subject event
+-- today (a guest's emit takes Subject::install from the install row, not from
+-- the guest), so this raises for nobody.
+--
+-- It is a BACKSTOP and not the guard, because of where it would fire.
+-- visible_events calls this inside a set read over `events`, so a RAISE aborts
+-- the whole statement rather than skipping the offending row: one bad row
+-- would break the event feed for every reader until somebody found and deleted
+-- it, and the person seeing the error would not be the person who caused it.
+-- The events CHECK below is what actually catches this, in front of the one
+-- INSERT that is wrong. Belt and braces, in that order.
 --
 -- The legitimate NULL case ... a person on the HTTP surface reaching their own
 -- data through no install ... does not come through here. It calls
@@ -248,3 +255,20 @@ BEGIN
                                                p_access, p_now, p_acting_install));
 END;
 $fn$;
+
+-- The guard the RAISE above cannot be. A collection-subject event is refused at
+-- the INSERT, in front of the writer, rather than at every subsequent read of
+-- the feed.
+--
+-- 'collection' was permitted here from migration one and nothing has ever
+-- written one: a guest's `events.emit` takes `Subject::install` from the
+-- install row, and the host's own writers use entity, conversation, install
+-- and tool. So this narrows a permission nobody used.
+--
+-- When a collection-subject event IS wanted, this constraint comes back with
+-- the acting install threaded through `visible_events` in the same migration.
+-- The two belong together: the CHECK is what makes it safe for the feed to
+-- assume the question never arises.
+ALTER TABLE events DROP CONSTRAINT events_subject_kind_check;
+ALTER TABLE events ADD CONSTRAINT events_subject_kind_check
+    CHECK (subject_kind IN ('install', 'tool', 'route', 'entity', 'conversation'));

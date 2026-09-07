@@ -222,6 +222,43 @@ impl World {
     /// A collection grant whose target is an INSTALL rather than a principal
     /// (D33). This is the row the registry will write when it derives an app's
     /// `uses` declaration at activation.
+    /// Revokes a grant the way `revoke_grant` does, so the test exercises the
+    /// predicate's tombstone clause rather than deleting the row.
+    async fn revoke(&self, grant: Uuid, by: Uuid) {
+        sqlx::query("UPDATE grants SET revoked_at = now(), revoked_by = $2 WHERE id = $1")
+            .bind(grant)
+            .bind(by)
+            .execute(self.pool())
+            .await
+            .expect("revoke");
+    }
+
+    /// An install grant that expired in the past.
+    async fn expired_install_grant(
+        &self,
+        subject_install: Uuid,
+        collection: &str,
+        to_install: Uuid,
+        by: Uuid,
+    ) -> Uuid {
+        let (id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind,
+                                 target_install_id, access, source, granted_by_actor,
+                                 granted_by_principal_kind, granted_by_principal_id, expires_at)
+             VALUES ('collection', $1, $2, 'install', $3, 'read', 'direct', $4, 'user', $4,
+                     now() - interval '1 hour')
+             RETURNING id",
+        )
+        .bind(subject_install)
+        .bind(collection)
+        .bind(to_install)
+        .bind(by)
+        .fetch_one(self.pool())
+        .await
+        .expect("expired install grant");
+        id
+    }
+
     async fn install_grant(
         &self,
         subject_install: Uuid,
@@ -861,4 +898,97 @@ async fn an_install_grant_does_not_widen_past_the_principal() {
         "an install grant carried an app past its principal: the app half was \
          satisfied and the principal half was not, and both are required"
     );
+}
+
+/// Revocation and expiry on an install grant.
+///
+/// This is the property the whole `install_grant` reason exists to enable: a
+/// person can shut one app out of one collection without touching their own
+/// access. Nothing tested it, and the clauses that implement it
+/// (`revoked_at IS NULL`, `expires_at > now()`) were carried over from the
+/// principal branches by hand, which is exactly the kind of copy that is right
+/// until it is not.
+#[tokio::test]
+async fn a_revoked_or_expired_install_grant_shuts_the_door() {
+    let Some(w) = World::new("a_revoked_or_expired_install_grant_shuts_the_door").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let journal = w.install("journal", "user", alice, alice).await;
+    let mail = w.install("mail", "user", alice, alice).await;
+    let subj = Subject {
+        kind: "collection",
+        id: journal,
+    };
+    let ask = |name: &'static str| {
+        w.decision_named(cred(alice, "user", alice), subj, name, "read", Some(mail))
+    };
+
+    // Live: the control, so a deny below cannot be a grant that never worked.
+    let g = w
+        .install_grant(journal, "contacts", mail, "read", alice)
+        .await;
+    assert_eq!(
+        ask("contacts").await.as_deref(),
+        Some("install_grant"),
+        "the grant did not work even before being revoked"
+    );
+
+    w.revoke(g, alice).await;
+    assert_eq!(
+        ask("contacts").await,
+        None,
+        "a revoked install grant still opened the collection"
+    );
+
+    // Expiry is a separate clause from revocation and fails separately.
+    w.expired_install_grant(journal, "decisions", mail, alice)
+        .await;
+    assert_eq!(
+        ask("decisions").await,
+        None,
+        "an expired install grant still opened the collection"
+    );
+}
+
+/// The composable form refuses to answer a collection question with no acting
+/// install, rather than answering it the fail-open way (D33).
+///
+/// `access_reason` keeps a NULL default so the three callers written before
+/// D33 resolve unchanged, and that default is the permissive direction for a
+/// collection. Only `visible_events` passes a subject kind it did not write
+/// literally, and the events CHECK permits 'collection', so this raises for
+/// nobody today and raises for whoever writes the first such event.
+#[tokio::test]
+async fn the_composable_form_will_not_decide_a_collection_blind() {
+    let Some(w) = World::new("the_composable_form_will_not_decide_a_collection_blind").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let journal = w.install("journal", "user", alice, alice).await;
+
+    let err = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT access_reason('collection', $1, 'contacts', 'user', $2, $2, 'read', now())",
+    )
+    .bind(journal)
+    .bind(alice)
+    .fetch_one(w.pool())
+    .await
+    .expect_err("the 8-argument form answered a collection question");
+    assert!(
+        format!("{err}").contains("without an acting install"),
+        "raised for the wrong reason: {err}"
+    );
+
+    // And the explicit form still answers, so the refusal above is about the
+    // missing dimension rather than about collections being unanswerable.
+    let ok: Option<String> = sqlx::query_scalar(
+        "SELECT access_reason('collection', $1, 'contacts', 'user', $2, $2, 'read', now(), $1)",
+    )
+    .bind(journal)
+    .bind(alice)
+    .fetch_one(w.pool())
+    .await
+    .expect("the 9-argument form should answer");
+    assert_eq!(ok.as_deref(), Some("owner"));
 }

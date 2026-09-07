@@ -216,6 +216,18 @@ impl Subject {
 /// subject outright and `authorize_collection` is the only way to decide one.
 /// That is a runtime refusal with a test behind it, not a type-level barrier,
 /// and it is written down as such rather than dressed up as one.
+/// **Nothing in the platform writes an install grant yet, and that is
+/// intended.** `write_grant` binds `target_kind` and `target_id` and no
+/// `target_install_id`, so it cannot produce one ... and the
+/// `grants_target_shape` CHECK would refuse it if it tried. The registry will
+/// write them when it derives an app's manifest `uses` at activation, which is
+/// the rest of #86.
+///
+/// Until then a cross-install collection read denies, always, and **that
+/// denial is the feature working**. This note exists because the failure looks
+/// identical to a bug: an app declares what it needs, the install activates,
+/// and every read is refused with nothing in the logs to say why. Someone will
+/// lose an afternoon to it otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ActingInstall(pub Uuid);
 
@@ -305,13 +317,49 @@ impl Guard {
             .await
     }
 
-    /// The collection decision, which is the only one that needs to know which
-    /// app is asking (D33).
+    /// The collection decision made THROUGH an install, which is every guest
+    /// call (D33).
     ///
-    /// `acting` is not optional-by-omission: a caller has to write `None` and
-    /// mean it. `None` is the person-on-the-HTTP-surface case; a guest
-    /// invocation always has an install and always passes it.
+    /// This takes an `ActingInstall`, not an `Option`. An earlier version took
+    /// the option, and the safe call and the fail-open call were then the same
+    /// keystrokes apart: a guest path that passed `None` got the old
+    /// owner-branch behaviour silently, which is the exact bug D33 exists to
+    /// close, reachable by autocomplete. The person-on-the-HTTP-surface case
+    /// has its own name below, so the dangerous shape is not merely
+    /// discouraged ... it cannot be written here at all.
     pub async fn authorize_collection(
+        &self,
+        db: &mut PgConnection,
+        cred: &Credential,
+        subj: &Subject,
+        acting: ActingInstall,
+        access: Access,
+        note: &str,
+    ) -> Result<Reason> {
+        self.collection_decision(db, cred, subj, Some(acting), access, note)
+            .await
+    }
+
+    /// The collection decision made by a person reaching their own data
+    /// through no install at all ... the HTTP surface, not a guest.
+    ///
+    /// Separately named on purpose. This is the one call in the codebase that
+    /// legitimately skips D33's dimension, and it should be greppable and
+    /// obvious in review rather than looking identical to the guest path with
+    /// one argument different.
+    pub async fn authorize_collection_as_person(
+        &self,
+        db: &mut PgConnection,
+        cred: &Credential,
+        subj: &Subject,
+        access: Access,
+        note: &str,
+    ) -> Result<Reason> {
+        self.collection_decision(db, cred, subj, None, access, note)
+            .await
+    }
+
+    async fn collection_decision(
         &self,
         db: &mut PgConnection,
         cred: &Credential,

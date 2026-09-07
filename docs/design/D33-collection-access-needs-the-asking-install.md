@@ -93,6 +93,21 @@ invocation to the guard on every storage path, and a `None` there must mean
 "not a guest call" rather than "no restriction" ... the default has to be the
 strict one, or this decision is a comment.
 
+## What ships denied, and why that is right
+
+Between this decision landing and the registry deriving grants at activation,
+**no code path can create an install grant.** `write_grant` binds no
+`target_install_id`, and the `grants_target_shape` CHECK refuses a
+`target_kind = 'install'` row without one, so the gap fails closed twice over
+rather than by omission.
+
+The consequence is worth stating where somebody will read it: a cross-install
+collection read denies, every time, and **the denial is the feature working**.
+It looks exactly like a bug ... an app declares its `uses`, a human activates
+the install, and every read is refused. Recorded here and on `ActingInstall`
+so the afternoon that would otherwise be spent debugging correct behaviour is
+spent on the registry instead.
+
 ## Left open
 
 - Whether a `write` grant to another app's collection is offered at all in

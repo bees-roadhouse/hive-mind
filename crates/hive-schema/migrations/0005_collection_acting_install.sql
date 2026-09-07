@@ -208,6 +208,23 @@ $fn$;
 -- A set read that uses this still owes the D18.2 audit for every row whose
 -- reason is 'override'. store.Guard is the only thing that may call it, and it
 -- discharges that obligation on every path.
+-- p_acting_install defaults to NULL here so the three existing callers
+-- (tool_access_reason, route_access_reason, visible_events) keep resolving
+-- without being recreated. That default is the fail-OPEN direction for a
+-- collection, so this form refuses to answer that question at all rather than
+-- answering it permissively.
+--
+-- The refusal is not paranoia about a hypothetical caller. Of the three, only
+-- visible_events passes a subject kind it did not write literally ... it takes
+-- `e.subject_kind` off the row, and the events table's CHECK permits
+-- 'collection'. No writer produces one today, so this raises for nobody now
+-- and raises loudly for whoever writes the first one, which is the moment the
+-- question actually needs answering.
+--
+-- The legitimate NULL case ... a person on the HTTP surface reaching their own
+-- data through no install ... does not come through here. It calls
+-- access_decision directly through Guard, where the argument is explicit and a
+-- caller has to write `None` and mean it.
 CREATE FUNCTION access_reason(
     p_subject_kind   text,
     p_subject_id     uuid,
@@ -219,8 +236,15 @@ CREATE FUNCTION access_reason(
     p_now            timestamptz DEFAULT now(),
     p_acting_install uuid DEFAULT NULL
 ) RETURNS text
-LANGUAGE sql STABLE PARALLEL SAFE AS $fn$
-    SELECT reason FROM access_decision(p_subject_kind, p_subject_id, p_subject_name,
-                                       p_principal_kind, p_principal_id, p_actor_id,
-                                       p_access, p_now, p_acting_install);
+LANGUAGE plpgsql STABLE PARALLEL SAFE AS $fn$
+BEGIN
+    IF p_subject_kind = 'collection' AND p_acting_install IS NULL THEN
+        RAISE EXCEPTION
+            'access_reason cannot decide a collection without an acting install (D33); '
+            'pass one, or use access_decision if the caller is genuinely not an install';
+    END IF;
+    RETURN (SELECT reason FROM access_decision(p_subject_kind, p_subject_id, p_subject_name,
+                                               p_principal_kind, p_principal_id, p_actor_id,
+                                               p_access, p_now, p_acting_install));
+END;
 $fn$;

@@ -269,9 +269,9 @@ impl AppData {
                 &mut tx,
                 &req.caller.cred,
                 &Subject::collection(info.id, &d.collection),
-                // The invocation IS an install, always. D33's `None` case is a
-                // person on the HTTP surface, which never reaches here.
-                Some(ActingInstall(req.caller.install_id)),
+                // The invocation IS an install, always: this signature has no
+                // way to say otherwise, which is the point.
+                ActingInstall(req.caller.install_id),
                 Access::Write,
                 "storage.insert",
             )

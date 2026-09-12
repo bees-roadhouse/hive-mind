@@ -22,10 +22,10 @@
 //! | 8 | no blob without a ref | hive-blob, `Catalog::publish` takes a transaction | `hive-blob/tests/catalog.rs` |
 //! | 9 | untrusted content never reaches instruction position | hive-chat, hive-wasmhost | `hive-chat/tests`, `hive-wasmhost/tests` |
 //! | 10 | money-spending steps are at-most-once | SQL (`agent_runs_turn_uq`); `AgentRunStore::finish_run`, the chat reclaimers | `tests/agentruns.rs`, `tests/chat.rs` |
-//! | 11 | a check that accepts the fact it decides is not a check | SQL, the predicate resolves its own facts; `Guard` takes no owner | `tests/invariants.rs`, `tests/bypass.rs` |
+//! | 11 | a check that accepts the fact it decides is not a check | SQL, the predicate resolves its own facts; `Guard` takes no owner | `tests/invariants.rs` |
 //! | 12 | trust is structural in the ABI | hive-wasmhost | `hive-wasmhost/tests` |
 //! | 13 | the API is reachable over a unix socket | hive-sandbox, the daemon | `hive-sandbox/tests` |
-//! | 14 | a key that omits a dimension is a bypass | every crate; SQL for install schemas | `tests/bypass.rs`, `hive-wasmhost/tests` |
+//! | 14 | a key that omits a dimension is a bypass | every crate; SQL for install schemas | `tests/invariants.rs`, `tests/installs.rs`, `hive-wasmhost/tests` |
 //!
 //! A row that says **not yet** is a debt this table makes visible. It moves to
 //! a test name when the crate lands, never to "done".
@@ -65,8 +65,8 @@ pub use events::{
     resolve_cursor, tail, tail_window, valid_event_kind,
 };
 pub use grants::{
-    Access, GrantSource, GrantSpec, Guard, Reason, Subject, SubjectKind, UnshareResult,
-    enter_break_glass, materialize_inherited, revoke_grant, unshare, write_grant,
+    Access, ActingInstall, GrantSource, GrantSpec, Guard, Reason, Subject, SubjectKind,
+    UnshareResult, enter_break_glass, materialize_inherited, revoke_grant, unshare, write_grant,
 };
 pub use guestblobs::GuestBlobs;
 pub use guestevents::{GuestEvents, platform_kind, visible_to};

@@ -96,19 +96,29 @@ even if the tests pass.
     dimension its correctness depends on, or the reuse skips the check the first
     caller passed.
 
-    **Seven times here**, in seven subsystems that share no code: a memoization
+    **Eight times here**, in eight subsystems that share no code: a memoization
     cache without the principal, a warm guest instance without the capability
     set, a client cache whose presence was read as permission, an HTTP transport
     pooling a connection opened under a loose egress rule for a request under a
     strict one, a per-app schema **name** derived from the app alone when the
     schema belongs to an *install*, an install slug truncated past the point
-    where its digest still separated two of them, and an MCP tool **name** ...
+    where its digest still separated two of them, an MCP tool **name** ...
     `journal.journal.add` ... that carries the app and not the owner, so with two
-    active installs of one app a call reached whichever row came back first.
+    active installs of one app a call reached whichever row came back first, and
+    the grant predicate itself, which decided a collection on the **install's
+    owner** and was never told which install was asking, so every app a person
+    installed reached every other app's data and the manifest declaration meant
+    nothing (D33).
 
     The transport one was found only by making the rule travel with the dial; the
     schema one only by building on it. Reading did not reveal either. **When you
     key anything, write down what the key omits and why that is safe.**
+
+    The eighth is the only one found before the code that would have contained
+    it was written, and the thing that found it was refusing to build on a
+    design's word: the plan said a derived grant would decide, so the question
+    was what the predicate answers today, asked as a test rather than as a
+    reading. **A design document is not evidence about the code it plans.**
 
     **Then ask what happens when two keys collide, because that is the difference
     between the fifth and the seventh.** The schema collision hit a unique index
@@ -117,6 +127,11 @@ even if the tests pass.
     wrong afterwards. A collision that fails closed is a bug report; a collision
     that resolves to *something* is a data leak with no symptom. **If the answer
     is "it just picks one", you have found the second kind.**
+
+    The eighth had no second thing to pick between: the door was simply open,
+    and the audit recorded every walk through it honestly as the principal's own
+    access, because that is what it was. Worse than a collision that resolves to
+    something is a key whose missing dimension never narrowed anything at all.
 
 ## Born-green gate
 

@@ -191,6 +191,100 @@ impl World {
         id
     }
 
+    /// The predicate for an install-scoped subject that needs a name:
+    /// collection, tool, route. Same function, same rules; only `subject_name`
+    /// is non-NULL.
+    async fn decision_named(
+        &self,
+        c: Cred,
+        s: Subject,
+        name: &str,
+        access: &str,
+        acting: Option<Uuid>,
+    ) -> Option<String> {
+        let (reason,): (Option<String>,) = sqlx::query_as(
+            "SELECT reason FROM access_decision($1, $2, $3, $4, $5, $6, $7, now(), $8)",
+        )
+        .bind(s.kind)
+        .bind(s.id)
+        .bind(name)
+        .bind(c.principal_kind)
+        .bind(c.principal)
+        .bind(c.actor)
+        .bind(access)
+        .bind(acting)
+        .fetch_one(self.pool())
+        .await
+        .expect("access_decision");
+        reason
+    }
+
+    /// A collection grant whose target is an INSTALL rather than a principal
+    /// (D33). This is the row the registry will write when it derives an app's
+    /// `uses` declaration at activation.
+    /// Revokes a grant the way `revoke_grant` does, so the test exercises the
+    /// predicate's tombstone clause rather than deleting the row.
+    async fn revoke(&self, grant: Uuid, by: Uuid) {
+        sqlx::query("UPDATE grants SET revoked_at = now(), revoked_by = $2 WHERE id = $1")
+            .bind(grant)
+            .bind(by)
+            .execute(self.pool())
+            .await
+            .expect("revoke");
+    }
+
+    /// An install grant that expired in the past.
+    async fn expired_install_grant(
+        &self,
+        subject_install: Uuid,
+        collection: &str,
+        to_install: Uuid,
+        by: Uuid,
+    ) -> Uuid {
+        let (id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind,
+                                 target_install_id, access, source, granted_by_actor,
+                                 granted_by_principal_kind, granted_by_principal_id, expires_at)
+             VALUES ('collection', $1, $2, 'install', $3, 'read', 'direct', $4, 'user', $4,
+                     now() - interval '1 hour')
+             RETURNING id",
+        )
+        .bind(subject_install)
+        .bind(collection)
+        .bind(to_install)
+        .bind(by)
+        .fetch_one(self.pool())
+        .await
+        .expect("expired install grant");
+        id
+    }
+
+    async fn install_grant(
+        &self,
+        subject_install: Uuid,
+        collection: &str,
+        to_install: Uuid,
+        access: &str,
+        by: Uuid,
+    ) -> Uuid {
+        let (id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind,
+                                 target_install_id, access, source, granted_by_actor,
+                                 granted_by_principal_kind, granted_by_principal_id)
+             VALUES ('collection', $1, $2, 'install', $3, $4, 'direct', $5, 'user', $5)
+             RETURNING id",
+        )
+        .bind(subject_install)
+        .bind(collection)
+        .bind(to_install)
+        .bind(access)
+        .bind(by)
+        .fetch_one(self.pool())
+        .await
+        .expect("install grant");
+        id
+    }
+
     /// The predicate itself. `None` is deny. This is the one call every
     /// enforcement funnels through (invariant 1), and it resolves the owner
     /// from the subject rather than taking one (invariant 11): there is no
@@ -590,4 +684,362 @@ async fn migrate_is_idempotent_and_records_checksums() {
         assert_eq!(checksum, &m.checksum(), "{version}");
         assert!(checksum.len() == 64 && checksum.chars().all(|c| c.is_ascii_hexdigit()));
     }
+}
+
+// --- invariant 14 / D33: the collection key needs the asking install --------
+//
+// A `collection` subject resolves its owner through `subject_owner()`, which
+// for install-scoped kinds is the INSTALL's owner. So before D33 the
+// predicate's first branch ... "the principal owns the row" ... fired on the
+// owner of the install being read, and it never learned which install was
+// doing the reading. One principal's apps were indistinguishable to it, and
+// the collection grants D32 derives decided nothing.
+//
+// That was invariant 14: a key omitting a dimension the decision depends on,
+// the dimension being "which app is asking". It was also the fail-OPEN kind.
+// It did not collide and refuse; it resolved to 'owner', the read succeeded,
+// and the audit recorded it honestly as the principal's own access, because it
+// was. CLAUDE.md: *if the answer is "it just picks one", you have found the
+// second kind.* Here there was never a second thing to pick between.
+//
+// D33 adds the acting install and requires BOTH halves for a cross-install
+// collection: the principal authorized as before, AND the asking install
+// holding a live grant. The principal half is what keeps invariant 2 whole ...
+// widening access to an app must never widen it past the person it acts for.
+
+/// The control, and the reason CLAUDE.md gives for writing one: without it a
+/// deny below cannot be told from a predicate that cannot see collections at
+/// all, which is failure shape 1.
+#[tokio::test]
+async fn an_owner_reaches_their_own_apps_collection() {
+    let Some(w) = World::new("an_owner_reaches_their_own_apps_collection").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let journal = w.install("journal", "user", alice, alice).await;
+    let subj = Subject {
+        kind: "collection",
+        id: journal,
+    };
+
+    // Through the app that owns the collection.
+    assert_eq!(
+        w.decision_named(
+            cred(alice, "user", alice),
+            subj,
+            "contacts",
+            "read",
+            Some(journal)
+        )
+        .await
+        .as_deref(),
+        Some("owner"),
+        "an app reading its own collection is the ordinary case and must not need a grant"
+    );
+
+    // And with no acting install at all: a person on the HTTP surface reading
+    // their own data. D33's `None` is this case, and it must stay open.
+    assert_eq!(
+        w.decision_named(cred(alice, "user", alice), subj, "contacts", "read", None)
+            .await
+            .as_deref(),
+        Some("owner"),
+        "a person reading their own data reaches it through no install"
+    );
+}
+
+/// The reproduction for #86, written before the door it describes was built.
+///
+/// Alice owns two installs. The mail app asks for the journal app's `contacts`
+/// with nothing declared and no grant written, so it must be deny ... and
+/// before D33 it was `owner`, because the predicate had no argument through
+/// which the asking install could reach it.
+#[tokio::test]
+async fn owning_two_apps_is_not_a_reason_for_one_to_read_the_other() {
+    let Some(w) = World::new("owning_two_apps_is_not_a_reason_for_one_to_read_the_other").await
+    else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let journal = w.install("journal", "user", alice, alice).await;
+    let mail = w.install("mail", "user", alice, alice).await;
+    assert_ne!(journal, mail, "the fixture needs two distinct installs");
+
+    let reason = w
+        .decision_named(
+            cred(alice, "user", alice),
+            Subject {
+                kind: "collection",
+                id: journal,
+            },
+            "contacts",
+            "read",
+            Some(mail),
+        )
+        .await;
+
+    assert_eq!(
+        reason, None,
+        "one app reached another app's collection with no grant. Both installs \
+         are alice's, so the owner branch fires and the `uses` declaration \
+         decides nothing (invariant 14, D33)"
+    );
+}
+
+/// The other half: the grant the registry will derive actually opens the door,
+/// and it opens exactly it.
+///
+/// Without this the test above passes for a bad reason ... a predicate that
+/// denies every cross-install collection unconditionally would satisfy it and
+/// make the whole feature unbuildable.
+#[tokio::test]
+async fn an_install_grant_opens_one_collection_and_no_other() {
+    let Some(w) = World::new("an_install_grant_opens_one_collection_and_no_other").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let journal = w.install("journal", "user", alice, alice).await;
+    let mail = w.install("mail", "user", alice, alice).await;
+    let subj = Subject {
+        kind: "collection",
+        id: journal,
+    };
+
+    w.install_grant(journal, "contacts", mail, "read", alice)
+        .await;
+
+    assert_eq!(
+        w.decision_named(
+            cred(alice, "user", alice),
+            subj,
+            "contacts",
+            "read",
+            Some(mail)
+        )
+        .await
+        .as_deref(),
+        Some("install_grant"),
+        "the derived grant is what opens it, and it is what provenance names"
+    );
+
+    // The same app, a collection it was not granted. A grant that opened the
+    // install rather than the collection would pass the assertion above and
+    // fail this one, which is the point of having it.
+    assert_eq!(
+        w.decision_named(
+            cred(alice, "user", alice),
+            subj,
+            "decisions",
+            "read",
+            Some(mail)
+        )
+        .await,
+        None,
+        "a grant on `contacts` opened `decisions` too"
+    );
+
+    // Read was granted; write was not. Access is a dimension of the key as
+    // much as the collection is.
+    assert_eq!(
+        w.decision_named(
+            cred(alice, "user", alice),
+            subj,
+            "contacts",
+            "write",
+            Some(mail)
+        )
+        .await,
+        None,
+        "a read grant allowed a write"
+    );
+}
+
+/// D33's "both, not either". An install grant must not carry an app past what
+/// its owner may reach: that would move ownership from the person to the app
+/// and make "alice's contacts" stop being a true sentence about the row
+/// (invariant 2).
+///
+/// Being honest about what this one is: it passes against the OLD predicate
+/// too, because bob reaches alice's journal through no branch either way. So it
+/// is not evidence that D33 works ... the two tests above are that. It is a
+/// guard against the specific future mistake of making the install grant
+/// sufficient on its own, and it was verified by making exactly that mutation
+/// (removing the principal early-return): this test failed and every other test
+/// in the file still passed. Single-site property, single catcher, checked.
+#[tokio::test]
+async fn an_install_grant_does_not_widen_past_the_principal() {
+    let Some(w) = World::new("an_install_grant_does_not_widen_past_the_principal").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let bob = w.human("bob").await;
+    // Alice owns the journal. Bob owns the mail app, and it runs for bob.
+    let journal = w.install("journal", "user", alice, alice).await;
+    let bobs_mail = w.install("mail", "user", bob, bob).await;
+
+    // Alice grants bob's app the collection. The app half is satisfied; the
+    // principal half is not, because bob holds nothing on alice's journal.
+    w.install_grant(journal, "contacts", bobs_mail, "read", alice)
+        .await;
+
+    assert_eq!(
+        w.decision_named(
+            cred(bob, "user", bob),
+            Subject {
+                kind: "collection",
+                id: journal,
+            },
+            "contacts",
+            "read",
+            Some(bobs_mail),
+        )
+        .await,
+        None,
+        "an install grant carried an app past its principal: the app half was \
+         satisfied and the principal half was not, and both are required"
+    );
+}
+
+/// Revocation and expiry on an install grant.
+///
+/// This is the property the whole `install_grant` reason exists to enable: a
+/// person can shut one app out of one collection without touching their own
+/// access. Nothing tested it, and the clauses that implement it
+/// (`revoked_at IS NULL`, `expires_at > now()`) were carried over from the
+/// principal branches by hand, which is exactly the kind of copy that is right
+/// until it is not.
+#[tokio::test]
+async fn a_revoked_or_expired_install_grant_shuts_the_door() {
+    let Some(w) = World::new("a_revoked_or_expired_install_grant_shuts_the_door").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let journal = w.install("journal", "user", alice, alice).await;
+    let mail = w.install("mail", "user", alice, alice).await;
+    let subj = Subject {
+        kind: "collection",
+        id: journal,
+    };
+    let ask = |name: &'static str| {
+        w.decision_named(cred(alice, "user", alice), subj, name, "read", Some(mail))
+    };
+
+    // Live: the control, so a deny below cannot be a grant that never worked.
+    let g = w
+        .install_grant(journal, "contacts", mail, "read", alice)
+        .await;
+    assert_eq!(
+        ask("contacts").await.as_deref(),
+        Some("install_grant"),
+        "the grant did not work even before being revoked"
+    );
+
+    w.revoke(g, alice).await;
+    assert_eq!(
+        ask("contacts").await,
+        None,
+        "a revoked install grant still opened the collection"
+    );
+
+    // Expiry is a separate clause from revocation and fails separately.
+    w.expired_install_grant(journal, "decisions", mail, alice)
+        .await;
+    assert_eq!(
+        ask("decisions").await,
+        None,
+        "an expired install grant still opened the collection"
+    );
+}
+
+/// The composable form refuses to answer a collection question with no acting
+/// install, rather than answering it the fail-open way (D33).
+///
+/// `access_reason` keeps a NULL default so the three callers written before
+/// D33 resolve unchanged, and that default is the permissive direction for a
+/// collection. Only `visible_events` passes a subject kind it did not write
+/// literally, and the events CHECK permits 'collection', so this raises for
+/// nobody today and raises for whoever writes the first such event.
+#[tokio::test]
+async fn the_composable_form_will_not_decide_a_collection_blind() {
+    let Some(w) = World::new("the_composable_form_will_not_decide_a_collection_blind").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let journal = w.install("journal", "user", alice, alice).await;
+
+    let err = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT access_reason('collection', $1, 'contacts', 'user', $2, $2, 'read', now())",
+    )
+    .bind(journal)
+    .bind(alice)
+    .fetch_one(w.pool())
+    .await
+    .expect_err("the 8-argument form answered a collection question");
+    assert!(
+        format!("{err}").contains("without an acting install"),
+        "raised for the wrong reason: {err}"
+    );
+
+    // And the explicit form still answers, so the refusal above is about the
+    // missing dimension rather than about collections being unanswerable.
+    let ok: Option<String> = sqlx::query_scalar(
+        "SELECT access_reason('collection', $1, 'contacts', 'user', $2, $2, 'read', now(), $1)",
+    )
+    .bind(journal)
+    .bind(alice)
+    .fetch_one(w.pool())
+    .await
+    .expect("the 9-argument form should answer");
+    assert_eq!(ok.as_deref(), Some("owner"));
+}
+
+/// The events CHECK refuses a collection-subject row, in front of the writer.
+///
+/// This is the guard; the `RAISE` in `access_reason` is the backstop, and the
+/// distinction is about blast radius rather than belt-and-braces for its own
+/// sake. `visible_events` calls `access_reason` inside a set read over
+/// `events`, so a RAISE there aborts the whole statement instead of skipping
+/// one row: a single bad row would break the event feed for every reader until
+/// someone found it, and the person seeing the error would not be the person
+/// who caused it. The CHECK fails the one INSERT that is wrong, at the moment
+/// it is wrong.
+#[tokio::test]
+async fn a_collection_subject_event_is_refused_at_the_insert() {
+    let Some(w) = World::new("a_collection_subject_event_is_refused_at_the_insert").await else {
+        return;
+    };
+    let alice = w.human("alice").await;
+    let inst = w.install("journal", "user", alice, alice).await;
+
+    let insert = |kind: &'static str| {
+        sqlx::query(
+            "INSERT INTO events (kind, subject_kind, subject_id, subject_name,
+                                 owner_kind, owner_id, author_actor,
+                                 principal_kind, principal_id, body)
+             VALUES ('app.journal.touched', $1, $2, $3, 'user', $4, $4, 'user', $4, '{}'::jsonb)",
+        )
+        .bind(kind)
+        .bind(inst)
+        .bind(if kind == "collection" {
+            Some("entries")
+        } else {
+            None
+        })
+        .bind(alice)
+        .execute(w.pool())
+    };
+
+    let err = insert("collection")
+        .await
+        .expect_err("a collection-subject event was accepted");
+    assert!(
+        format!("{err}").contains("events_subject_kind_check"),
+        "refused by something other than the events CHECK: {err}"
+    );
+
+    // The control: an install-subject event still writes, so the assertion
+    // above is about `collection` and not about the fixture being wrong.
+    insert("install")
+        .await
+        .expect("an install-subject event should still be accepted");
 }

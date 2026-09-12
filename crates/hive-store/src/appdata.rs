@@ -40,7 +40,7 @@ use uuid::Uuid;
 use crate::appschema::{check_ident, quote_ident};
 use crate::docblobs::descriptors_in;
 use crate::events::{Event, append_events};
-use crate::grants::{Access, Reason, Subject};
+use crate::grants::{Access, ActingInstall, Reason, Subject};
 use crate::{Result, Store, StoreError};
 
 /// The host-mediated data layer over a store and a blob catalog.
@@ -265,10 +265,13 @@ impl AppData {
         // guest acting for anyone else needs a grant.
         let guard = self.store.guard();
         guard
-            .authorize(
+            .authorize_collection(
                 &mut tx,
                 &req.caller.cred,
                 &Subject::collection(info.id, &d.collection),
+                // The invocation IS an install, always: this signature has no
+                // way to say otherwise, which is the point.
+                ActingInstall(req.caller.install_id),
                 Access::Write,
                 "storage.insert",
             )

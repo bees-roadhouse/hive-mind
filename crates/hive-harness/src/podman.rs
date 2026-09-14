@@ -45,6 +45,33 @@ static RESERVED_ENV: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
         "https_proxy",
         "NO_PROXY",
         "no_proxy",
+        // D35: the CLI's config directory is where it keeps the login it
+        // wrote during the person's own sign-in. The launcher points it at the
+        // per-principal volume or leaves it unset; a spec that redirects it
+        // has the same hazard as redirecting HOME, one level down.
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+    ])
+});
+
+/// Refused from a spec outright, whatever else is set.
+///
+/// D35: a person's subscription signs in to the binary inside their own
+/// container, and the daemon never holds the resulting token. There is
+/// therefore no legitimate caller that can put one here; a spec carrying one
+/// means something upstream collected it, which is the thing the terms name.
+static FORBIDDEN_ENV: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| HashSet::from(["CLAUDE_CODE_OAUTH_TOKEN"]));
+
+/// A provider credential the CLI ranks ABOVE a stored login. Any of these
+/// beside a mounted config volume would bill the key and silently bypass the
+/// subscription the person linked, so the pair is refused: the caller decides
+/// volume-or-lease before it builds a spec, never both.
+static PROVIDER_KEY_ENV: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    HashSet::from([
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "OPENAI_API_KEY",
     ])
 });
 
@@ -98,6 +125,26 @@ pub fn podman_run_args(spec: &RunSpec, extra: &[String]) -> Result<Vec<String>, 
         s("--volume"),
         format!("{}:{CONTAINER_WORKSPACE}:rw", spec.workspace_dir),
     ];
+
+    // D35: the person's config volume for this runtime, and the CLI pointed at
+    // it. The CLI writes its own login there during the person's sign-in run
+    // and reads it back on every later run; the daemon mounts the directory
+    // and never opens it. Home stays a tmpfs, so everything else the CLI
+    // writes still dies with the run. `validate` has already refused a
+    // runtime with no config variable and a path that would be a named
+    // volume.
+    if !spec.config_dir.is_empty() {
+        let (var, path) = spec
+            .runtime()?
+            .config_env()
+            .ok_or_else(|| SpecError("runtime has no config directory".into()))?;
+        args.extend([
+            s("--volume"),
+            format!("{}:{path}:rw", spec.config_dir),
+            s("--env"),
+            format!("{var}={path}"),
+        ]);
+    }
 
     match spec.network {
         NetworkMode::None => {
@@ -185,6 +232,16 @@ pub fn podman_run_args(spec: &RunSpec, extra: &[String]) -> Result<Vec<String>, 
         if RESERVED_ENV.contains(key.as_str()) {
             return Err(SpecError(format!(
                 "{key:?} is set by the launcher and cannot be overridden"
+            )));
+        }
+        if FORBIDDEN_ENV.contains(key.as_str()) {
+            return Err(SpecError(format!(
+                "{key:?} never arrives by environment (D35): a subscription signs in to the binary in the person's own container and the daemon does not hold the token"
+            )));
+        }
+        if !spec.config_dir.is_empty() && PROVIDER_KEY_ENV.contains(key.as_str()) {
+            return Err(SpecError(format!(
+                "{key:?} beside config_dir: the CLI ranks a key above a stored login, so the run would bill the key and bypass the subscription the person linked; resolve volume-or-lease before building the spec"
             )));
         }
         args.extend([s("--env"), format!("{key}={value}")]);
@@ -493,6 +550,11 @@ mod tests {
             "NO_PROXY",                // how a proxied run reaches anything
             "HIVE_SANDBOX_API_SOCKET", // the daemon's API
             "HIVE_SANDBOX_RUN_ID",
+            // D35: the same hazard as HOME, one level down. A spec that aims
+            // the CLI's config directory at the workspace persists a login
+            // in the one directory that outlives the run and is snapshotted.
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
         ] {
             let mut s = spec();
             s.env.insert(key.into(), "/workspace".into());
@@ -516,6 +578,119 @@ mod tests {
             .into_iter()
             .rfind(|e| e.starts_with("HOME="));
         assert_eq!(last_home, Some("HOME=/home/harness"));
+    }
+
+    /// D35: a person's config volume is mounted at the runtime's config path
+    /// and the CLI is pointed at it, so the login the CLI wrote during the
+    /// person's own sign-in is found on the next run. Home stays a tmpfs.
+    #[test]
+    fn config_dir_is_mounted_and_the_cli_is_pointed_at_it() {
+        for (runtime, var, path) in [
+            (Runtime::Claude, "CLAUDE_CONFIG_DIR", "/config/claude"),
+            (Runtime::Codex, "CODEX_HOME", "/config/codex"),
+        ] {
+            let mut s = spec();
+            s.runtime = Some(runtime);
+            s.config_dir = "/srv/hive/config/p-nate/claude".into();
+            let args = podman_run_args(&s, &[]).unwrap();
+            assert!(
+                has_pair(&args, "--volume", &format!("{}:{path}:rw", s.config_dir)),
+                "{runtime}: config volume not mounted at {path}: {args:?}"
+            );
+            assert!(
+                has_pair(&args, "--env", &format!("{var}={path}")),
+                "{runtime}: {var} not pointed at the mount: {args:?}"
+            );
+            // The mount is added; nothing about home changes.
+            assert!(
+                values_of(&args, "--tmpfs")
+                    .iter()
+                    .any(|v| v.starts_with("/home/harness:")),
+                "{runtime}: home left the tmpfs"
+            );
+        }
+    }
+
+    /// Without a config volume there is no /config mount and no config
+    /// variable: a run with no linked subscription looks exactly as it did
+    /// before D35.
+    #[test]
+    fn no_config_dir_means_no_config_mount() {
+        let args = podman_run_args(&spec(), &[]).unwrap();
+        assert!(
+            !values_of(&args, "--volume")
+                .iter()
+                .any(|m| m.contains(":/config/")),
+            "a /config mount appeared with no config_dir: {args:?}"
+        );
+        assert!(
+            !values_of(&args, "--env")
+                .iter()
+                .any(|e| e.starts_with("CLAUDE_CONFIG_DIR=") || e.starts_with("CODEX_HOME=")),
+            "a config variable was set with no config_dir: {args:?}"
+        );
+    }
+
+    /// A subscription token never arrives by environment (D35): the daemon does
+    /// not hold one, so a spec carrying one is a bug somewhere upstream and is
+    /// refused rather than honoured.
+    #[test]
+    fn a_subscription_token_never_arrives_by_env() {
+        let mut s = spec();
+        s.env
+            .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-ant-oat01-x".into());
+        let err = podman_run_args(&s, &[]).unwrap_err();
+        assert!(
+            err.0.contains("CLAUDE_CODE_OAUTH_TOKEN") && err.0.contains("D35"),
+            "refused for the wrong reason: {err}"
+        );
+    }
+
+    /// The CLI ranks an environment key above a stored login, so a leased key
+    /// beside a config volume would bill the key and silently bypass the
+    /// subscription the person linked. Refuse the pair; the caller resolves
+    /// volume-or-lease before building a spec.
+    #[test]
+    fn a_config_dir_beside_a_provider_key_is_refused() {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENAI_API_KEY",
+        ] {
+            let mut s = spec();
+            s.config_dir = "/srv/hive/config/p-nate/claude".into();
+            s.env.insert(key.into(), "leased".into());
+            let err = podman_run_args(&s, &[]).unwrap_err();
+            assert!(
+                err.0.contains(key) && err.0.contains("config_dir"),
+                "{key}: refused for the wrong reason: {err}"
+            );
+        }
+    }
+
+    /// A bare name would become a podman NAMED volume, shared by every run that
+    /// spells it the same way: a key with the principal left out.
+    #[test]
+    fn config_dir_must_be_a_host_path_not_a_volume_name() {
+        let mut s = spec();
+        s.config_dir = "p-nate-claude".into();
+        let err = podman_run_args(&s, &[]).unwrap_err();
+        assert!(err.0.contains("named volume"), "wrong refusal: {err}");
+        // Windows dev boxes hand podman drive paths; those are paths too.
+        let mut s = spec();
+        s.config_dir = r"G:\hive\config\p-nate\claude".into();
+        assert!(podman_run_args(&s, &[]).is_ok());
+    }
+
+    /// opencode has no config-directory variable, so a subscription cannot be
+    /// linked to it yet; mounting nothing and calling it linked would be worse.
+    #[test]
+    fn a_runtime_without_a_config_dir_refuses_one() {
+        let mut s = spec();
+        s.runtime = Some(Runtime::OpenCode);
+        s.config_dir = "/srv/hive/config/p-nate/opencode".into();
+        let err = podman_run_args(&s, &[]).unwrap_err();
+        assert!(err.0.contains("opencode"), "wrong refusal: {err}");
     }
 
     #[test]

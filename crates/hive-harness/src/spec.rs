@@ -33,6 +33,22 @@ impl Runtime {
     pub fn parse(s: &str) -> Option<Runtime> {
         Runtime::ALL.into_iter().find(|r| r.as_str() == s)
     }
+
+    /// The variable this CLI reads its config directory from, and where the
+    /// per-principal config volume is mounted for it (D35). The CLI writes its
+    /// own login there (`.credentials.json`, `auth.json`) and finds it on the
+    /// next run; the daemon never opens the directory.
+    ///
+    /// `None` for a runtime whose CLI has no such variable: opencode keeps its
+    /// auth under XDG paths inside home, which is a tmpfs here, so a person
+    /// cannot link a subscription to it until that is worked out.
+    pub fn config_env(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Runtime::Claude => Some(("CLAUDE_CONFIG_DIR", "/config/claude")),
+            Runtime::Codex => Some(("CODEX_HOME", "/config/codex")),
+            Runtime::OpenCode => None,
+        }
+    }
 }
 
 impl fmt::Display for Runtime {
@@ -192,6 +208,18 @@ pub struct RunSpec {
     /// thing that outlives the run.
     pub workspace_dir: String,
 
+    /// The host path of this person's config volume for this runtime, mounted
+    /// at the runtime's config path with the CLI pointed at it (D35). Empty
+    /// means none: the run has no linked subscription and takes a leased key.
+    ///
+    /// One directory per principal per runtime, and the harness does not care
+    /// what backs it on the host. What it holds is the login the unmodified
+    /// CLI wrote during the person's own sign-in, which is why a spec that
+    /// sets this AND carries a provider key is refused: the CLI ranks an
+    /// environment key above a stored login, so the pair would quietly bill
+    /// the key instead of the subscription the person chose.
+    pub config_dir: String,
+
     /// Resumes a prior conversation (D12.9). Empty starts fresh.
     pub session_id: String,
 
@@ -278,6 +306,29 @@ impl RunSpec {
         }
         if self.workspace_dir.is_empty() {
             return Err(SpecError("workspace_dir is required".into()));
+        }
+        if !self.config_dir.is_empty() {
+            // A bare name is not a path to podman: `--volume name:/config`
+            // silently creates a NAMED volume called `name`, shared by every
+            // run that spells it the same way. That is a key with the
+            // principal left out (invariant 14), refused here rather than
+            // discovered when two people find they share a login.
+            let c = self.config_dir.as_bytes();
+            let looks_like_a_path = c[0] == b'/'
+                || c[0] == b'\\'
+                || (c.len() > 2 && c[0].is_ascii_alphabetic() && c[1] == b':');
+            if !looks_like_a_path {
+                return Err(SpecError(format!(
+                    "config_dir {:?} must be an absolute host path; a bare name would become a podman named volume shared across principals",
+                    self.config_dir
+                )));
+            }
+            let runtime = self.runtime()?;
+            if runtime.config_env().is_none() {
+                return Err(SpecError(format!(
+                    "runtime {runtime} has no config directory to mount; a subscription cannot be linked to it yet"
+                )));
+            }
         }
         if self.deadline.is_zero() {
             return Err(SpecError(

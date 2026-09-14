@@ -106,15 +106,43 @@ Built as:
    always take the lease path**, because "ordinary, individual usage" is the
    line the usage-limits sentence draws, and an unattended loop spending a
    consumer subscription is the thing on the other side of it.
-6. **A person may bring their own image or modify one in house.** The image
-   is already a per-run digest pin (`RunSpec::image_repository`,
-   `image_digest`, D12.5); this adds a per-principal pin the run resolves
-   before the deployment default. The image around the binary is theirs. The
-   binary inside it is the other thing the terms single out, so the platform
-   records the CLI version the image reports at pin time and the D says
-   plainly: a modified `claude` binary is outside the case this decision
-   stands in, and the platform does not check for one beyond the version
-   label, because it cannot.
+6. **A person may bring their own image or modify one in house, and so may
+   the AI running in it.** Nate, later the same day: "ai should also have
+   direct access to change its container image as well. tool should always be
+   available." The image is already a per-run digest pin
+   (`RunSpec::image_repository`, `image_digest`, D12.5); this adds a
+   per-principal pin the run resolves before the deployment default, and a
+   host tool, always present in a principal's runs, that moves it:
+   - **Input** is a Containerfile or build context in the workspace, or a
+     registry reference. The tool builds (or pulls), records the digest, and
+     pins it **for that principal**; the pin is keyed on the principal, not
+     the run or the runtime's default (invariant 14).
+   - **It takes effect on the next run, never mid-run.** A run is one
+     container from one digest; the supervisor never swaps under it.
+   - **Every change is an event** carrying old digest, new digest and who
+     made it: the AI actor acting for the principal (invariant 2), or the
+     person from the UI. The person can roll back to any earlier digest from
+     that history.
+   - **The image controls userland only.** Nothing in it changes what the
+     harness decides: capabilities, privileges, network mode, mounts, the
+     uid, the reserved environment (`HOME`, `CLAUDE_CONFIG_DIR`,
+     `CODEX_HOME`, the proxy variables). Those are `podman run` arguments
+     the launcher composes and `isolates_by_default` asserts; an image cannot
+     reach them. Otherwise an AI with this tool rewrites its own sandbox.
+   - **A broken image falls back.** A pinned digest whose container fails to
+     start (as distinct from a run that fails inside it) is marked and the
+     last digest that started is used, with an event saying so, so an AI
+     cannot brick its own container and a person cannot lock themselves out.
+   - The binary inside is the other thing the terms single out. The platform
+     records the CLI version the image reports at pin time and says plainly:
+     a modified `claude` binary is outside the case this decision stands in,
+     and the platform does not check for one beyond the version label,
+     because it cannot. "Always available" means the tool, not a promise
+     that what it builds stays inside the terms; the person who linked the
+     subscription is the one the terms bind.
+   - Where builds run (rootless BuildKit on the host, or a build job on the
+     cluster) and where images live (a registry, which D12.5's cross-machine
+     pin needed anyway) are Pia's side and are not decided here.
 
 ## Why this shape
 

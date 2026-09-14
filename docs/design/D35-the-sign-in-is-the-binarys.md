@@ -212,5 +212,19 @@ Built as:
   through `hive-blob`'s S3 driver. The harness does not know any of this:
   it mounts the path it is handed, one per principal per runtime.
   Encryption at rest is decided with the placement.
+
+  **The Claude placement is provisional.** JuiceFS went up the same
+  evening (StorageClass `juicefs`, one filesystem, a subdirectory per PVC
+  with the claim size as quota; `longhorn-2r` for Codex). Pia's first
+  numbers, taken while two rclone jobs were saturating the Garage node:
+  metadata 15–35 ms per op and usable, locks correct, but 50 synced 4 KiB
+  writes took 184 s against 0.35 s on Longhorn. That matters here because
+  Claude Code's config directory is not only a credential file: it takes
+  small appends on every turn (`history.jsonl`, `projects/<slug>/*.jsonl`,
+  debug logs), so a slow small-write path slows every hosted session. If
+  the rerun with the copies finished does not bring small writes near
+  Longhorn's, the Claude config volume moves to `longhorn-2r` as well and
+  JuiceFS keeps the workspaces only once git timings clear. Nothing in the
+  harness changes either way.
 - Whether apis, the DTC identity, may link anything: no, until Nate says so,
   and never a DTC credential on the Roadhouse instance.

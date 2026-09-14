@@ -73,6 +73,14 @@ Every one of these is a deny a `RunSpec` cannot widen, asserted in
 | `--memory`, `--cpus`, `--pids-limit` | all required on the spec; an uncapped harness run is a feral loop waiting to happen (D12.8) |
 | `--volume <workspace>:/workspace:rw` | the only writable thing that outlives the run |
 
+D35 adds one more mount, not yet built: a per-principal config volume at
+`/config/<runtime>`, with `CLAUDE_CONFIG_DIR` or `CODEX_HOME` set by the
+launcher (and reserved from the spec, like `HOME`). It exists so a person's
+own subscription login, written there by the unmodified CLI during a sign-in
+run, is found by their next run. Home stays a tmpfs; the daemon never opens a
+file under the volume; and a bind mount is not captured by `podman commit`, so
+the snapshot property above still holds.
+
 ## Network modes
 
 | Mode | What it does |

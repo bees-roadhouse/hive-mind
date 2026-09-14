@@ -16,6 +16,14 @@ in an image.
 Both are wrong in the same way: the credential outlives the reason it was
 handed over.
 
+**What is not in the vault:** a person's Claude or ChatGPT subscription login.
+D35 keeps that in a per-principal config directory the CLI writes and refreshes
+itself, mounted into that person's runs and never opened by the daemon, because
+the terms forbid a platform holding the token and because a vault compromise
+should not become an account compromise. The vault holds API keys, which are
+ours to hold; a run with no linked subscription, and every automated run, takes
+a leased key from here.
+
 ## Why this cannot be "just mount the secrets"
 
 Two things already in this repo make the naive version dangerous.

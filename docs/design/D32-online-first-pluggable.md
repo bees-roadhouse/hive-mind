@@ -114,6 +114,12 @@ for reversal.)* (#88)
 
 ## 6. A person's own Claude subscription runs their agents; it is not the login
 
+**The mechanism below is superseded by D35** (2026-09-14): the terms read on
+that day forbid a platform collecting, storing or intermediating a Claude.ai
+session token, which is exactly what the `setup-token` step does. The goal
+stands; the credential now lives in a per-person config directory the CLI
+writes itself. Kept as written so the correction is visible.
+
 Nate: "Sign in with claude subscription.. yes they do. and i don't want to use
 it for authentication, just to get the token so users can use their
 subscription since they're using claude code directly over the app."

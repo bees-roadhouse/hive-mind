@@ -200,7 +200,17 @@ Built as:
 - The interactive terminal in the browser client (a PTY-attached harness run
   over a WebSocket) is the enrollment surface and is a piece of work in its
   own right; it is not designed here.
-- Where the per-principal volumes live on the Talos cluster (Longhorn, an
-  encrypted volume or not) is Pia's side.
+- Where the per-principal volumes live on the cluster is Pia's side. Nate's
+  fleet-wide rule, later the same day: config and high-throughput file data
+  on JuiceFS, SQLite-backed things on Longhorn block volumes, large
+  unstructured objects in Garage over S3 directly. For this repo that puts
+  the Claude config volume and the workspaces on JuiceFS (JSON, JSONL and
+  lock files; git inside the workspace), and the **Codex config volume on
+  Longhorn**, because `CODEX_HOME` holds SQLite with WAL (`goals_*.sqlite`,
+  `logs_*.sqlite`, checked on a workstation) and WAL on a network filesystem
+  is the case the rule exists for. Blobs already go to Garage directly
+  through `hive-blob`'s S3 driver. The harness does not know any of this:
+  it mounts the path it is handed, one per principal per runtime.
+  Encryption at rest is decided with the placement.
 - Whether apis, the DTC identity, may link anything: no, until Nate says so,
   and never a DTC credential on the Roadhouse instance.

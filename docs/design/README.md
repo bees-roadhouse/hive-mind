@@ -28,3 +28,4 @@ does not.
 | [D32](D32-online-first-pluggable.md) | online-first with htmx, every resource a host capability, core entities shared by grant, the journal as a guest, TypeScript as the second guest language, a person's own Claude subscription runs their agents |
 | [D33](D33-collection-access-needs-the-asking-install.md) | cross-app collection access is decided on the asking install as well as the principal; grants gain an install target |
 | [D34](D34-hive-mind-rename.md) | the repository is Hive Mind; the crate, binary, env vars and test database stay `hive-sandbox`, because a name's cost is its blast radius |
+| [D35](D35-the-sign-in-is-the-binarys.md) | a person's subscription signs in to the unmodified CLI inside their own container; the platform keeps a per-principal config volume and never the token; the vault leases API keys; automated runs use keys; the terms and the accepted residual risk are on the record |

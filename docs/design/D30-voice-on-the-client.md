@@ -1,5 +1,11 @@
 # D30: voice is an interface, and it is rendered on the client
 
+**The placement below is reversed by D36** (2026-09-14): both directions
+now run in a server worker, because "best open model and voice quality
+available" is a server-tier property and the shell went online-first (D32).
+D30's principle, that text is the record and audio is never stored, is kept
+by D36. Kept as written so the reversal and its reasons are both visible.
+
 **Inputs**, from Nate on 2026-09-02, late: record Kokoro in the design docs
 as the way to interface with the platform by voice, with the rendering done
 **client side**. Same night, the fleet gained a server-side voice stack

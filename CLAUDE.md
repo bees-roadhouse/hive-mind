@@ -241,7 +241,9 @@ invariant was written, and nobody caught one of them at merge time.
   least `MIN_INVARIANTS` of them. Adding one means raising that constant in the
   same commit. The regex is anchored at column zero, so nested numbered lists
   elsewhere in this file are invisible to it ... keep them indented.
-- Ten load-bearing phrases must survive verbatim. Rewording one means updating
+- The load-bearing phrases in `REQUIRED_PHRASES` must survive verbatim (the
+  count lives there, not here, because a number in prose rots: this line said
+  "ten" while the list held twelve). Rewording one means updating
   `REQUIRED_PHRASES` in the same commit.
 - A phrase must not span a line break. This file is hard-wrapped and the check
   reads raw bytes, so a sentence that renders as one line can be two in source.
@@ -390,7 +392,7 @@ and has tests.
      well written. Ask what size makes the loop take its other path.
 - **Ask what the instrument measured before believing it.** The general form,
   and every detector below is an instance of it: **the instrument answered a
-  narrower question than the one you are about to report.** Seven, each earned
+  narrower question than the one you are about to report.** Eight, each earned
   here by nearly shipping the thing it catches:
   - **Check the platform.** Green on your machine is a claim about your machine.
     A test that passed three times on Windows failed deterministically on Linux,
@@ -430,8 +432,26 @@ and has tests.
     reproductions here passed by hitting a foreign key, an unknown-tool error and
     a parse error rather than the rule under test; the message assertion caught
     all three. Refusal is the cheapest thing to get accidentally right.
+  - **Check what your instrument cannot see.** Before trusting a probe, ask
+    whether **the instrument's failure mode did not overlap the bug's**. Three
+    times in one afternoon: `podman exec pg_isready` cannot fail the way a
+    caller on the host fails (the container was up; the port was not
+    forwarded), so it said healthy while every connect was refused. A grep for
+    `Storage {` to find struct literals missing a new field returned twelve
+    hits, eleven of them a *trait* of the same name, and the one real case was
+    found by reading the diff; the compiler, whose failure mode is exactly
+    "this literal is missing a field", found it on the first build. A grep for
+    `..Default::default()` to find `RunSpec` literals that would break flagged
+    one that spells it `..RunSpec::default()` and compiles. A call-site scan
+    for `access_reason('tool', …)` finds the callers that named the kind and
+    never the ones that read it off a table, and in this codebase the second
+    kind is where the questions live. The fix is the same each time: **pick
+    the instrument whose failure mode matches the bug** ... a TCP connect for
+    "can I connect", the compiler for "does this compile", a read for "what
+    does this literal contain" ... and when none exists, say what the one you
+    used cannot see.
 - **Some instruments cannot express the distinction the question needs, and no
-  amount of careful reading fixes that.** The seven above are people over-reading
+  amount of careful reading fixes that.** The eight above are people over-reading
   an instrument. This one is different: the SSE test reader silently discarded an
   all-empty block, so "no frame arrived" covered three unrelated causes ... the
   handler returned, the branch was starved, or a frame was written the parser

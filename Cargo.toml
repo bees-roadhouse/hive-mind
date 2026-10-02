@@ -8,6 +8,7 @@
 members = [
     "crates/hive-identity",
     "crates/hive-trust",
+    "crates/hive-db",
     "crates/hive-testdb",
     "crates/hive-schema",
     "crates/hive-store",
@@ -41,8 +42,11 @@ publish = false
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net", "fs", "signal"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-# Runtime queries, never the compile-time macros: the gate builds on machines
-# with no database in reach. rustls for the reason the Go host had no CGo.
+# libSQL, the engine (D38): SQLite with vectors, replicas and encryption in
+# the same crate. `core` only for now; the replica and encryption features are
+# phase 3 and are turned on by the daemon when that lands, not here.
+libsql = { version = "0.9", default-features = false, features = ["core"] }
+# Still here while the port is in flight; removed with the last Postgres crate.
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "macros"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

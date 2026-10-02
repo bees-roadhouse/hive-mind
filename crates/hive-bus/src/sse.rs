@@ -154,9 +154,13 @@ impl Bus {
                     .expect("static response");
             }
         };
-        // One all-partition probe per connect, to turn a bare id into a real
-        // position. Never per poll.
-        let cursor = match hive_store::resolve_cursor(&self.inner.pool, cursor).await {
+        // One probe per connect, to turn a bare id into a real position.
+        // Never per poll.
+        let resolved = match self.inner.conn().await {
+            Ok(c) => hive_store::resolve_cursor(&c, cursor).await,
+            Err(e) => Err(e),
+        };
+        let cursor = match resolved {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(err = %e, "sse: resolve cursor");
@@ -232,7 +236,7 @@ impl Bus {
             // non-waiting one: a missing value is "no floor yet".
             last_safe = self.settled_floor();
         } else {
-            let mut conn = match store.conn().await {
+            let conn = match store.conn().await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(err = %e, "sse: acquire for replay");
@@ -242,7 +246,7 @@ impl Bus {
             let since = cursor.at_or_epoch()
                 - chrono::Duration::from_std(self.inner.cfg.overlap).unwrap_or_default();
             let replay = match guard
-                .replay(&mut conn, &cred, cursor, since, opts.max_replay + 1)
+                .replay(&conn, &cred, cursor, since, opts.max_replay + 1)
                 .await
             {
                 Ok(r) => r,
@@ -294,11 +298,11 @@ impl Bus {
                     if !gate.check().await {
                         return Ok(());
                     }
-                    let mut conn = match store.conn().await {
+                    let conn = match store.conn().await {
                         Ok(c) => c,
                         Err(e) => { tracing::warn!(err = %e, "sse: acquire"); return Ok(()); }
                     };
-                    let visible = match guard.visible(&mut conn, &cred, &batch).await {
+                    let visible = match guard.visible(&conn, &cred, &batch).await {
                         Ok(v) => v,
                         Err(e) => { tracing::warn!(err = %e, "sse: visible"); return Ok(()); }
                     };

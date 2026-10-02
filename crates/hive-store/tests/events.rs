@@ -447,7 +447,7 @@ async fn events_are_append_only_and_origin_dedupes() {
             .bind(alice)
             .bind(origin)
             .bind(origin_id)
-            .execute(&*db.conn().await.unwrap())
+            .execute(&db.conn().await.unwrap())
             .await
         }
     };
@@ -635,7 +635,7 @@ async fn migrate_concurrent() {
         "migration one ran more than once"
     );
     let n: i64 = query("SELECT count(*) FROM schema_migrations")
-        .fetch_scalar(&*db.conn().await.unwrap())
+        .fetch_scalar(&db.conn().await.unwrap())
         .await
         .unwrap();
     assert_eq!(n as usize, hive_store::MIGRATIONS.len());
@@ -658,7 +658,7 @@ async fn a_future_event_is_refused_and_a_minute_of_skew_is_not() {
             )
             .bind(alice)
             .bind(common::now() + offset)
-            .execute(&*db.conn().await.unwrap())
+            .execute(&db.conn().await.unwrap())
             .await
         }
     };

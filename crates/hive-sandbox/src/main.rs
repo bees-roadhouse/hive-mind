@@ -16,7 +16,9 @@ use hive_bus::Bus;
 use hive_chat::{Hub, Worker};
 use hive_harness::{ImagePins, PinError, PodmanLauncher, Supervisor};
 use hive_httpapi::Options;
-use hive_sandbox::{BlobConfig, blob_driver, unix_listener};
+#[cfg(unix)]
+use hive_sandbox::unix_listener;
+use hive_sandbox::{BlobConfig, blob_driver};
 use hive_store::{AppData, BootstrapConfig, Chat, GuestBlobs, GuestEvents, Store};
 use hive_wasmhost::{Deps, Host};
 use tokio_util::sync::CancellationToken;
@@ -60,9 +62,10 @@ struct Args {
     /// Claim and execute workflow steps.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     run_workflows: bool,
-    /// Postgres connection string.
-    #[arg(long, env = "HIVE_SANDBOX_DATABASE_URL")]
-    database_url: Option<String>,
+    /// Where the store files live: `hive.db` and `hive-audit.db` (D38).
+    /// Created on first boot.
+    #[arg(long, env = "HIVE_SANDBOX_DATA_DIR")]
+    data_dir: Option<String>,
     /// Apply pending migrations at boot.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     migrate: bool,
@@ -132,10 +135,10 @@ impl Args {
     /// Whether the enabled roles read or write platform state.
     ///
     /// The egress proxy deliberately does not: it runs inside a harness
-    /// container beside the run it is fencing, with no reason to reach
-    /// Postgres and no credentials to reach it with. Requiring a connection
-    /// string there would make every run depend on the database being up in
-    /// order to be DENIED network access, which is backwards.
+    /// container beside the run it is fencing, with no reason to reach the
+    /// store and no mount to reach it with. Requiring a data directory there
+    /// would make every run depend on the store being present in order to be
+    /// DENIED network access, which is backwards.
     fn needs_database(&self) -> bool {
         self.serve_api || self.run_workflows || self.run_chat
     }
@@ -189,8 +192,8 @@ async fn run() -> anyhow::Result<()> {
             "no role enabled: pass --serve-api, --run-workflows, --run-chat, --run-egress-proxy, or a combination"
         );
     }
-    if args.needs_database() && args.database_url.as_deref().unwrap_or("").is_empty() {
-        bail!("no database: pass --database-url or set HIVE_SANDBOX_DATABASE_URL");
+    if args.needs_database() && args.data_dir.as_deref().unwrap_or("").is_empty() {
+        bail!("no store: pass --data-dir or set HIVE_SANDBOX_DATA_DIR");
     }
 
     tracing::info!(
@@ -222,7 +225,7 @@ async fn run() -> anyhow::Result<()> {
     let mut wake: Option<Arc<dyn Fn() + Send + Sync>> = None;
 
     if args.needs_database() {
-        let st = Store::open(args.database_url.as_deref().unwrap_or(""))
+        let st = Store::open(std::path::Path::new(args.data_dir.as_deref().unwrap_or("")))
             .await
             .context("open store")?;
         prepare(&st, &args).await?;
@@ -238,7 +241,7 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("blob driver")?;
         let driver_name = driver.name();
-        let cat = Arc::new(Catalog::new(st.pool().clone(), driver));
+        let cat = Arc::new(Catalog::new(st.db().clone(), driver));
         let deps = Deps {
             storage: Arc::new(AppData::new(st.clone(), cat.clone())),
             blob: Arc::new(GuestBlobs::new(st.clone(), cat.clone())),
@@ -274,7 +277,7 @@ async fn run() -> anyhow::Result<()> {
         apps = Some(Arc::new(AppRoutes(surfaces)) as Arc<dyn hive_httpapi::AppRouter>);
         host = Some(h);
 
-        let b = Bus::new(st.pool().clone(), hive_bus::Config::default());
+        let b = Bus::new(st.db().clone(), hive_bus::Config::default());
         {
             let run = b.clone();
             let c = cancel.clone();
@@ -317,7 +320,8 @@ async fn run() -> anyhow::Result<()> {
         listeners += 1;
     }
 
-    let mut socket_guard = None;
+    #[cfg(unix)]
+    let mut socket_guard: Option<hive_sandbox::UnixSocket> = None;
     if args.serve_api {
         let app = hive_httpapi::router(
             store.clone(),
@@ -365,6 +369,11 @@ async fn run() -> anyhow::Result<()> {
         // no gateway and cannot reach the host at all. Without this the
         // harness has no route to the API and the failure looks like a bug
         // inside the run.
+        #[cfg(not(unix))]
+        if args.unix_socket.as_deref().is_some_and(|p| !p.is_empty()) {
+            bail!("--unix-socket needs a unix host");
+        }
+        #[cfg(unix)]
         if let Some(path) = args.unix_socket.as_deref().filter(|p| !p.is_empty()) {
             let mut sock = unix_listener(path).await?;
             let listener = sock.take().expect("fresh socket");
@@ -405,6 +414,7 @@ async fn run() -> anyhow::Result<()> {
     if let Some(h) = host {
         h.close().await;
     }
+    #[cfg(unix)]
     drop(socket_guard);
     if let Some(st) = store {
         st.close().await;
@@ -412,6 +422,7 @@ async fn run() -> anyhow::Result<()> {
     outcome
 }
 
+#[cfg(unix)]
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -422,21 +433,26 @@ async fn shutdown_signal() {
     }
 }
 
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 /// Brings the schema up to date and seeds root, in that order.
 async fn prepare(st: &Store, args: &Args) -> anyhow::Result<()> {
     if args.migrate {
-        let applied = hive_store::migrate(st.pool()).await.context("migrate")?;
+        let applied = hive_store::migrate(st.db()).await.context("migrate")?;
         if !applied.is_empty() {
             tracing::info!(versions = ?applied, "migrated");
         }
-    }
-    // A blocked month is degraded, not down: writes still land in the DEFAULT
-    // partition, so this logs and carries on rather than failing every boot.
-    let mut conn = st.conn().await?;
-    let blocked = hive_store::ensure_event_partitions(&mut conn, 2).await?;
-    drop(conn);
-    if !blocked.is_empty() {
-        tracing::warn!(months = ?blocked, "event partitions blocked; rows in the default partition are in the way");
+        // The override audit is its own file (D38): a row written under a
+        // caller's open write lock must survive that caller's rollback.
+        let applied = hive_store::migrate_audit(st.audit())
+            .await
+            .context("migrate audit")?;
+        if !applied.is_empty() {
+            tracing::info!(versions = ?applied, "migrated audit");
+        }
     }
     bootstrap_from_env(st).await
 }
@@ -476,8 +492,8 @@ async fn bootstrap_from_env(st: &Store) -> anyhow::Result<()> {
     if token.is_empty() {
         return Ok(());
     }
-    let mut conn = st.conn().await?;
-    hive_store::ensure_bootstrap_credential(&mut conn, res.root_actor_id, &token)
+    let conn = st.conn().await?;
+    hive_store::ensure_bootstrap_credential(&conn, res.root_actor_id, &token)
         .await
         .context("bootstrap credential")?;
     tracing::info!(actor = %res.root_actor_id, "bootstrap credential present");

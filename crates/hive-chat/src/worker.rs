@@ -463,7 +463,8 @@ impl Worker {
                 }),
             );
         }
-        let n = hive_store::reclaim_abandoned_runs(self.store.pool(), ABANDONED_RUN_GRACE).await?;
+        let conn = self.store.conn().await?;
+        let n = hive_store::reclaim_abandoned_runs(&conn, ABANDONED_RUN_GRACE).await?;
         if n > 0 {
             tracing::warn!(count = n, "chat: marked abandoned runs indeterminate");
         }

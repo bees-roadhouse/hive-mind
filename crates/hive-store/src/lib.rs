@@ -153,7 +153,7 @@ impl StoreError {
         matches!(self, StoreError::Denied)
     }
 
-    pub(crate) fn db(what: impl Into<String>, e: hive_db::Error) -> StoreError {
+    pub fn db(what: impl Into<String>, e: hive_db::Error) -> StoreError {
         StoreError::Db(what.into(), e)
     }
 
@@ -271,9 +271,12 @@ impl Store {
             .map_err(|e| StoreError::db("connect", e))
     }
 
-    /// Nothing to close: connections are per operation and the file needs no
-    /// farewell. Kept so the daemon's shutdown reads the same as before.
-    pub async fn close(&self) {}
+    /// Refuses every later checkout on both files. Every clone of this store
+    /// is closed with it.
+    pub async fn close(&self) {
+        self.db.close();
+        self.audit.close();
+    }
 }
 
 /// The point check's SQL with every argument a placeholder, for the one test

@@ -16,7 +16,7 @@ use hive_store::{AgentRunStore, RunWriter};
 use hive_trust::Level;
 use uuid::Uuid;
 
-async fn chat_api(test: &str, plain_http: bool) -> Option<Api> {
+async fn chat_api(test: &str, plain_http: bool) -> Api {
     Api::with(
         test,
         Setup {
@@ -41,9 +41,7 @@ async fn create_conversation(a: &Api, token: &str) -> Uuid {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conversation_lifecycle_over_http() {
-    let Some(a) = chat_api("chatapi_lifecycle", false).await else {
-        return;
-    };
+    let a = chat_api("chatapi_lifecycle", false).await;
     let id = create_conversation(&a, &a.root_token).await;
 
     let (status, raw) = get(&format!("{}/conversations", a.url), &a.root_token).await;
@@ -127,9 +125,7 @@ async fn conversation_lifecycle_over_http() {
 /// cookie-carried credential: a cross-site form cannot send that content type.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_writes_require_json() {
-    let Some(a) = chat_api("chatapi_json", false).await else {
-        return;
-    };
+    let a = chat_api("chatapi_json", false).await;
     let id = create_conversation(&a, &a.root_token).await;
 
     for path in [
@@ -184,9 +180,7 @@ fn cookie_named<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Opti
 /// sites away from it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_cookie_carries_the_credential() {
-    let Some(a) = chat_api("chatapi_session", false).await else {
-        return;
-    };
+    let a = chat_api("chatapi_session", false).await;
     let client = reqwest::Client::new();
 
     let res = client
@@ -262,9 +256,7 @@ async fn session_cookie_carries_the_credential() {
 /// over it. Everything else about the cookie is unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_http_deployment_drops_secure_and_nothing_else() {
-    let Some(a) = chat_api("chatapi_plain", true).await else {
-        return;
-    };
+    let a = chat_api("chatapi_plain", true).await;
     let res = reqwest::Client::new()
         .post(format!("{}/session", a.url))
         .header("Authorization", format!("Bearer {}", a.root_token))
@@ -459,13 +451,11 @@ fn run_frame(seq: i32, kind: &str, text: &str) -> Update {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_replays_the_turn_in_flight_then_goes_live() {
-    let Some(a) = chat_api("chatapi_stream", false).await else {
-        return;
-    };
+    let a = chat_api("chatapi_stream", false).await;
     let id = create_conversation(&a, &a.root_token).await;
     let root_cred = {
-        let mut conn = a.store.conn().await.unwrap();
-        hive_store::resolve_credential(&mut conn, &a.root_token)
+        let conn = a.store.conn().await.unwrap();
+        hive_store::resolve_credential(&conn, &a.root_token)
             .await
             .unwrap()
     };
@@ -537,9 +527,7 @@ async fn stream_replays_the_turn_in_flight_then_goes_live() {
 /// tool result published live reaches the wire with no text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_on_a_quiet_conversation_is_quiet() {
-    let Some(a) = chat_api("chatapi_quiet", false).await else {
-        return;
-    };
+    let a = chat_api("chatapi_quiet", false).await;
     let id = create_conversation(&a, &a.root_token).await;
     let mut s = open_stream(
         &format!("{}/conversations/{id}/stream", a.url),

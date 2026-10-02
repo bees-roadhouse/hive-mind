@@ -1444,7 +1444,7 @@ async fn org_members_are_human() {
                 .bind(member)
                 .bind(role)
                 .bind(by)
-                .execute(&*db.conn().await.unwrap())
+                .execute(&db.conn().await.unwrap())
                 .await
         }
     };

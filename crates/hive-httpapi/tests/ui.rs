@@ -68,7 +68,7 @@ fn scripts_are_external(page: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_root_is_the_sign_in_card_without_a_session_and_the_app_with_one() {
-    let Some(a) = Api::with(
+    let a = Api::with(
         "ui_root",
         Setup {
             chat: true,
@@ -76,10 +76,7 @@ async fn the_root_is_the_sign_in_card_without_a_session_and_the_app_with_one() {
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
 
     let (status, page, h) = as_browser("GET", &format!("{}/", a.url), "", false, None).await;
     assert_eq!(status, 200);
@@ -119,7 +116,7 @@ async fn the_root_is_the_sign_in_card_without_a_session_and_the_app_with_one() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fragments_compose_a_thread_and_escape_everything() {
-    let Some(a) = Api::with(
+    let a = Api::with(
         "ui_fragments",
         Setup {
             chat: true,
@@ -127,10 +124,7 @@ async fn fragments_compose_a_thread_and_escape_everything() {
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let t = &a.root_token;
 
     // Create: the list comes back with the new row active, and the thread
@@ -249,7 +243,7 @@ async fn fragments_compose_a_thread_and_escape_everything() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutations_need_the_htmx_header_and_a_session() {
-    let Some(a) = Api::with(
+    let a = Api::with(
         "ui_guards",
         Setup {
             chat: true,
@@ -257,10 +251,7 @@ async fn mutations_need_the_htmx_header_and_a_session() {
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let t = &a.root_token;
 
     // A plain form post, the shape a cross-site page can produce, is refused.

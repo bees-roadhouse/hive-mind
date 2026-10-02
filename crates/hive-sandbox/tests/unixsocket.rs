@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Ported from unixsocket_test.go and stalesocket_unix_test.go.
 
 use std::os::unix::fs::PermissionsExt;

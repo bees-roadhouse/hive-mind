@@ -13,9 +13,7 @@ use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enroll_exchanges_a_live_token_for_a_device_token() {
-    let Some(a) = Api::new("api_enroll").await else {
-        return;
-    };
+    let a = Api::new("api_enroll").await;
 
     let (status, body) = post(
         &format!("{}/credentials", a.url),
@@ -28,8 +26,8 @@ async fn enroll_exchanges_a_live_token_for_a_device_token() {
     let token = got["token"].as_str().unwrap().to_string();
 
     // The minted token must actually authenticate, as its own actor.
-    let mut conn = a.store.conn().await.unwrap();
-    let cred = hive_store::resolve_credential(&mut conn, &token)
+    let conn = a.store.conn().await.unwrap();
+    let cred = hive_store::resolve_credential(&conn, &token)
         .await
         .expect("minted token does not resolve");
     assert_eq!(cred.actor_id, a.root, "actor should be the issuing actor");
@@ -58,9 +56,7 @@ async fn enroll_exchanges_a_live_token_for_a_device_token() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enroll_rejects_an_ai_caller_with_the_generic_forbidden() {
-    let Some(a) = Api::new("api_enroll_ai").await else {
-        return;
-    };
+    let a = Api::new("api_enroll_ai").await;
     let (_, ai_token) = a.ai("helper", "nova", a.root).await;
 
     let (status, body) = post(
@@ -78,9 +74,7 @@ async fn enroll_rejects_an_ai_caller_with_the_generic_forbidden() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enroll_rejects_bad_requests() {
-    let Some(a) = Api::new("api_enroll_bad").await else {
-        return;
-    };
+    let a = Api::new("api_enroll_bad").await;
     let cases = [
         ("no label", "{}".to_string()),
         ("blank", r#"{"label":"   "}"#.to_string()),
@@ -102,9 +96,7 @@ async fn enroll_rejects_bad_requests() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn whoami_reports_actor_principal_and_credential() {
-    let Some(a) = Api::new("api_whoami").await else {
-        return;
-    };
+    let a = Api::new("api_whoami").await;
     let (alice, alice_token) = a.human("alice").await;
 
     let (status, body) = get(&format!("{}/whoami", a.url), &alice_token).await;
@@ -137,9 +129,7 @@ async fn whoami_reports_actor_principal_and_credential() {
 /// handler that leaks any of it back puts the oracle on the wire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_unauthorized_is_byte_identical() {
-    let Some(a) = Api::new("api_401").await else {
-        return;
-    };
+    let a = Api::new("api_401").await;
 
     let (_, unknown) = get(&format!("{}/whoami", a.url), "no-such-token").await;
 
@@ -147,23 +137,22 @@ async fn every_unauthorized_is_byte_identical() {
     a.revoke(&revoked).await;
 
     let disabled = Uuid::new_v4();
-    sqlx::query(
+    hive_db::query(
         "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor, disabled_at)
-         VALUES ($1, 'human', 'departed', 'departed', 'user', $1, $2, now())",
+         VALUES (?1, 'human', 'departed', 'departed', 'user', ?1, ?2, ?3)",
     )
     .bind(disabled)
     .bind(a.root)
-    .execute(a.db.pool())
+    .bind(hive_db::now())
+    .execute(&*a.conn().await)
     .await
     .unwrap();
     let disabled_token = a.insert_credential(disabled).await;
 
-    // A database that cannot answer is absence of scope too. Closing the pool
+    // A store that cannot answer is absence of scope too. Closing the pool
     // makes the auth lookup fail inside the extractor rather than at the edge.
-    let Some(dead) = Api::new("api_401_dead").await else {
-        return;
-    };
-    dead.store.pool().close().await;
+    let dead = Api::new("api_401_dead").await;
+    dead.store.close().await;
 
     let cases = [
         ("revoked", get(&format!("{}/whoami", a.url), &revoked).await),
@@ -196,9 +185,7 @@ async fn every_unauthorized_is_byte_identical() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_method_is_rejected() {
-    let Some(a) = Api::new("api_405").await else {
-        return;
-    };
+    let a = Api::new("api_405").await;
     let (status, _) = get(&format!("{}/credentials", a.url), &a.root_token).await;
     assert_eq!(status, 405, "GET /credentials");
     let (status, _) = post(&format!("{}/whoami", a.url), &a.root_token, "{}").await;
@@ -209,26 +196,23 @@ async fn wrong_method_is_rejected() {
 // --- readiness ----------------------------------------------------------------
 
 /// Liveness answers while the process is up. Readiness must not: a daemon that
-/// cannot reach Postgres is running and useless, and a probe that cannot tell
+/// cannot open its store is running and useless, and a probe that cannot tell
 /// those apart sends traffic to a replica that will fail every request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn readyz_reports_postgres_and_bus() {
-    let Some(a) = Api::with(
+async fn readyz_reports_store_and_bus() {
+    let a = Api::with(
         "api_readyz",
         Setup {
             run_bus: true,
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let (status, body) = get(&format!("{}/readyz", a.url), "").await;
     assert_eq!(status, 200, "body {}", text(&body));
     let got = decode(&body);
     assert_eq!(got["status"], "ready");
-    assert_eq!(got["checks"]["postgres"], "ok");
+    assert_eq!(got["checks"]["store"], "ok");
     assert_eq!(got["checks"]["bus"], "ok");
     assert_eq!(got["version"], "test-v1");
     a.stop().await;
@@ -239,9 +223,7 @@ async fn readyz_reports_postgres_and_bus() {
 /// watermark it has not established (invariant 4 through the front door).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readyz_is_not_ready_before_the_bus_has_tailed() {
-    let Some(a) = Api::new("api_readyz_untailed").await else {
-        return;
-    };
+    let a = Api::new("api_readyz_untailed").await;
     let (status, body) = get(&format!("{}/readyz", a.url), "").await;
     assert_eq!(status, 503, "body {}", text(&body));
     let got = decode(&body);
@@ -255,26 +237,23 @@ async fn readyz_is_not_ready_before_the_bus_has_tailed() {
 
 /// A dead pool must fail the probe rather than hang it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn readyz_fails_when_postgres_is_gone() {
-    let Some(a) = Api::with(
+async fn readyz_fails_when_the_store_is_gone() {
+    let a = Api::with(
         "api_readyz_dead",
         Setup {
             run_bus: true,
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
-    a.store.pool().close().await;
+    .await;
+    a.store.close().await;
     let started = std::time::Instant::now();
     let (status, body) = get(&format!("{}/readyz", a.url), "").await;
     assert_eq!(status, 503, "body {}", text(&body));
     assert_ne!(
-        decode(&body)["checks"]["postgres"],
+        decode(&body)["checks"]["store"],
         "ok",
-        "postgres ok with a closed pool"
+        "store ok with a closed pool"
     );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),
@@ -283,22 +262,19 @@ async fn readyz_fails_when_postgres_is_gone() {
     a.stop().await;
 }
 
-/// Liveness must stay dumb. If /healthz also checked Postgres, a database blip
+/// Liveness must stay dumb. If /healthz also checked the store, a disk blip
 /// would make every replica look dead and get them all restarted at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn healthz_stays_liveness_only() {
-    let Some(a) = Api::with(
+    let a = Api::with(
         "api_healthz",
         Setup {
             no_bus: true,
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
-    a.store.pool().close().await;
+    .await;
+    a.store.close().await;
     let (status, body, headers) =
         do_req("GET", &format!("{}/healthz", a.url), "", None, false).await;
     assert_eq!(status, 200, "healthz with a closed pool");

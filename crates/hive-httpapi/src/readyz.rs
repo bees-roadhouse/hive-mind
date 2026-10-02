@@ -25,26 +25,31 @@ struct ReadyResponse {
 
 /// Whether this process can actually serve, as opposed to whether it is
 /// running. The split from /healthz is load-bearing in both directions.
-/// Liveness must stay dumb: if it checked Postgres, a database blip would make
+/// Liveness must stay dumb: if it checked the store, a disk blip would make
 /// every replica look dead and get them all restarted at once. Readiness must
-/// NOT stay dumb: a daemon that cannot reach Postgres is up and useless.
+/// NOT stay dumb: a daemon that cannot open its store is up and useless.
 pub(crate) async fn readyz(State(s): State<AppState>) -> Response {
     let mut checks = BTreeMap::new();
     let mut ready = true;
     match &s.store {
         None => {
-            checks.insert("postgres", "not configured");
+            checks.insert("store", "not configured");
         }
         Some(st) => {
-            let ping =
-                tokio::time::timeout(PROBE_TIMEOUT, sqlx::query("SELECT 1").execute(st.pool()))
-                    .await;
-            if matches!(ping, Ok(Ok(_))) {
-                checks.insert("postgres", "ok");
+            let ping = tokio::time::timeout(PROBE_TIMEOUT, async {
+                let c = st.conn().await?;
+                hive_db::query("SELECT 1")
+                    .fetch_scalar::<i64>(&c)
+                    .await
+                    .map_err(|e| hive_store::StoreError::db("ping", e))
+            })
+            .await;
+            if matches!(ping, Ok(Ok(1))) {
+                checks.insert("store", "ok");
             } else {
-                // The error text can carry a DSN, so report the fact and let
+                // The error text can carry a path, so report the fact and let
                 // the logs carry the detail.
-                checks.insert("postgres", "unreachable");
+                checks.insert("store", "unreachable");
                 ready = false;
             }
         }

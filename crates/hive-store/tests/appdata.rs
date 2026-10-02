@@ -1085,7 +1085,7 @@ async fn an_install_grant_opens_another_apps_collection() {
     .bind(f.install)
     .bind(mail)
     .bind(alice)
-    .execute(&*conn)
+    .execute(&conn)
     .await
     .expect("write the install grant");
     drop(conn);
@@ -1144,7 +1144,7 @@ async fn the_qualifier_names_an_app_not_an_owner() {
     .bind(bobs_journal)
     .bind(bobs_mail)
     .bind(bob)
-    .execute(&*conn)
+    .execute(&conn)
     .await
     .expect("grant bob's mail access to bob's journal");
     drop(conn);

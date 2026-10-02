@@ -111,17 +111,14 @@ async fn rpc(a: &Api, token: &str, body: Value) -> (u16, Value) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_without_a_credential_is_the_one_401() {
-    let Some(a) = Api::with(
+    let a = Api::with(
         "mcp_401",
         Setup {
             mcp: Some(server(false)),
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let (s1, b1, _) = do_req(
         "POST",
         &format!("{}/mcp", a.url),
@@ -138,17 +135,14 @@ async fn mcp_without_a_credential_is_the_one_401() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn initialize_list_and_call_round_trip() {
-    let Some(a) = Api::with(
+    let a = Api::with(
         "mcp_round_trip",
         Setup {
             mcp: Some(server(false)),
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let t = &a.root_token;
 
     let (status, v) = rpc(
@@ -213,17 +207,14 @@ async fn initialize_list_and_call_round_trip() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn errors_are_jsonrpc_shaped() {
-    let Some(a) = Api::with(
+    let a = Api::with(
         "mcp_errors",
         Setup {
             mcp: Some(server(true)),
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let t = &a.root_token;
 
     let (status, bytes) = post_json(&format!("{}/mcp", a.url), t, &json!("not an object")).await;
@@ -310,17 +301,14 @@ async fn app_routes_map_the_request_and_the_answer() {
     let rec = Arc::new(Recorder {
         seen: Mutex::new(Vec::new()),
     });
-    let Some(a) = Api::with(
+    let a = Api::with(
         "apps_mapping",
         Setup {
             apps: Some(rec.clone()),
             ..Default::default()
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let t = &a.root_token;
 
     let (status, body, headers) = do_req(

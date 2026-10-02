@@ -1,5 +1,5 @@
 //! The surfaces against a real schema, a real catalog and the real reference
-//! guest. Each test stands up its own schema (`hive_testdb`), installs the
+//! guest. Each test stands up its own store file (`hive_testdb`), installs the
 //! hello app the way the daemon would ... publish the module, prepare the
 //! manifest against the module's exports, register the build, stage and
 //! activate ... and then asks the MCP server and the route resolver what an
@@ -12,6 +12,7 @@
 use std::sync::{Arc, OnceLock};
 
 use hive_blob::{Catalog, CreateUpload, DiskDriver, Driver, Provenance, RefSpec, SourceKind};
+use hive_db::query;
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_manifest::{Collection, Function, Kind, Manifest, RouteDef, Storage, ToolDef};
 use hive_mcp::{McpError, Server};
@@ -50,10 +51,9 @@ struct World {
 }
 
 impl World {
-    async fn new(test: &str) -> Option<World> {
-        let db = TestDb::new(test).await?;
-        hive_store::migrate(db.pool()).await.expect("migrate");
-        let store = Store::from_pool(db.pool().clone());
+    async fn new(test: &str) -> World {
+        let db = TestDb::new(test).await;
+        let store = Store::from_dbs(db.db().clone(), db.audit().clone());
         let res = store
             .bootstrap_in_tx(&BootstrapConfig {
                 root_handle: "root".into(),
@@ -65,7 +65,7 @@ impl World {
         let dir = tempfile::tempdir().unwrap();
         let driver = DiskDriver::new(dir.path()).await.expect("driver");
         let blobs = Arc::new(Catalog::new(
-            db.pool().clone(),
+            db.db().clone(),
             Box::new(DiskDriver::new(dir.path()).await.unwrap()),
         ));
         let deps = Deps {
@@ -85,7 +85,7 @@ impl World {
         .expect("host");
         let surfaces = Arc::new(Surfaces::new(store.clone(), host.clone(), blobs.clone()));
         let server = Server::new(surfaces.clone(), surfaces.clone(), surfaces.clone());
-        Some(World {
+        World {
             _db: db,
             store,
             blobs,
@@ -95,7 +95,11 @@ impl World {
             server,
             root: res.root_actor_id,
             _dir: dir,
-        })
+        }
+    }
+
+    async fn conn(&self) -> hive_db::Conn {
+        self.store.conn().await.expect("checkout")
     }
 
     async fn close(self) {
@@ -104,14 +108,14 @@ impl World {
 
     async fn human(&self, handle: &str) -> (Uuid, Credential) {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', $2, $2, 'user', $1, $3)",
+             VALUES (?1, 'human', ?2, ?2, 'user', ?1, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(self.root)
-        .execute(self.store.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create human {handle}: {e}"));
         (id, Credential::new(id, PrincipalKind::User, id))
@@ -127,10 +131,10 @@ impl World {
             .expect("create upload");
         up.write(HELLO).await.expect("write");
         let sealed = up.seal().await.expect("seal");
-        let mut tx = self.store.begin().await.unwrap();
+        let tx = self.store.begin().await.unwrap();
         self.blobs
             .publish(
-                &mut tx,
+                &tx,
                 sealed,
                 "application/wasm",
                 &Provenance::capture(),
@@ -158,9 +162,9 @@ impl World {
         let spec = prepared
             .install_spec("user", &owner.to_string())
             .expect("install_spec");
-        let mut tx = self.store.begin().await.unwrap();
+        let tx = self.store.begin().await.unwrap();
         let reg = register_build(
-            &mut tx,
+            &tx,
             &BuildSpec {
                 spec,
                 owner: Some(Owner::user(owner)),
@@ -171,9 +175,9 @@ impl World {
         .await
         .expect("register_build");
         tx.commit().await.unwrap();
-        let mut conn = self.store.conn().await.unwrap();
+        let conn = self.store.conn().await.unwrap();
         let install = stage_install(
-            &mut conn,
+            &conn,
             &InstallSpec {
                 build_id: reg.build_id,
                 slug: m.name.clone(),
@@ -183,7 +187,7 @@ impl World {
         )
         .await
         .expect("stage_install");
-        activate_install(&mut conn, install, &cred)
+        activate_install(&conn, install, &cred)
             .await
             .expect("activate_install");
         install
@@ -324,9 +328,7 @@ fn first_id(v: &serde_json::Value) -> Option<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_owner_is_offered_her_tools_and_the_guest_actually_runs() {
-    let Some(w) = World::new("surfaces_owner").await else {
-        return;
-    };
+    let w = World::new("surfaces_owner").await;
     let (alice, ac) = w.human("alice").await;
     w.install_hello(alice, ac).await;
 
@@ -357,9 +359,7 @@ async fn the_owner_is_offered_her_tools_and_the_guest_actually_runs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stranger_sees_nothing_and_gets_one_answer() {
-    let Some(w) = World::new("surfaces_stranger").await else {
-        return;
-    };
+    let w = World::new("surfaces_stranger").await;
     let (alice, ac) = w.human("alice").await;
     let (_bob, bc) = w.human("bob").await;
     w.install_hello(alice, ac).await;
@@ -387,15 +387,13 @@ async fn a_stranger_sees_nothing_and_gets_one_answer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tool_grant_reveals_exactly_that_tool() {
-    let Some(w) = World::new("surfaces_tool_grant").await else {
-        return;
-    };
+    let w = World::new("surfaces_tool_grant").await;
     let (alice, ac) = w.human("alice").await;
     let (bob, bc) = w.human("bob").await;
     let install = w.install_hello(alice, ac).await;
 
     write_grant(
-        w.store.pool(),
+        &*w.conn().await,
         &GrantSpec::direct(
             Subject::tool(install, "hello"),
             Owner::user(bob),
@@ -430,15 +428,13 @@ async fn a_tool_grant_reveals_exactly_that_tool() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_route_grant_opens_the_route_and_nothing_else() {
-    let Some(w) = World::new("surfaces_route_grant").await else {
-        return;
-    };
+    let w = World::new("surfaces_route_grant").await;
     let (alice, ac) = w.human("alice").await;
     let (bob, bc) = w.human("bob").await;
     let install = w.install_hello(alice, ac).await;
 
     write_grant(
-        w.store.pool(),
+        &*w.conn().await,
         &GrantSpec::direct(
             Subject::named(SubjectKind::Route, install, "POST /hello"),
             Owner::user(bob),
@@ -465,16 +461,14 @@ async fn a_route_grant_opens_the_route_and_nothing_else() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_disabled_install_vanishes_from_both_surfaces() {
-    let Some(w) = World::new("surfaces_disabled").await else {
-        return;
-    };
+    let w = World::new("surfaces_disabled").await;
     let (alice, ac) = w.human("alice").await;
     let install = w.install_hello(alice, ac).await;
     assert_eq!(w.names(&ac).await.len(), 2);
 
-    sqlx::query("UPDATE installs SET state = 'disabled' WHERE id = $1")
+    query("UPDATE installs SET state = 'disabled' WHERE id = ?1")
         .bind(install)
-        .execute(w.store.pool())
+        .execute(&*w.conn().await)
         .await
         .unwrap();
 
@@ -492,9 +486,7 @@ async fn a_disabled_install_vanishes_from_both_surfaces() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_crud_round_trips_as_tools_and_as_routes() {
-    let Some(w) = World::new("surfaces_crud").await else {
-        return;
-    };
+    let w = World::new("surfaces_crud").await;
     let (alice, ac) = w.human("alice").await;
     w.install_notes(alice, ac).await;
 

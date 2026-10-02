@@ -260,6 +260,16 @@ impl Db {
     pub async fn batch(c: &Connection, sql: &str) -> Result<()> {
         c.execute_batch(sql)
     }
+
+    /// Refuses every later checkout and drops the idle connections. What a
+    /// daemon does on the way out, and what a test does to stand in for the
+    /// store being gone: after this every `conn` fails with "connection pool
+    /// closed", which is the failure the readiness probe and the credential
+    /// resolver have to turn into "not ready" and 401.
+    pub fn close(&self) {
+        self.inner.slots.close();
+        self.inner.idle.lock().clear();
+    }
 }
 
 /// A checked-out connection. Derefs to the connection; goes back to the pool

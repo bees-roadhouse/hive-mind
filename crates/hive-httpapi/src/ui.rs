@@ -274,7 +274,11 @@ pub(crate) async fn index(State(s): State<AppState>, headers: HeaderMap) -> Resp
             },
         );
     };
-    let actor = match hive_store::actor_by_id(s.store().pool(), cred.actor_id).await {
+    let actor = match s.store().conn().await {
+        Ok(conn) => hive_store::actor_by_id(&conn, cred.actor_id).await,
+        Err(e) => Err(e),
+    };
+    let actor = match actor {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(err = %e, actor = %cred.actor_id, "index actor read");

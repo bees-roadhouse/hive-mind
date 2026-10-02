@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use hive_bus::{Bus, Config as BusConfig};
 use hive_chat::Hub;
+use hive_db::query;
 use hive_httpapi::Options;
 use hive_store::{BootstrapConfig, Chat, Store};
 use hive_testdb::TestDb;
@@ -45,14 +46,13 @@ pub struct Setup {
 }
 
 impl Api {
-    pub async fn new(test: &str) -> Option<Api> {
+    pub async fn new(test: &str) -> Api {
         Api::with(test, Setup::default()).await
     }
 
-    pub async fn with(test: &str, setup: Setup) -> Option<Api> {
-        let db = TestDb::new(test).await?;
-        hive_store::migrate(db.pool()).await.expect("migrate");
-        let store = Store::from_pool(db.pool().clone());
+    pub async fn with(test: &str, setup: Setup) -> Api {
+        let db = TestDb::new(test).await;
+        let store = Store::from_dbs(db.db().clone(), db.audit().clone());
         let res = store
             .bootstrap_in_tx(&BootstrapConfig {
                 root_handle: "root".into(),
@@ -63,8 +63,8 @@ impl Api {
             .expect("bootstrap");
         let root_token = format!("root-token-{}", Uuid::new_v4());
         {
-            let mut conn = store.conn().await.unwrap();
-            hive_store::ensure_bootstrap_credential(&mut conn, res.root_actor_id, &root_token)
+            let conn = store.conn().await.unwrap();
+            hive_store::ensure_bootstrap_credential(&conn, res.root_actor_id, &root_token)
                 .await
                 .expect("bootstrap credential");
         }
@@ -73,7 +73,7 @@ impl Api {
         let bus = if setup.no_bus {
             None
         } else {
-            let b = Bus::new(db.pool().clone(), BusConfig::default());
+            let b = Bus::new(db.db().clone(), BusConfig::default());
             if setup.run_bus {
                 let run = b.clone();
                 let c = cancel.clone();
@@ -116,7 +116,7 @@ impl Api {
                 .with_graceful_shutdown(async move { c.cancelled().await })
                 .await;
         }));
-        Some(Api {
+        Api {
             db,
             store,
             bus,
@@ -128,7 +128,7 @@ impl Api {
             woken,
             cancel,
             tasks,
-        })
+        }
     }
 
     pub async fn stop(mut self) {
@@ -138,17 +138,21 @@ impl Api {
         }
     }
 
+    pub async fn conn(&self) -> hive_db::Conn {
+        self.store.conn().await.expect("checkout")
+    }
+
     /// A person with a live personal token.
     pub async fn human(&self, handle: &str) -> (Uuid, String) {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', $2, $2, 'user', $1, $3)",
+             VALUES (?1, 'human', ?2, ?2, 'user', ?1, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(self.root)
-        .execute(self.db.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create human {handle}: {e}"));
         (id, self.insert_credential(id).await)
@@ -158,28 +162,28 @@ impl Api {
     /// owner in the same INSERT (D13.9).
     pub async fn ai(&self, handle: &str, persona: &str, owner: Uuid) -> (Uuid, String) {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, persona, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'ai', $2, $2, $3, 'user', $4, $5)",
+             VALUES (?1, 'ai', ?2, ?2, ?3, 'user', ?4, ?5)",
         )
         .bind(id)
         .bind(handle)
         .bind(persona)
         .bind(owner)
         .bind(self.root)
-        .execute(self.db.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create ai {handle}: {e}"));
         let token = format!("tok-{}", Uuid::new_v4());
-        sqlx::query(
+        query(
             "INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256, label,
                                       issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
-             VALUES ($1, 'user', $2, $3, 'fixture', $2, 'user', $2)",
+             VALUES (?1, 'user', ?2, ?3, 'fixture', ?2, 'user', ?2)",
         )
         .bind(id)
         .bind(owner)
         .bind(hive_store::hash_token(&token))
-        .execute(self.db.pool())
+        .execute(&*self.conn().await)
         .await
         .expect("insert ai credential");
         (id, token)
@@ -190,30 +194,27 @@ impl Api {
     /// matter which client issued it.
     pub async fn insert_credential(&self, actor: Uuid) -> String {
         let token = format!("tok-{}", Uuid::new_v4());
-        sqlx::query(
+        query(
             "INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256, label,
                                       issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
-             VALUES ($1, 'user', $1, $2, 'fixture', $1, 'user', $1)",
+             VALUES (?1, 'user', ?1, ?2, 'fixture', ?1, 'user', ?1)",
         )
         .bind(actor)
         .bind(hive_store::hash_token(&token))
-        .execute(self.db.pool())
+        .execute(&*self.conn().await)
         .await
         .expect("insert credential");
         token
     }
 
     pub async fn revoke(&self, token: &str) {
-        let res = sqlx::query("UPDATE credentials SET revoked_at = now() WHERE token_sha256 = $1")
+        let rows = query("UPDATE credentials SET revoked_at = ?2 WHERE token_sha256 = ?1")
             .bind(hive_store::hash_token(token))
-            .execute(self.db.pool())
+            .bind(hive_db::now())
+            .execute(&*self.conn().await)
             .await
             .unwrap();
-        assert_eq!(
-            res.rows_affected(),
-            1,
-            "the test is not revoking what it thinks it is"
-        );
+        assert_eq!(rows, 1, "the test is not revoking what it thinks it is");
     }
 }
 

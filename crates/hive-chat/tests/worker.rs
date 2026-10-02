@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use hive_chat::{Config, FAILED_TURN_NOTICE, Hub, RECLAIMED_TURN_NOTICE, Update, Worker};
+use hive_db::query;
 use hive_harness::{
     ImagePin, ImagePins, Launcher, NetworkMode, RunError, RunSpec, Runtime, Supervisor,
 };
@@ -79,7 +80,6 @@ impl Launcher for HelperLauncher {
 }
 
 struct Fixture {
-    _db: TestDb,
     store: Store,
     chat: Arc<Chat>,
     hub: Hub,
@@ -87,12 +87,13 @@ struct Fixture {
     worker: Worker,
     cred: Credential,
     _workspace: tempfile::TempDir,
+    /// Last: the files go only after every pooled connection above has.
+    _db: TestDb,
 }
 
-async fn fixture(test: &str, mode: &str) -> Option<Fixture> {
-    let db = TestDb::new(test).await?;
-    hive_store::migrate(db.pool()).await.expect("migrate");
-    let store = Store::from_pool(db.pool().clone());
+async fn fixture(test: &str, mode: &str) -> Fixture {
+    let db = TestDb::new(test).await;
+    let store = Store::from_dbs(db.db().clone(), db.audit().clone());
     let res = store
         .bootstrap_in_tx(&BootstrapConfig {
             root_handle: "root".into(),
@@ -135,7 +136,7 @@ async fn fixture(test: &str, mode: &str) -> Option<Fixture> {
         },
     )
     .expect("worker");
-    Some(Fixture {
+    Fixture {
         _db: db,
         store,
         chat,
@@ -144,7 +145,7 @@ async fn fixture(test: &str, mode: &str) -> Option<Fixture> {
         worker,
         cred: Credential::new(res.root_actor_id, PrincipalKind::User, res.root_actor_id),
         _workspace: workspace,
-    })
+    }
 }
 
 impl Fixture {
@@ -188,9 +189,7 @@ fn drain(sub: &mut hive_chat::Subscription) -> (Vec<hive_chat::Frame>, Vec<hive_
 /// it in the same workspace. Ported from
 /// `TestATurnBecomesAnAnsweredMessageAndTheNextResumes`.
 async fn a_turn_becomes_an_answered_message_and_the_next_resumes() {
-    let Some(f) = fixture("chat_turn_answered", "answer").await else {
-        return;
-    };
+    let f = fixture("chat_turn_answered", "answer").await;
     let conv = f.converse().await;
     let mut updates = f.hub.subscribe(conv, 256);
     f.post(conv, "hello").await;
@@ -210,16 +209,21 @@ async fn a_turn_becomes_an_answered_message_and_the_next_resumes() {
         "a tool result reached the message body"
     );
 
-    let (turn_state, run_state, session): (String, String, String) = sqlx::query_as(
-        "SELECT t.state, r.state, s.session_id
+    let row = query(
+        "SELECT t.state AS turn_state, r.state AS run_state, s.session_id
            FROM chat_turns t JOIN agent_runs r ON r.turn_id = t.id
            JOIN chat_sessions s ON s.conversation_id = t.conversation_id
-          WHERE t.conversation_id = $1",
+          WHERE t.conversation_id = ?1",
     )
     .bind(conv)
-    .fetch_one(f.store.pool())
+    .fetch_one(&f.store.conn().await.unwrap())
     .await
     .expect("read state");
+    let (turn_state, run_state, session): (String, String, String) = (
+        row.get("turn_state"),
+        row.get("run_state"),
+        row.get("session_id"),
+    );
     assert_eq!(
         (turn_state.as_str(), run_state.as_str(), session.as_str()),
         (TURN_DONE, "succeeded", "sess-1")
@@ -292,9 +296,7 @@ async fn a_turn_becomes_an_answered_message_and_the_next_resumes() {
 /// Ported from `TestAFailedRunTellsTheConversation`: a fixed sentence that
 /// names no container, path or exit code.
 async fn a_failed_run_tells_the_conversation() {
-    let Some(f) = fixture("chat_failed_run", "crash").await else {
-        return;
-    };
+    let f = fixture("chat_failed_run", "crash").await;
     let conv = f.converse().await;
     let mut updates = f.hub.subscribe(conv, 64);
     f.post(conv, "hello").await;
@@ -313,13 +315,15 @@ async fn a_failed_run_tells_the_conversation() {
         !msgs[1].body.contains("boom") && !msgs[1].body.contains("exit"),
         "the notice leaked the cause"
     );
-    let (turn_state, run_state): (String, String) = sqlx::query_as(
-        "SELECT t.state, r.state FROM chat_turns t JOIN agent_runs r ON r.turn_id = t.id WHERE t.conversation_id = $1",
+    let row = query(
+        "SELECT t.state AS turn_state, r.state AS run_state
+           FROM chat_turns t JOIN agent_runs r ON r.turn_id = t.id WHERE t.conversation_id = ?1",
     )
     .bind(conv)
-    .fetch_one(f.store.pool())
+    .fetch_one(&f.store.conn().await.unwrap())
     .await
     .unwrap();
+    let (turn_state, run_state): (String, String) = (row.get("turn_state"), row.get("run_state"));
     assert_eq!(
         (turn_state.as_str(), run_state.as_str()),
         (TURN_FAILED, "failed")
@@ -344,9 +348,7 @@ async fn a_failed_run_tells_the_conversation() {
 
 /// Ported from `TestReclaimTellsTheConversation`.
 async fn reclaim_tells_the_conversation() {
-    let Some(f) = fixture("chat_reclaim_tells", "answer").await else {
-        return;
-    };
+    let f = fixture("chat_reclaim_tells", "answer").await;
     let conv = f.converse().await;
     let mut updates = f.hub.subscribe(conv, 64);
     f.post(conv, "hello").await;
@@ -356,13 +358,12 @@ async fn reclaim_tells_the_conversation() {
         .await
         .unwrap()
         .expect("claim");
-    sqlx::query(
-        "UPDATE chat_turns SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
-    )
-    .bind(claim.turn_id)
-    .execute(f.store.pool())
-    .await
-    .unwrap();
+    query("UPDATE chat_turns SET lease_expires_at = ?2 WHERE id = ?1")
+        .bind(claim.turn_id)
+        .bind(hive_db::now() - chrono::Duration::seconds(1))
+        .execute(&f.store.conn().await.unwrap())
+        .await
+        .unwrap();
     f.worker.reclaim().await.expect("reclaim");
     let msgs = f.messages(conv).await;
     assert!(
@@ -378,10 +379,8 @@ async fn reclaim_tells_the_conversation() {
 
 /// `Worker::new` refuses a configuration it cannot run turns on.
 async fn worker_refuses_a_bad_config() {
-    let Some(db) = TestDb::new("chat_worker_bad_config").await else {
-        return;
-    };
-    let store = Store::from_pool(db.pool().clone());
+    let db = TestDb::new("chat_worker_bad_config").await;
+    let store = Store::from_dbs(db.db().clone(), db.audit().clone());
     let chat = Arc::new(Chat::new(store.clone()));
     let launch = Arc::new(HelperLauncher {
         mode: "answer".into(),

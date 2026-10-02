@@ -1116,8 +1116,15 @@ CREATE TABLE events (
                          CHECK (length(kind) BETWEEN 1 AND 128
                                 AND kind GLOB '[a-z0-9]*'
                                 AND NOT (kind GLOB '*[^a-z0-9._-]*'))
+                     -- The byte-length clause is for a NUL: the engine's text
+                     -- functions stop at one, so the alphabet rule alone would
+                     -- read "note." out of "note.<NUL>created" and pass it. A
+                     -- text whose byte length is not its character length has
+                     -- a NUL (or a non-ASCII character, which the alphabet
+                     -- rule refuses anyway).
                      CONSTRAINT events_kind_has_no_frame_separator
-                         CHECK (NOT (kind GLOB '*[^ -~]*')),
+                         CHECK (NOT (kind GLOB '*[^ -~]*')
+                                AND length(CAST(kind AS BLOB)) = length(kind)),
 
     -- What the event is about, in the shape the predicate takes, so replay
     -- filters with the same rule as a live read. 'collection' is deliberately

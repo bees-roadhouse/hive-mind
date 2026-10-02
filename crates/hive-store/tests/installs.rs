@@ -5,6 +5,7 @@
 mod common;
 
 use common::{World, cred, user};
+use hive_db::query;
 use hive_identity::PrincipalKind;
 use hive_manifest::{Collection, Kind, Manifest, Storage};
 use hive_store::{
@@ -19,29 +20,28 @@ use uuid::Uuid;
 /// activator to the credential.
 #[tokio::test]
 async fn ai_cannot_activate_its_own_build() {
-    let Some(w) = World::new("ai_cannot_activate_own_build").await else {
-        return;
-    };
+    let w = World::new("ai_cannot_activate_own_build").await;
     let alice = w.human("alice").await;
     let ava = w.ai("ava", "ava", user(alice), alice).await;
     let ava_cred = cred(ava, PrincipalKind::User, alice);
     let alice_cred = cred(alice, PrincipalKind::User, alice);
 
-    let build_id: Uuid = sqlx::query_scalar(
+    let build_id: Uuid = query(
         "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
                                  author_actor, owner_kind, owner_id, visibility, trust, status)
-         VALUES ('extract', 'tool', 'host', '{}', repeat('b', 64), $1, 'user', $2, 'private', 'local', 'registered')
+         VALUES ('extract', 'tool', 'host', '{}', ?3, ?1, 'user', ?2, 'private', 'local', 'registered')
          RETURNING id",
     )
     .bind(ava)
     .bind(alice)
-    .fetch_one(w.pool())
+    .bind("b".repeat(64))
+    .fetch_scalar(&*w.conn().await)
     .await
     .expect("an AI could not register a build, which D19.4 allows");
 
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let install_id = stage_install(
-        &mut conn,
+        &conn,
         &InstallSpec {
             build_id,
             slug: "extract".into(),
@@ -52,7 +52,7 @@ async fn ai_cannot_activate_its_own_build() {
     .await
     .expect("stage");
 
-    let err = activate_install(&mut conn, install_id, &ava_cred)
+    let err = activate_install(&conn, install_id, &ava_cred)
         .await
         .expect_err("an AI activated its own build");
     assert!(
@@ -61,15 +61,14 @@ async fn ai_cannot_activate_its_own_build() {
     );
     assert_eq!(w.install_state(install_id).await, "disabled");
 
-    activate_install(&mut conn, install_id, &alice_cred)
+    activate_install(&conn, install_id, &alice_cred)
         .await
         .expect("a human could not activate");
-    let activator: Uuid =
-        sqlx::query_scalar("SELECT activated_by_actor FROM installs WHERE id = $1")
-            .bind(install_id)
-            .fetch_one(w.pool())
-            .await
-            .unwrap();
+    let activator: Uuid = query("SELECT activated_by_actor FROM installs WHERE id = ?1")
+        .bind(install_id)
+        .fetch_scalar(&*w.conn().await)
+        .await
+        .unwrap();
     assert_eq!(
         activator, alice,
         "activated_by_actor is the actor on the credential"
@@ -79,20 +78,18 @@ async fn ai_cannot_activate_its_own_build() {
 /// Ported from `TestStandingAuthorityMustBeHumanDelegated`.
 #[tokio::test]
 async fn standing_authority_must_be_human_delegated() {
-    let Some(w) = World::new("standing_authority_human_delegated").await else {
-        return;
-    };
+    let w = World::new("standing_authority_human_delegated").await;
     let alice = w.human("alice").await;
     let ava = w.ai("ava", "ava", user(alice), alice).await;
     let ava_cred = cred(ava, PrincipalKind::User, alice);
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let install_id = w.stage_build("extract", ava, user(alice)).await;
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
 
     // Ava acts for the owner, so she may write plenty of things. Not this.
     assert!(
         grant_install_authority(
-            w.pool(),
+            &*w.conn().await,
             install_id,
             user(alice),
             CAPABILITY_ACTIVATE,
@@ -105,7 +102,7 @@ async fn standing_authority_must_be_human_delegated() {
         "an AI delegated install authority to itself"
     );
     assert!(
-        activate_install(&mut conn, install_id, &ava_cred)
+        activate_install(&conn, install_id, &ava_cred)
             .await
             .is_err(),
         "an AI activated with no authority"
@@ -114,14 +111,14 @@ async fn standing_authority_must_be_human_delegated() {
     // Nor may a human who does not own the install.
     let carol = w.human("carol").await;
     let carol_cred = cred(carol, PrincipalKind::User, carol);
-    let build_id: Uuid = sqlx::query_scalar("SELECT build_id FROM installs WHERE id = $1")
+    let build_id: Uuid = query("SELECT build_id FROM installs WHERE id = ?1")
         .bind(install_id)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
     assert!(
         stage_install(
-            &mut conn,
+            &conn,
             &InstallSpec {
                 build_id,
                 slug: "squatter".into(),
@@ -135,7 +132,7 @@ async fn standing_authority_must_be_human_delegated() {
     );
     assert!(
         grant_install_authority(
-            w.pool(),
+            &*w.conn().await,
             install_id,
             user(carol),
             CAPABILITY_ACTIVATE,
@@ -148,7 +145,7 @@ async fn standing_authority_must_be_human_delegated() {
         "a human who does not own the install delegated authority over it"
     );
     assert!(
-        activate_install(&mut conn, install_id, &carol_cred)
+        activate_install(&conn, install_id, &carol_cred)
             .await
             .is_err(),
         "carol activated an install they do not own"
@@ -156,7 +153,7 @@ async fn standing_authority_must_be_human_delegated() {
 
     // A human delegates it, and the loop rolls builds from then on.
     grant_install_authority(
-        w.pool(),
+        &*w.conn().await,
         install_id,
         user(alice),
         CAPABILITY_ACTIVATE,
@@ -166,7 +163,7 @@ async fn standing_authority_must_be_human_delegated() {
     )
     .await
     .expect("human delegation");
-    activate_install(&mut conn, install_id, &ava_cred)
+    activate_install(&conn, install_id, &ava_cred)
         .await
         .expect("the loop could not roll a build under a standing authority");
 }
@@ -175,9 +172,7 @@ async fn standing_authority_must_be_human_delegated() {
 /// is a write-path capability in its own table, so it confers no visibility.
 #[tokio::test]
 async fn install_authority_confers_no_visibility() {
-    let Some(w) = World::new("install_authority_no_visibility").await else {
-        return;
-    };
+    let w = World::new("install_authority_no_visibility").await;
     let alice = w.human("alice").await;
     let dave = w.human("dave").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
@@ -186,7 +181,7 @@ async fn install_authority_confers_no_visibility() {
     let install = Subject::install(install_id);
 
     grant_install_authority(
-        w.pool(),
+        &*w.conn().await,
         install_id,
         user(dave),
         CAPABILITY_ACTIVATE,
@@ -209,10 +204,10 @@ async fn install_authority_confers_no_visibility() {
             .await,
     );
     assert_eq!(w.reason_of(&dave_cred, &entity, Access::Read).await, None);
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let ids = w
         .guard()
-        .visible_entity_ids(&mut conn, &dave_cred, Access::Read, "", 100)
+        .visible_entity_ids(&conn, &dave_cred, Access::Read, "", 100)
         .await
         .expect("list");
     assert!(
@@ -222,7 +217,7 @@ async fn install_authority_confers_no_visibility() {
     );
 
     // The capability itself still works, which is the point of separating them.
-    activate_install(&mut conn, install_id, &dave_cred)
+    activate_install(&conn, install_id, &dave_cred)
         .await
         .expect("the delegate could not activate");
 }
@@ -230,9 +225,7 @@ async fn install_authority_confers_no_visibility() {
 /// Ported from `TestRevokedInstallAuthorityStopsActivating`.
 #[tokio::test]
 async fn revoked_install_authority_stops_activating() {
-    let Some(w) = World::new("revoked_authority_stops").await else {
-        return;
-    };
+    let w = World::new("revoked_authority_stops").await;
     let alice = w.human("alice").await;
     let ava = w.ai("ava", "ava", user(alice), alice).await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
@@ -240,7 +233,7 @@ async fn revoked_install_authority_stops_activating() {
     let install_id = w.stage_build("extract", ava, user(alice)).await;
 
     let authority_id = grant_install_authority(
-        w.pool(),
+        &*w.conn().await,
         install_id,
         user(alice),
         CAPABILITY_ACTIVATE,
@@ -250,23 +243,21 @@ async fn revoked_install_authority_stops_activating() {
     )
     .await
     .expect("delegate");
-    let mut conn = w.conn().await;
-    activate_install(&mut conn, install_id, &ava_cred)
+    let conn = w.conn().await;
+    activate_install(&conn, install_id, &ava_cred)
         .await
         .expect("activate");
 
-    revoke_install_authority(w.pool(), authority_id, alice)
+    revoke_install_authority(&*w.conn().await, authority_id, alice)
         .await
         .expect("revoke");
-    sqlx::query(
-        "UPDATE installs SET state = 'disabled', activation_authority_id = NULL WHERE id = $1",
-    )
-    .bind(install_id)
-    .execute(w.pool())
-    .await
-    .unwrap();
+    query("UPDATE installs SET state = 'disabled', activation_authority_id = NULL WHERE id = ?1")
+        .bind(install_id)
+        .execute(&*w.conn().await)
+        .await
+        .unwrap();
     assert!(
-        activate_install(&mut conn, install_id, &ava_cred)
+        activate_install(&conn, install_id, &ava_cred)
             .await
             .is_err(),
         "a revoked authority still activated"
@@ -276,15 +267,13 @@ async fn revoked_install_authority_stops_activating() {
 /// Ported from `TestInstallAuthorityIsImmutableExceptRevocation`.
 #[tokio::test]
 async fn install_authority_is_immutable_except_revocation() {
-    let Some(w) = World::new("install_authority_immutable").await else {
-        return;
-    };
+    let w = World::new("install_authority_immutable").await;
     let alice = w.human("alice").await;
     let carol = w.human("carol").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let install_id = w.stage_build("extract", alice, user(alice)).await;
     let id = grant_install_authority(
-        w.pool(),
+        &*w.conn().await,
         install_id,
         user(alice),
         CAPABILITY_ACTIVATE,
@@ -295,15 +284,15 @@ async fn install_authority_is_immutable_except_revocation() {
     .await
     .expect("delegate");
     assert!(
-        sqlx::query("UPDATE install_authorities SET holder_id = $2 WHERE id = $1")
+        query("UPDATE install_authorities SET holder_id = ?2 WHERE id = ?1")
             .bind(id)
             .bind(carol)
-            .execute(w.pool())
+            .execute(&*w.conn().await)
             .await
             .is_err(),
         "an install authority was retargeted by UPDATE"
     );
-    revoke_install_authority(w.pool(), id, alice)
+    revoke_install_authority(&*w.conn().await, id, alice)
         .await
         .expect("revocation was refused");
 }
@@ -316,10 +305,10 @@ async fn staged_build(
     owner: hive_identity::Owner,
     by: &hive_identity::Credential,
 ) -> (Uuid, Uuid) {
-    let build_id: Uuid = sqlx::query_scalar(
+    let build_id: Uuid = query(
         "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
                                  author_actor, owner_kind, owner_id, visibility, trust, status)
-         VALUES ($1, 'app', 'host', '{}', $2, $3, $4, $5, 'private', 'local', 'registered')
+         VALUES (?1, 'app', 'host', '{}', ?2, ?3, ?4, ?5, 'private', 'local', 'registered')
          RETURNING id",
     )
     .bind(slug)
@@ -327,12 +316,12 @@ async fn staged_build(
     .bind(by.actor_id)
     .bind(owner.kind.as_str())
     .bind(owner.id)
-    .fetch_one(w.pool())
+    .fetch_scalar(&*w.conn().await)
     .await
     .expect("register build");
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let install_id = stage_install(
-        &mut conn,
+        &conn,
         &InstallSpec {
             build_id,
             slug: slug.into(),
@@ -348,20 +337,18 @@ async fn staged_build(
 /// Ported from `TestActivatingChecksWhatIsBeingPromotedAndNotOnlyWho`.
 #[tokio::test]
 async fn activating_checks_what_is_being_promoted_and_not_only_who() {
-    let Some(w) = World::new("activating_checks_what").await else {
-        return;
-    };
+    let w = World::new("activating_checks_what").await;
     let alice = w.human("alice").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let (build_id, install_id) = staged_build(&w, "withdrawn-app", user(alice), &alice_cred).await;
-    sqlx::query("UPDATE app_builds SET status = 'withdrawn' WHERE id = $1")
+    query("UPDATE app_builds SET status = 'withdrawn' WHERE id = ?1")
         .bind(build_id)
-        .execute(w.pool())
+        .execute(&*w.conn().await)
         .await
         .unwrap();
 
-    let mut conn = w.conn().await;
-    let err = activate_install(&mut conn, install_id, &alice_cred)
+    let conn = w.conn().await;
+    let err = activate_install(&conn, install_id, &alice_cred)
         .await
         .expect_err("a withdrawn build was promoted into a live install");
     assert!(
@@ -370,12 +357,12 @@ async fn activating_checks_what_is_being_promoted_and_not_only_who() {
     );
     assert_eq!(w.install_state(install_id).await, "disabled");
 
-    sqlx::query("UPDATE app_builds SET status = 'registered' WHERE id = $1")
+    query("UPDATE app_builds SET status = 'registered' WHERE id = ?1")
         .bind(build_id)
-        .execute(w.pool())
+        .execute(&*w.conn().await)
         .await
         .unwrap();
-    activate_install(&mut conn, install_id, &alice_cred)
+    activate_install(&conn, install_id, &alice_cred)
         .await
         .expect("a registered build was refused");
     assert_eq!(w.install_state(install_id).await, "active");
@@ -384,19 +371,17 @@ async fn activating_checks_what_is_being_promoted_and_not_only_who() {
 /// Ported from `TestActivatingCannotPullATeardownBackToLive`.
 #[tokio::test]
 async fn activating_cannot_pull_a_teardown_back_to_live() {
-    let Some(w) = World::new("activating_cannot_pull_teardown").await else {
-        return;
-    };
+    let w = World::new("activating_cannot_pull_teardown").await;
     let alice = w.human("alice").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let (_, install_id) = staged_build(&w, "teardown-app", user(alice), &alice_cred).await;
-    sqlx::query("UPDATE installs SET state = 'uninstalling' WHERE id = $1")
+    query("UPDATE installs SET state = 'uninstalling' WHERE id = ?1")
         .bind(install_id)
-        .execute(w.pool())
+        .execute(&*w.conn().await)
         .await
         .unwrap();
-    let mut conn = w.conn().await;
-    let err = activate_install(&mut conn, install_id, &alice_cred)
+    let conn = w.conn().await;
+    let err = activate_install(&conn, install_id, &alice_cred)
         .await
         .expect_err("an install being torn down was activated");
     assert!(matches!(err, StoreError::Denied), "{err}");
@@ -406,21 +391,19 @@ async fn activating_cannot_pull_a_teardown_back_to_live() {
 /// Ported from `TestActivatingSaysNothingAboutABuildToACallerWithNoStanding`.
 #[tokio::test]
 async fn activating_says_nothing_about_a_build_to_a_caller_with_no_standing() {
-    let Some(w) = World::new("activating_says_nothing").await else {
-        return;
-    };
+    let w = World::new("activating_says_nothing").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let bob_cred = cred(bob, PrincipalKind::User, bob);
     let (build_id, install_id) = staged_build(&w, "private-app", user(alice), &alice_cred).await;
-    sqlx::query("UPDATE app_builds SET status = 'withdrawn' WHERE id = $1")
+    query("UPDATE app_builds SET status = 'withdrawn' WHERE id = ?1")
         .bind(build_id)
-        .execute(w.pool())
+        .execute(&*w.conn().await)
         .await
         .unwrap();
-    let mut conn = w.conn().await;
-    let err = activate_install(&mut conn, install_id, &bob_cred)
+    let conn = w.conn().await;
+    let err = activate_install(&conn, install_id, &bob_cred)
         .await
         .expect_err("a stranger activated somebody else's install");
     assert!(
@@ -438,9 +421,7 @@ async fn activating_says_nothing_about_a_build_to_a_caller_with_no_standing() {
 /// Ported from `TestBootstrapCapsTheOrgToo`.
 #[tokio::test]
 async fn bootstrap_caps_the_org_too() {
-    let Some(w) = World::bare("bootstrap_caps_the_org").await else {
-        return;
-    };
+    let w = World::bare("bootstrap_caps_the_org").await;
     let cfg = BootstrapConfig {
         root_handle: "alice".into(),
         root_name: "Alice".into(),
@@ -479,9 +460,7 @@ async fn bootstrap_caps_the_org_too() {
 /// Ported from `TestBootstrapIsAtomic`.
 #[tokio::test]
 async fn bootstrap_is_atomic() {
-    let Some(w) = World::bare("bootstrap_is_atomic").await else {
-        return;
-    };
+    let w = World::bare("bootstrap_is_atomic").await;
     w.store
         .bootstrap_in_tx(&BootstrapConfig {
             root_handle: "alice".into(),
@@ -489,31 +468,31 @@ async fn bootstrap_is_atomic() {
         })
         .await
         .expect("seed root");
-    let root: Uuid = sqlx::query_scalar("SELECT id FROM actors WHERE created_by_actor IS NULL")
-        .fetch_one(w.pool())
+    let root: Uuid = query("SELECT id FROM actors WHERE created_by_actor IS NULL")
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
 
     // An org named "clash", created by somebody other than the root, so the
     // "did I seed one" lookup misses it and the insert collides on the handle.
     let other = Uuid::new_v4();
-    sqlx::query(
+    query(
         "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-         VALUES ($1, 'human', 'other', 'Other', 'user', $1, $2)",
+         VALUES (?1, 'human', 'other', 'Other', 'user', ?1, ?2)",
     )
     .bind(other)
     .bind(root)
-    .execute(w.pool())
+    .execute(&*w.conn().await)
     .await
     .unwrap();
     let clash = Uuid::new_v4();
-    sqlx::query(
+    query(
         "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-         VALUES ($1, 'org', 'clash', 'clash', 'org', $1, $2)",
+         VALUES (?1, 'org', 'clash', 'clash', 'org', ?1, ?2)",
     )
     .bind(clash)
     .bind(other)
-    .execute(w.pool())
+    .execute(&*w.conn().await)
     .await
     .unwrap();
 
@@ -547,9 +526,7 @@ async fn bootstrap_is_atomic() {
 /// Ported from `TestBootstrapCapsTheRootAtOne`.
 #[tokio::test]
 async fn bootstrap_caps_the_root_at_one() {
-    let Some(w) = World::bare("bootstrap_caps_the_root").await else {
-        return;
-    };
+    let w = World::bare("bootstrap_caps_the_root").await;
     let cfg = BootstrapConfig {
         root_handle: "alice".into(),
         root_name: "Alice".into(),
@@ -578,12 +555,12 @@ async fn bootstrap_caps_the_root_at_one() {
     // to hold.
     let id = Uuid::new_v4();
     assert!(
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', 'usurper', 'Usurper', 'user', $1, NULL)",
+             VALUES (?1, 'human', 'usurper', 'Usurper', 'user', ?1, NULL)",
         )
         .bind(id)
-        .execute(w.pool())
+        .execute(&*w.conn().await)
         .await
         .is_err(),
         "a second creator-less actor was accepted"
@@ -617,8 +594,8 @@ async fn register_in(
     spec: BuildSpec,
     by: &hive_identity::Credential,
 ) -> Result<hive_store::RegisteredBuild, StoreError> {
-    let mut tx = w.store.begin().await.expect("begin");
-    let out = register_build(&mut tx, &spec, by).await;
+    let tx = w.store.begin().await.expect("begin");
+    let out = register_build(&tx, &spec, by).await;
     match out {
         Ok(o) => {
             tx.commit().await.expect("commit");
@@ -635,11 +612,11 @@ fn short_slug() -> String {
     format!("t{}", &Uuid::new_v4().to_string()[..8])
 }
 
-/// An app schema lives outside the test's private schema, so each test drops
-/// the ones it provisioned.
+/// Drops the collection tables a test provisioned. The file is deleted with
+/// the test anyway; this keeps the uninstall path exercised.
 async fn drop_app_schema(w: &World, spec: &hive_registry::InstallSpec) {
-    let mut tx = w.store.begin().await.unwrap();
-    hive_store::drop_schema_plan(&mut tx, &spec.schema)
+    let tx = w.store.begin().await.unwrap();
+    hive_store::drop_schema_plan(&tx, &spec.schema)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -651,9 +628,7 @@ async fn drop_app_schema(w: &World, spec: &hive_registry::InstallSpec) {
 /// prevents it" is a claim about today's type.
 #[tokio::test]
 async fn bob_cannot_stage_an_install_onto_alices_schema() {
-    let Some(w) = World::new("bob_cannot_stage_onto_alice").await else {
-        return;
-    };
+    let w = World::new("bob_cannot_stage_onto_alice").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let slug = short_slug();
@@ -689,9 +664,9 @@ async fn bob_cannot_stage_an_install_onto_alices_schema() {
     .await
     .expect("bob register");
 
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let Ok(install_id) = stage_install(
-        &mut conn,
+        &conn,
         &InstallSpec {
             build_id: bob_build.build_id,
             slug: slug.clone(),
@@ -705,9 +680,9 @@ async fn bob_cannot_stage_an_install_onto_alices_schema() {
         drop_app_schema(&w, &bob_spec).await;
         return; // refused outright is a correct outcome too
     };
-    let captured: String = sqlx::query_scalar("SELECT schema_name FROM installs WHERE id = $1")
+    let captured: String = query("SELECT schema_name FROM installs WHERE id = ?1")
         .bind(install_id)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
     drop_app_schema(&w, &alice_spec).await;
@@ -720,9 +695,7 @@ async fn bob_cannot_stage_an_install_onto_alices_schema() {
 /// sixth time).
 #[tokio::test]
 async fn stage_install_refuses_a_slug_that_would_truncate() {
-    let Some(w) = World::new("stage_install_refuses_long_slug").await else {
-        return;
-    };
+    let w = World::new("stage_install_refuses_long_slug").await;
     let alice = w.human("alice").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let legal = short_slug();
@@ -742,9 +715,9 @@ async fn stage_install_refuses_a_slug_that_would_truncate() {
     // One character past what fits: the first length at which the owner
     // suffix starts falling off.
     let slug = format!("a{}", "b".repeat(hive_manifest::MAX_APP_NAME));
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let err = stage_install(
-        &mut conn,
+        &conn,
         &InstallSpec {
             build_id: build.build_id,
             slug,
@@ -763,9 +736,7 @@ async fn stage_install_refuses_a_slug_that_would_truncate() {
 /// Ported from `TestTheLongestLegalSlugStillWorks`.
 #[tokio::test]
 async fn the_longest_legal_slug_still_works() {
-    let Some(w) = World::new("longest_legal_slug_works").await else {
-        return;
-    };
+    let w = World::new("longest_legal_slug_works").await;
     let alice = w.human("alice").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let slug = format!("a{}", "b".repeat(hive_manifest::MAX_APP_NAME - 1));
@@ -789,9 +760,9 @@ async fn the_longest_legal_slug_still_works() {
     )
     .await
     .expect("the longest legal slug was refused at registration");
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let staged = stage_install(
-        &mut conn,
+        &conn,
         &InstallSpec {
             build_id: build.build_id,
             slug,
@@ -841,9 +812,7 @@ fn two_owners_stay_distinct_after_postgres_truncates() {
 /// are measured against a path that answers: a plain principal check.
 #[tokio::test]
 async fn owner_reason_still_answers_for_installs() {
-    let Some(w) = World::new("owner_reason_installs").await else {
-        return;
-    };
+    let w = World::new("owner_reason_installs").await;
     let alice = w.human("alice").await;
     let inst = w.install("journal", user(alice), alice).await;
     assert_eq!(

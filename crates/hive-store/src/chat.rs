@@ -240,9 +240,8 @@ impl Chat {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let ids_json = serde_json::Value::from(
-            ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-        );
+        let ids_json =
+            serde_json::Value::from(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
         let rows = query(&format!(
             "SELECT {CONVERSATION_COLUMNS} FROM conversations
               WHERE id IN (SELECT value FROM json_each(?1))
@@ -296,13 +295,12 @@ impl Chat {
         // The sequence is assigned INSIDE the transaction that appends, against
         // the row the primary key protects. Two concurrent posts serialise on
         // the write lock rather than both reading the same max.
-        let seq: i32 = query(
-            "SELECT coalesce(max(seq), 0) + 1 FROM chat_messages WHERE conversation_id = ?1",
-        )
-        .bind(conv_id)
-        .fetch_scalar(&tx)
-        .await
-        .map_err(|e| StoreError::db("chat: next seq", e))?;
+        let seq: i32 =
+            query("SELECT coalesce(max(seq), 0) + 1 FROM chat_messages WHERE conversation_id = ?1")
+                .bind(conv_id)
+                .fetch_scalar(&tx)
+                .await
+                .map_err(|e| StoreError::db("chat: next seq", e))?;
         let created = hive_db::now();
         query(
             "INSERT INTO chat_messages (conversation_id, seq, role, author_actor, body, trust, run_id, created_at)
@@ -548,13 +546,15 @@ impl Chat {
             return Ok(());
         }
         let conn = self.store.conn().await?;
-        query("UPDATE chat_sessions SET session_id = ?1, updated_at = ?3 WHERE conversation_id = ?2")
-            .bind(session_id)
-            .bind(conv_id)
-            .bind(hive_db::now())
-            .execute(&conn)
-            .await
-            .map_err(|e| StoreError::db("chat: record session", e))?;
+        query(
+            "UPDATE chat_sessions SET session_id = ?1, updated_at = ?3 WHERE conversation_id = ?2",
+        )
+        .bind(session_id)
+        .bind(conv_id)
+        .bind(hive_db::now())
+        .execute(&conn)
+        .await
+        .map_err(|e| StoreError::db("chat: record session", e))?;
         Ok(())
     }
 

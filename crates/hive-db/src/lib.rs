@@ -181,7 +181,9 @@ pub struct Db {
 
 impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Db").field("path", &self.inner.path).finish()
+        f.debug_struct("Db")
+            .field("path", &self.inner.path)
+            .finish()
     }
 }
 
@@ -699,12 +701,8 @@ impl Query<'_> {
     fn fetch(self, c: &Connection, limit: Option<usize>) -> Result<Vec<Row>> {
         let conn = c.inner.lock();
         let mut stmt = conn.prepare(self.sql)?;
-        let columns: Arc<Vec<String>> = Arc::new(
-            stmt.column_names()
-                .into_iter()
-                .map(String::from)
-                .collect(),
-        );
+        let columns: Arc<Vec<String>> =
+            Arc::new(stmt.column_names().into_iter().map(String::from).collect());
         let n = columns.len();
         let mut rows = stmt.query(rusqlite::params_from_iter(self.params.iter()))?;
         let mut out = Vec::new();
@@ -787,8 +785,15 @@ mod tests {
         assert_eq!(fk, 1);
         let mode: String = query("PRAGMA journal_mode").fetch_scalar(&c).await.unwrap();
         assert_eq!(mode, "wal");
-        let v: String = query("SELECT sqlite_version()").fetch_scalar(&c).await.unwrap();
-        let major_minor: Vec<u32> = v.split('.').take(2).filter_map(|p| p.parse().ok()).collect();
+        let v: String = query("SELECT sqlite_version()")
+            .fetch_scalar(&c)
+            .await
+            .unwrap();
+        let major_minor: Vec<u32> = v
+            .split('.')
+            .take(2)
+            .filter_map(|p| p.parse().ok())
+            .collect();
         assert!(
             major_minor >= vec![3, 45],
             "the schema needs jsonb and the -> operators; bundled engine is {v}"
@@ -847,7 +852,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id, 1);
-        let n = query("UPDATE t SET v = ?1").bind("y").execute(&c).await.unwrap();
+        let n = query("UPDATE t SET v = ?1")
+            .bind("y")
+            .execute(&c)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
         assert!(matches!(
             query("SELECT v FROM t WHERE id = 99").fetch_one(&c).await,
@@ -884,15 +893,27 @@ mod tests {
         Db::batch(&c, "CREATE TABLE t (n INTEGER)").await.unwrap();
         {
             let tx = db.begin().await.unwrap();
-            query("INSERT INTO t VALUES (1)").execute(&tx).await.unwrap();
+            query("INSERT INTO t VALUES (1)")
+                .execute(&tx)
+                .await
+                .unwrap();
             // dropped, not committed
         }
-        let n: i64 = query("SELECT count(*) FROM t").fetch_scalar(&c).await.unwrap();
+        let n: i64 = query("SELECT count(*) FROM t")
+            .fetch_scalar(&c)
+            .await
+            .unwrap();
         assert_eq!(n, 0);
         let tx = db.begin().await.unwrap();
-        query("INSERT INTO t VALUES (1)").execute(&tx).await.unwrap();
+        query("INSERT INTO t VALUES (1)")
+            .execute(&tx)
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
-        let n: i64 = query("SELECT count(*) FROM t").fetch_scalar(&c).await.unwrap();
+        let n: i64 = query("SELECT count(*) FROM t")
+            .fetch_scalar(&c)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -903,7 +924,10 @@ mod tests {
         let (_d, db) = temp().await;
         {
             let c = db.conn().await.unwrap();
-            query("CREATE TABLE t (n INTEGER)").execute(&c).await.unwrap();
+            query("CREATE TABLE t (n INTEGER)")
+                .execute(&c)
+                .await
+                .unwrap();
         }
         assert_eq!(db.inner.idle.lock().len(), 1, "one idle after return");
         {
@@ -920,9 +944,16 @@ mod tests {
             c.execute_batch("BEGIN").unwrap();
             query("INSERT INTO t VALUES (1)").execute(&c).await.unwrap();
         }
-        assert_eq!(db.inner.idle.lock().len(), 1, "a mid-transaction connection was pooled");
+        assert_eq!(
+            db.inner.idle.lock().len(),
+            1,
+            "a mid-transaction connection was pooled"
+        );
         let c = db.conn().await.unwrap();
-        let n: i64 = query("SELECT count(*) FROM t").fetch_scalar(&c).await.unwrap();
+        let n: i64 = query("SELECT count(*) FROM t")
+            .fetch_scalar(&c)
+            .await
+            .unwrap();
         assert_eq!(n, 0, "the abandoned transaction leaked a row");
         drop(c);
         let mut held = Vec::new();
@@ -943,13 +974,19 @@ mod tests {
         let db = Db::open(&path).await.unwrap();
         {
             let c = db.conn().await.unwrap();
-            query("CREATE TABLE t (n INTEGER)").execute(&c).await.unwrap();
+            query("CREATE TABLE t (n INTEGER)")
+                .execute(&c)
+                .await
+                .unwrap();
         }
         for _ in 0..20 {
             let mut keep = Vec::new();
             for _ in 0..64 {
                 let c = Connection::open(&path).unwrap();
-                let n: i64 = query("SELECT count(*) FROM t").fetch_scalar(&c).await.unwrap();
+                let n: i64 = query("SELECT count(*) FROM t")
+                    .fetch_scalar(&c)
+                    .await
+                    .unwrap();
                 assert_eq!(n, 0);
                 keep.push(c);
             }
@@ -967,7 +1004,10 @@ mod tests {
         )
         .await
         .unwrap();
-        query("INSERT INTO t DEFAULT VALUES").execute(&c).await.unwrap();
+        query("INSERT INTO t DEFAULT VALUES")
+            .execute(&c)
+            .await
+            .unwrap();
         let r = query("SELECT id, at FROM t").fetch_one(&c).await.unwrap();
         let id: Uuid = r.get("id");
         assert_eq!(id.get_version_num(), 4);

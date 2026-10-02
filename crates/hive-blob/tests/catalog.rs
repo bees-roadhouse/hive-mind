@@ -3,10 +3,10 @@
 
 use chrono::{Duration as ChronoDuration, Utc};
 use hive_blob::*;
+use hive_db::{Conn, Db, query};
 use hive_identity::{Credential, PrincipalKind};
 use hive_testdb::TestDb;
 use hive_trust::Level;
-use hive_db::{Conn, Db, query};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
@@ -313,7 +313,13 @@ async fn two_owners_share_one_object() {
     // Alice releasing hers must not make the bytes collectable while Bob still
     // holds one. Counting per tenant is exactly what would get this wrong.
     w.catalog
-        .release(&*w.conn().await, &alice, first.hash, SourceKind::Upload, "upload-a")
+        .release(
+            &*w.conn().await,
+            &alice,
+            first.hash,
+            SourceKind::Upload,
+            "upload-a",
+        )
         .await
         .expect("release");
     let candidates = w
@@ -433,7 +439,13 @@ async fn sweep_collects_only_unreferenced_bytes() {
         )
         .await;
     w.catalog
-        .release(&*w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
+        .release(
+            &*w.conn().await,
+            &alice,
+            desc.hash,
+            SourceKind::Upload,
+            "upload-1",
+        )
         .await
         .unwrap();
 
@@ -477,7 +489,13 @@ async fn trash_refuses_when_a_reference_reappears() {
         )
         .await;
     w.catalog
-        .release(&*w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
+        .release(
+            &*w.conn().await,
+            &alice,
+            desc.hash,
+            SourceKind::Upload,
+            "upload-1",
+        )
         .await
         .unwrap();
 
@@ -884,7 +902,13 @@ async fn ref_attribution_follows_the_act() {
 
     // Released, then revived by the assistant: that is a new act.
     w.catalog
-        .release(&*w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
+        .release(
+            &*w.conn().await,
+            &alice,
+            desc.hash,
+            SourceKind::Upload,
+            "upload-1",
+        )
         .await
         .unwrap();
     let sealed = w.seal(b"a document alice uploaded").await;

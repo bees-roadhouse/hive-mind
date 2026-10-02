@@ -114,11 +114,13 @@ async fn agent_run_pins_author_and_owner_from_the_credential() {
     let rs = AgentRunStore::new(w.store.clone(), writer(c, Level::Untrusted)).expect("new store");
     let rec = record("run-identity-1");
     rs.create_run(rec.clone()).await.expect("create");
-    let row = query("SELECT author_actor, owner_kind, owner_id, trust FROM agent_runs WHERE run_key = ?1")
-        .bind(&rec.run_id)
-        .fetch_one(&*w.conn().await)
-        .await
-        .unwrap();
+    let row = query(
+        "SELECT author_actor, owner_kind, owner_id, trust FROM agent_runs WHERE run_key = ?1",
+    )
+    .bind(&rec.run_id)
+    .fetch_one(&*w.conn().await)
+    .await
+    .unwrap();
     let (author, owner_kind, owner_id, recorded): (Uuid, String, Uuid, String) = (
         row.get("author_actor"),
         row.get("owner_kind"),

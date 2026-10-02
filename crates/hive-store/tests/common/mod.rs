@@ -98,7 +98,11 @@ impl World {
 
     /// A connection on the override audit's file.
     pub async fn audit(&self) -> Conn {
-        self.store.audit().conn().await.expect("open audit connection")
+        self.store
+            .audit()
+            .conn()
+            .await
+            .expect("open audit connection")
     }
 
     /// A person. Every actor after the root names its creator.

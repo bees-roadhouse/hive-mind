@@ -194,8 +194,13 @@ mod tests {
     #[tokio::test]
     async fn the_audit_file_migrates_on_its_own() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = Db::open(dir.path().join("hive-audit.db")).await.expect("open");
-        assert_eq!(migrate_audit(&db).await.expect("migrate"), vec!["0001".to_string()]);
+        let db = Db::open(dir.path().join("hive-audit.db"))
+            .await
+            .expect("open");
+        assert_eq!(
+            migrate_audit(&db).await.expect("migrate"),
+            vec!["0001".to_string()]
+        );
         assert!(migrate_audit(&db).await.expect("again").is_empty());
         let c = db.conn().await.unwrap();
         let n: i64 = query("SELECT count(*) FROM grant_override_audit")
@@ -247,15 +252,28 @@ mod tests {
                 .fetch_scalars(&c)
                 .await
                 .unwrap();
-        for want in ["actors", "grants", "events", "installs", "chat_turns", "schema_migrations"] {
-            assert!(tables.iter().any(|t| t == want), "missing table {want}: {tables:?}");
+        for want in [
+            "actors",
+            "grants",
+            "events",
+            "installs",
+            "chat_turns",
+            "schema_migrations",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == want),
+                "missing table {want}: {tables:?}"
+            );
         }
         let views: Vec<String> = query("SELECT name FROM sqlite_master WHERE type = 'view'")
             .fetch_scalars(&c)
             .await
             .unwrap();
         assert!(views.iter().any(|v| v == "subject_owners"), "{views:?}");
-        assert!(views.iter().any(|v| v == "builds_awaiting_promotion"), "{views:?}");
+        assert!(
+            views.iter().any(|v| v == "builds_awaiting_promotion"),
+            "{views:?}"
+        );
     }
 
     #[tokio::test]
@@ -281,6 +299,9 @@ mod tests {
             .await
             .unwrap();
         let err = migrate(&db).await.unwrap_err();
-        assert!(matches!(err, MigrateError::Unknown(ref v) if v == "0999"), "{err}");
+        assert!(
+            matches!(err, MigrateError::Unknown(ref v) if v == "0999"),
+            "{err}"
+        );
     }
 }

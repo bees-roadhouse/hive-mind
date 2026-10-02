@@ -75,7 +75,9 @@ pub use guestblobs::GuestBlobs;
 pub use guestevents::{GuestEvents, platform_kind, visible_to};
 pub use hive_db::{Conn, Connection, Db, Transaction};
 pub use hive_identity::{Credential, Owner, PrincipalKind};
-pub use hive_schema::{AUDIT_MIGRATIONS, MIGRATIONS, MigrateError, Migration, migrate, migrate_audit};
+pub use hive_schema::{
+    AUDIT_MIGRATIONS, MIGRATIONS, MigrateError, Migration, migrate, migrate_audit,
+};
 pub use installs::{
     CAPABILITY_ACTIVATE, InstallSpec, activate_install, grant_install_authority,
     revoke_install_authority, stage_install,

@@ -267,13 +267,20 @@ fn scan_events(rows: Vec<Row>) -> Result<Vec<Event>> {
 #[derive(Clone, Default)]
 pub struct EventWake {
     inner: Arc<tokio::sync::Notify>,
+    rings: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl EventWake {
     /// Rings the bell. Coalescing: a ring nobody was waiting for is stored
     /// once, so a burst of writes is one wakeup rather than a queue.
     pub fn ring(&self) {
+        self.rings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.notify_one();
+    }
+
+    /// How many times the bell has rung, for a test that counts them.
+    pub fn rings(&self) -> u64 {
+        self.rings.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Resolves on the next ring (or the stored one).

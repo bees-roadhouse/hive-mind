@@ -462,8 +462,8 @@ async fn reclaim_fails_a_lapsed_turn_and_fences_the_worker() {
         .bind(claim.turn_id)
         .bind(common::now() - chrono::Duration::seconds(1))
         .execute(&*w.conn().await)
-    .await
-    .unwrap();
+        .await
+        .unwrap();
 
     let reclaimed = chat.reclaim_lapsed_turns().await.expect("reclaim");
     assert_eq!(reclaimed.len(), 1);

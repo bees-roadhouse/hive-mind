@@ -78,12 +78,11 @@ pub async fn ensure_bootstrap_credential(conn: &Connection, root: Uuid, token: &
             "bootstrap credential needs a token".into(),
         ));
     }
-    let existing: Option<Uuid> =
-        query("SELECT actor_id FROM credentials WHERE token_sha256 = ?1")
-            .bind(hash_token(token))
-            .fetch_scalar_optional(conn)
-            .await
-            .map_err(|e| StoreError::db("look up bootstrap credential", e))?;
+    let existing: Option<Uuid> = query("SELECT actor_id FROM credentials WHERE token_sha256 = ?1")
+        .bind(hash_token(token))
+        .fetch_scalar_optional(conn)
+        .await
+        .map_err(|e| StoreError::db("look up bootstrap credential", e))?;
     if let Some(existing) = existing {
         if existing != root {
             return Err(StoreError::Other(format!(

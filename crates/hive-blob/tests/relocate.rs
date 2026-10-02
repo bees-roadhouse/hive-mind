@@ -16,7 +16,9 @@ async fn two_disks() -> (DiskDriver, DiskDriver, tempfile::TempDir, tempfile::Te
 
 async fn unused_db() -> (tempfile::TempDir, hive_db::Db) {
     let dir = tempfile::tempdir().unwrap();
-    let db = hive_db::Db::open(dir.path().join("unused.db")).await.unwrap();
+    let db = hive_db::Db::open(dir.path().join("unused.db"))
+        .await
+        .unwrap();
     (dir, db)
 }
 

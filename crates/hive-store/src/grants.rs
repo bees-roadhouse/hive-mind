@@ -573,8 +573,15 @@ impl Guard {
         install_id: Uuid,
         route: &str,
     ) -> Result<Option<Reason>> {
-        self.named_reason(db, cred, SubjectKind::Route, install_id, route, "route call")
-            .await
+        self.named_reason(
+            db,
+            cred,
+            SubjectKind::Route,
+            install_id,
+            route,
+            "route call",
+        )
+        .await
     }
 
     /// The set-read form, and it carries the same audit obligation as the point

@@ -12,8 +12,8 @@ use common::{World, cred, org, user};
 use hive_db::query;
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_store::{
-    Access, GrantSource, GrantSpec, Reason, StoreError, Subject, UnshareResult,
-    enter_break_glass, materialize_inherited, revoke_grant, write_grant,
+    Access, GrantSource, GrantSpec, Reason, StoreError, Subject, UnshareResult, enter_break_glass,
+    materialize_inherited, revoke_grant, write_grant,
 };
 use rand::{Rng, SeedableRng};
 use uuid::Uuid;
@@ -81,7 +81,9 @@ async fn revoking_a_parent_removes_every_inherited_child() {
     }
 
     // THE INVARIANT.
-    revoke_grant(&*w.conn().await, parent).await.expect("revoke parent");
+    revoke_grant(&*w.conn().await, parent)
+        .await
+        .expect("revoke parent");
     for (i, r) in replies.iter().enumerate() {
         assert_eq!(
             w.reason_of(&bob_cred, r, Access::Read).await,
@@ -151,7 +153,9 @@ async fn narrowing_survives_rematerialization_but_revocation_does_not() {
 
     // Revoking the parent deletes the tombstone with the live child, so a
     // later re-share starts clean.
-    revoke_grant(&*w.conn().await, parent).await.expect("revoke");
+    revoke_grant(&*w.conn().await, parent)
+        .await
+        .expect("revoke");
     assert_eq!(
         w.count("SELECT count(*) FROM grants WHERE source = 'inherited'")
             .await,
@@ -328,12 +332,11 @@ async fn override_never_reaches_a_personally_owned_row() {
             .expect("authorize org row");
         assert_eq!(reason, Reason::Override);
     }
-    let audits: i64 =
-        query("SELECT count(*) FROM grant_override_audit WHERE actor_id = ?1")
-            .bind(alice)
-            .fetch_scalar(&*w.audit().await)
-            .await
-            .unwrap();
+    let audits: i64 = query("SELECT count(*) FROM grant_override_audit WHERE actor_id = ?1")
+        .bind(alice)
+        .fetch_scalar(&*w.audit().await)
+        .await
+        .unwrap();
     assert_eq!(audits, 1);
 
     // THE INVARIANT: being admin of the household is not being Bob.
@@ -1265,20 +1268,20 @@ async fn visible_entity_ids_audits_overrides() {
 
     // THE POINT: the row came back solely because of break-glass, so the set
     // read owes the audit exactly as the point check does.
-    let audits: i64 =
-        query("SELECT count(*) FROM grant_override_audit WHERE actor_id = ?1")
-            .bind(alice)
-            .fetch_scalar(&*w.audit().await)
-            .await
-            .unwrap();
+    let audits: i64 = query("SELECT count(*) FROM grant_override_audit WHERE actor_id = ?1")
+        .bind(alice)
+        .fetch_scalar(&*w.audit().await)
+        .await
+        .unwrap();
     assert!(
         audits > 0,
         "a set read returned an override-only row and wrote no audit row"
     );
-    let last = query("SELECT owner_kind, owner_id FROM grant_override_audit ORDER BY id DESC LIMIT 1")
-        .fetch_one(&*w.audit().await)
-        .await
-        .unwrap();
+    let last =
+        query("SELECT owner_kind, owner_id FROM grant_override_audit ORDER BY id DESC LIMIT 1")
+            .fetch_one(&*w.audit().await)
+            .await
+            .unwrap();
     let (owner_kind, owner_id): (String, Uuid) = (last.get("owner_kind"), last.get("owner_id"));
     assert_eq!(
         (owner_kind.as_str(), owner_id),
@@ -1316,12 +1319,11 @@ async fn override_audit_survives_a_caller_rollback() {
         .expect("authorize in tx");
     tx.rollback().await.expect("rollback");
 
-    let audits: i64 =
-        query("SELECT count(*) FROM grant_override_audit WHERE actor_id = ?1")
-            .bind(alice)
-            .fetch_scalar(&*w.audit().await)
-            .await
-            .unwrap();
+    let audits: i64 = query("SELECT count(*) FROM grant_override_audit WHERE actor_id = ?1")
+        .bind(alice)
+        .fetch_scalar(&*w.audit().await)
+        .await
+        .unwrap();
     assert_eq!(audits, 1, "audit rows surviving the caller's rollback");
 }
 

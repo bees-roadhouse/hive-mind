@@ -424,10 +424,11 @@ async fn conversation_is_a_grantable_subject() {
 #[tokio::test]
 async fn conversation_subject_has_no_name() {
     let w = World::new("conversation_subject_has_no_name").await;
-    let ddl: String = query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'grants'")
-        .fetch_scalar(&*w.conn().await)
-        .await
-        .expect("read table definition");
+    let ddl: String =
+        query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'grants'")
+            .fetch_scalar(&*w.conn().await)
+            .await
+            .expect("read table definition");
     let clause = ddl
         .split("grants_named_subjects")
         .nth(1)
@@ -562,7 +563,10 @@ async fn grants_cannot_be_rewritten_by_update() {
         (
             "promote to override",
             "UPDATE grants SET source = 'override', expires_at = ?2 WHERE id = ?1",
-            vec![grant.into_value(), Value::Integer(hive_db::micros(tomorrow))],
+            vec![
+                grant.into_value(),
+                Value::Integer(hive_db::micros(tomorrow)),
+            ],
         ),
         (
             "move the subject",
@@ -572,7 +576,10 @@ async fn grants_cannot_be_rewritten_by_update() {
         (
             "extend the window",
             "UPDATE grants SET expires_at = ?2 WHERE id = ?1",
-            vec![grant.into_value(), Value::Integer(hive_db::micros(next_year))],
+            vec![
+                grant.into_value(),
+                Value::Integer(hive_db::micros(next_year)),
+            ],
         ),
     ];
     for (name, sql, args) in attacks {

@@ -403,7 +403,9 @@ fn contains(hay: &serde_json::Value, needle: &serde_json::Value) -> bool {
         (Value::Object(h), Value::Object(n)) => n
             .iter()
             .all(|(k, nv)| h.get(k).is_some_and(|hv| contains(hv, nv))),
-        (Value::Array(h), Value::Array(n)) => n.iter().all(|nv| h.iter().any(|hv| contains(hv, nv))),
+        (Value::Array(h), Value::Array(n)) => {
+            n.iter().all(|nv| h.iter().any(|hv| contains(hv, nv)))
+        }
         // Postgres also lets a scalar needle match an array containing it.
         (Value::Array(h), scalar) if !scalar.is_object() && !scalar.is_array() => {
             h.iter().any(|hv| hv == scalar)
@@ -1164,6 +1166,9 @@ mod tests {
         assert!(!contains(&doc, &json!({"tags": ["c"]})));
         assert!(contains(&doc, &json!({"meta": {"x": 1}})));
         assert!(!contains(&doc, &json!({"meta": {"x": 2}})));
-        assert!(contains(&doc, &json!({"tags": "a"})), "a scalar matches inside an array");
+        assert!(
+            contains(&doc, &json!({"tags": "a"})),
+            "a scalar matches inside an array"
+        );
     }
 }

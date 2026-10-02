@@ -266,8 +266,10 @@ pub(crate) fn point_sql() -> String {
 ///   it loses: the set-read form skipped the audit entirely.
 ///
 /// Reads go through the connection each method is handed, so a caller inside a
-/// transaction sees its own writes. Audit rows land on a connection of their
-/// own, outside any transaction, on purpose.
+/// transaction sees its own writes. Audit rows land in the audit file, on a
+/// connection of its own, on purpose: with one writer per file a second
+/// connection on the SAME file would wait on the caller's write lock, so the
+/// evidence has a file to itself (D38 §3).
 #[derive(Clone)]
 pub struct Guard {
     audit: Db,
@@ -415,7 +417,7 @@ impl Guard {
         if reason == Reason::Override {
             // Refuse the access rather than let it happen unaudited.
             // Visibility is what makes the power acceptable.
-            self.record_override(cred, subj, access, grant_id, note)
+            self.record_override(db, cred, subj, access, grant_id, note)
                 .await
                 .map_err(|e| {
                     StoreError::Other(format!("override audit failed, access refused: {e}"))
@@ -440,24 +442,36 @@ impl Guard {
         }
     }
 
-    /// Writes the audit row on a connection of its own, outside whatever
-    /// transaction the caller is running, and fails loudly if it wrote
-    /// nothing.
+    /// Writes the audit row in the audit file, outside whatever transaction
+    /// the caller is running, and fails loudly if it wrote nothing.
     ///
-    /// A zero-row insert is not an error to the engine, so without the count
-    /// check the guarantee would be "the audit statement did not error", which
-    /// is a weaker claim than the one D18.2 makes. The owner comes from
-    /// `subject_owners` for the same reason the predicate resolves it: an
-    /// audit row naming an owner the caller supplied would record the caller's
-    /// belief rather than the fact.
+    /// The owner comes from `subject_owners`, read on the caller's connection
+    /// so it is the same fact the decision just resolved, for the same reason
+    /// the predicate resolves it: an audit row naming an owner the caller
+    /// supplied would record the caller's belief rather than the fact. A
+    /// subject that resolves to no owner cannot have reached 'override', so
+    /// that reads as an error rather than as an unowned audit row.
     async fn record_override(
         &self,
+        db: &Connection,
         cred: &Credential,
         subj: &Subject,
         access: Access,
         grant_id: Option<Uuid>,
         note: &str,
     ) -> Result<()> {
+        let owner = query(
+            "SELECT owner_kind, owner_id FROM subject_owners
+              WHERE subject_kind = ?1 AND subject_id = ?2",
+        )
+        .bind(subj.kind.as_str())
+        .bind(subj.id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| StoreError::db("resolve audit owner", e))?
+        .ok_or_else(|| StoreError::Other("override audit: subject has no owner".into()))?;
+        let owner_kind: String = owner.get("owner_kind");
+        let owner_id: Uuid = owner.get("owner_id");
         let c = self
             .audit
             .conn()
@@ -468,9 +482,7 @@ impl Guard {
                  grant_id, actor_id, principal_kind, principal_id,
                  subject_kind, subject_id, subject_name,
                  owner_kind, owner_id, access, reason, occurred_at)
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, so.owner_kind, so.owner_id, ?8, ?9, ?10
-               FROM subject_owners so
-              WHERE so.subject_kind = ?5 AND so.subject_id = ?6",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(grant_id)
         .bind(cred.actor_id)
@@ -479,6 +491,8 @@ impl Guard {
         .bind(subj.kind.as_str())
         .bind(subj.id)
         .bind(subj.name())
+        .bind(owner_kind)
+        .bind(owner_id)
         .bind(access.as_str())
         .bind(note)
         .bind(hive_db::now())
@@ -526,7 +540,7 @@ impl Guard {
         };
         if r == Reason::Override {
             let audited = Subject::named(kind, install_id, name);
-            self.record_override(cred, &audited, Access::Call, grant_id, note)
+            self.record_override(db, cred, &audited, Access::Call, grant_id, note)
                 .await
                 .map_err(|e| {
                     StoreError::Other(format!("override audit failed, access refused: {e}"))
@@ -684,7 +698,7 @@ impl Guard {
             // `kind` is Entity or Conversation on every path that reaches here;
             // neither is install-scoped, so there is no asking install to name.
             let (_, grant_id) = self.decision(db, cred, &subj, access, None).await?;
-            self.record_override(cred, &subj, access, grant_id, "list")
+            self.record_override(db, cred, &subj, access, grant_id, "list")
                 .await
                 .map_err(|e| {
                     StoreError::Other(format!(

@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 axum.workspace = true
 http.workspace = true
-sqlx.workspace = true
+hive-db = { path = "../hive-db" }
 tokio.workspace = true
 futures.workspace = true
 thiserror.workspace = true

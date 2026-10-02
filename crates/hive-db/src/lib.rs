@@ -1,12 +1,22 @@
 //! The one way the host opens a database file (D38).
 //!
-//! libSQL is SQLite with additions, reached through the `libsql` crate. This
-//! crate wraps it just enough that the rest of the workspace speaks one shape:
-//! a [`Db`] is a file, a [`Conn`] is a checked-out connection on it with the
-//! pragmas the schema assumes already set, a [`Transaction`] is `BEGIN
-//! IMMEDIATE` on one, and [`query`] binds typed values and reads typed columns
-//! by name. There is deliberately no query helper that knows about grants: the
-//! predicate lives in `hive-store`, and nothing here reads policy.
+//! SQLite, bundled and vanilla, through `rusqlite`. This crate wraps it just
+//! enough that the rest of the workspace speaks one shape: a [`Db`] is a
+//! file, a [`Conn`] is a checked-out connection on it with the pragmas the
+//! schema assumes already set, a [`Transaction`] is `BEGIN IMMEDIATE` on one,
+//! and [`query`] binds typed values and reads typed columns by name. There is
+//! deliberately no query helper that knows about grants: the predicate lives
+//! in `hive-store`, and nothing here reads policy.
+//!
+//! The engine is vanilla SQLite rather than the libSQL fork D38 first named,
+//! and that is a measured change rather than a preference: the fork's crate
+//! (0.9.30 and 0.10.0-pre.4, MSVC and GNU builds) corrupts the heap on
+//! Windows once roughly ten connections are open in one process, and the
+//! process dies in `sqlite3_close_v2` reading a handle that was already
+//! freed. The same open-and-close pattern against this crate's bundled
+//! SQLite ran 600 connections at a time without incident. The API below is
+//! the seam: when the fork is fixed, or when phase 3 wants its replicas, the
+//! swap is this file.
 //!
 //! Three facts every caller relies on and should know it relies on:
 //!
@@ -20,16 +30,14 @@
 //!   expression a column default or a trigger uses. They read the same clock
 //!   at different resolutions (microseconds and milliseconds), and nothing
 //!   orders rows across the two.
-//! - **Connections are pooled and few.** A [`Conn`] goes back to its file's
-//!   pool when dropped, and the number open at once is capped. Measured, not
-//!   assumed: the engine as built crashes the process once a few hundred
-//!   connections are open on one WAL file (reproduced on Windows with bare
-//!   `libsql`, no pragmas, 600 connections; 200 was fine), and opening one per
-//!   statement crashed intermittently on the way there. The cap keeps the
-//!   daemon far from that cliff and the reuse keeps a statement from paying
-//!   an open. A connection is keyed on nothing a caller could forget
-//!   (invariant 14): every one has the same pragmas and no state outlives a
-//!   checkout, because one mid-transaction is closed rather than returned.
+//! - **Connections are pooled and few, and every call on one blocks.** The
+//!   engine is in-process and synchronous; a statement runs on the calling
+//!   thread, which is what the async-shaped libSQL API did underneath too.
+//!   A [`Conn`] goes back to its file's pool when dropped, and the number
+//!   open at once is capped. A connection is keyed on nothing a caller could
+//!   forget (invariant 14): every one has the same pragmas and no state
+//!   outlives a checkout, because one mid-transaction is closed rather than
+//!   returned.
 
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -37,7 +45,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-pub use libsql::{Connection, TransactionBehavior, Value};
+use parking_lot::Mutex;
+pub use rusqlite::types::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
@@ -58,9 +67,7 @@ pub const UUID_SQL: &str = "(lower(hex(randomblob(4)) || '-' || hex(randomblob(2
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many connections one file may have open at once, counting the ones
-/// checked out. Past this a caller waits for a return. Well under the few
-/// hundred where the engine falls over, and well over what one daemon's
-/// handlers and workers hold at a time.
+/// checked out. Past this a caller waits for a return.
 const MAX_OPEN: usize = 32;
 
 /// How many idle connections the pool keeps. More than this and a returned
@@ -71,7 +78,7 @@ const MAX_IDLE: usize = 8;
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
-    Sqlite(#[from] libsql::Error),
+    Sqlite(#[from] rusqlite::Error),
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("no rows")]
@@ -90,7 +97,7 @@ impl Error {
     /// shows one to a client.
     pub fn message(&self) -> String {
         match self {
-            Error::Sqlite(libsql::Error::SqliteFailure(_, msg)) => msg.clone(),
+            Error::Sqlite(rusqlite::Error::SqliteFailure(_, Some(msg))) => msg.clone(),
             other => other.to_string(),
         }
     }
@@ -98,7 +105,7 @@ impl Error {
     /// The primary SQLite result code, when the engine produced one.
     pub fn sqlite_code(&self) -> Option<i32> {
         match self {
-            Error::Sqlite(libsql::Error::SqliteFailure(code, _)) => Some(*code & 0xff),
+            Error::Sqlite(rusqlite::Error::SqliteFailure(e, _)) => Some(e.extended_code & 0xff),
             _ => None,
         }
     }
@@ -123,10 +130,45 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// One engine connection, behind a lock so a reference to it can cross an
+/// await point. A statement takes the lock for exactly its own duration;
+/// nothing holds it across a wait, so two tasks sharing one `Connection`
+/// interleave statements rather than deadlock. Transactions are statements
+/// too (`BEGIN IMMEDIATE`, `COMMIT`), which is why a checked-out [`Conn`] is
+/// never shared: the pool hands each one to one holder at a time.
+pub struct Connection {
+    inner: Mutex<rusqlite::Connection>,
+}
+
+impl Connection {
+    fn open(path: &Path) -> Result<Connection> {
+        let c = rusqlite::Connection::open(path)?;
+        c.busy_timeout(BUSY_TIMEOUT)?;
+        // Foreign keys are per connection in SQLite and default to off, so a
+        // connection that skipped this would silently ignore every
+        // `REFERENCES` in the schema; that is why there is no other way to
+        // open one.
+        c.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
+        Ok(Connection {
+            inner: Mutex::new(c),
+        })
+    }
+
+    /// Whether no transaction is open on this connection.
+    pub fn is_autocommit(&self) -> bool {
+        self.inner.lock().is_autocommit()
+    }
+
+    /// Runs many statements. Migrations and DDL only; nothing here binds.
+    pub fn execute_batch(&self, sql: &str) -> Result<()> {
+        self.inner.lock().execute_batch(sql)?;
+        Ok(())
+    }
+}
+
 struct Inner {
-    db: libsql::Database,
     path: PathBuf,
-    idle: parking_lot::Mutex<Vec<Connection>>,
+    idle: Mutex<Vec<Connection>>,
     slots: Arc<Semaphore>,
 }
 
@@ -155,12 +197,10 @@ impl Db {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let inner = libsql::Builder::new_local(&path).build().await?;
         let db = Db {
             inner: Arc::new(Inner {
-                db: inner,
                 path,
-                idle: parking_lot::Mutex::new(Vec::new()),
+                idle: Mutex::new(Vec::new()),
                 slots: Arc::new(Semaphore::new(MAX_OPEN)),
             }),
         };
@@ -182,11 +222,8 @@ impl Db {
         &self.inner.path
     }
 
-    /// A connection from the pool, or a fresh one with foreign keys enforced
-    /// and the busy timeout set. Foreign keys are per connection in SQLite and
-    /// default to off, so a connection that skipped this would silently ignore
-    /// every `REFERENCES` in the schema; that is why there is no other way to
-    /// get one. Waits when the file's cap of open connections is reached.
+    /// A connection from the pool, or a fresh one. Waits when the file's cap
+    /// of open connections is reached.
     pub async fn conn(&self) -> Result<Conn> {
         let permit = self
             .inner
@@ -198,13 +235,7 @@ impl Db {
         let reused = self.inner.idle.lock().pop();
         let c = match reused {
             Some(c) => c,
-            None => {
-                let c = self.inner.db.connect()?;
-                c.busy_timeout(BUSY_TIMEOUT)?;
-                c.execute("PRAGMA foreign_keys = ON", ()).await?;
-                c.execute("PRAGMA synchronous = NORMAL", ()).await?;
-                c
-            }
+            None => Connection::open(&self.inner.path)?,
         };
         Ok(Conn {
             c: Some(c),
@@ -219,23 +250,19 @@ impl Db {
     /// Dropping the transaction without committing rolls it back.
     pub async fn begin(&self) -> Result<Transaction> {
         let conn = self.conn().await?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?;
-        Ok(Transaction { tx: Some(tx), conn })
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(Transaction { open: true, conn })
     }
 
     /// Runs many statements. Migrations and DDL only; nothing here binds.
     pub async fn batch(c: &Connection, sql: &str) -> Result<()> {
-        c.execute_batch(sql).await?;
-        Ok(())
+        c.execute_batch(sql)
     }
 }
 
-/// A checked-out connection. Derefs to the engine's connection; goes back to
-/// the pool when dropped unless it is mid-transaction, in which case it is
-/// closed, because a connection with state is not interchangeable with one
-/// without.
+/// A checked-out connection. Derefs to the connection; goes back to the pool
+/// when dropped unless it is mid-transaction, in which case it is closed,
+/// because a connection with state is not interchangeable with one without.
 pub struct Conn {
     c: Option<Connection>,
     pool: Arc<Inner>,
@@ -266,9 +293,9 @@ impl Drop for Conn {
 
 /// `BEGIN IMMEDIATE` on a pooled connection. Derefs to the connection so
 /// statements run inside it; `commit` ends it; dropping it rolls it back and
-/// returns the connection to the pool afterwards (fields drop in order).
+/// returns the connection to the pool afterwards.
 pub struct Transaction {
-    tx: Option<libsql::Transaction>,
+    open: bool,
     conn: Conn,
 }
 
@@ -281,17 +308,30 @@ impl Deref for Transaction {
 
 impl Transaction {
     pub async fn commit(mut self) -> Result<()> {
-        if let Some(tx) = self.tx.take() {
-            tx.commit().await?;
+        if self.open {
+            self.open = false;
+            self.conn.execute_batch("COMMIT")?;
         }
         Ok(())
     }
 
     pub async fn rollback(mut self) -> Result<()> {
-        if let Some(tx) = self.tx.take() {
-            tx.rollback().await?;
+        if self.open {
+            self.open = false;
+            self.conn.execute_batch("ROLLBACK")?;
         }
         Ok(())
+    }
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if self.open && !self.conn.is_autocommit() {
+            // Best effort: a rollback that fails leaves the connection
+            // mid-transaction, and `Conn::drop` then closes it rather than
+            // returning it, so the failure cannot leak into another caller.
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
     }
 }
 
@@ -640,68 +680,56 @@ pub fn query(sql: &str) -> Query<'_> {
     }
 }
 
-impl<'q> Query<'q> {
+impl Query<'_> {
     pub fn bind<T: ToSql>(mut self, v: T) -> Self {
         self.params.push(v.to_sql());
         self
     }
 
-    fn params(self) -> (&'q str, libsql::params::Params) {
-        let p = if self.params.is_empty() {
-            libsql::params::Params::None
-        } else {
-            libsql::params::Params::Positional(self.params)
-        };
-        (self.sql, p)
-    }
-
     /// Runs a statement that returns no rows and reports how many it changed.
     /// A statement with `RETURNING` wants `fetch_*`; the engine refuses it here.
     pub async fn execute(self, c: &Connection) -> Result<u64> {
-        let (sql, p) = self.params();
-        Ok(c.execute(sql, p).await?)
+        let conn = c.inner.lock();
+        let mut stmt = conn.prepare(self.sql)?;
+        let n = stmt.execute(rusqlite::params_from_iter(self.params.iter()))?;
+        Ok(n as u64)
     }
 
-    pub async fn fetch_all(self, c: &Connection) -> Result<Vec<Row>> {
-        let (sql, p) = self.params();
-        let mut rows = c.query(sql, p).await?;
-        let n = rows.column_count();
+    /// Reads up to `limit` rows; `None` reads them all.
+    fn fetch(self, c: &Connection, limit: Option<usize>) -> Result<Vec<Row>> {
+        let conn = c.inner.lock();
+        let mut stmt = conn.prepare(self.sql)?;
         let columns: Arc<Vec<String>> = Arc::new(
-            (0..n)
-                .map(|i| rows.column_name(i).unwrap_or("").to_string())
+            stmt.column_names()
+                .into_iter()
+                .map(String::from)
                 .collect(),
         );
+        let n = columns.len();
+        let mut rows = stmt.query(rusqlite::params_from_iter(self.params.iter()))?;
         let mut out = Vec::new();
-        while let Some(r) = rows.next().await? {
-            let mut values = Vec::with_capacity(n as usize);
+        while let Some(r) = rows.next()? {
+            let mut values = Vec::with_capacity(n);
             for i in 0..n {
-                values.push(r.get_value(i)?);
+                values.push(r.get::<_, Value>(i)?);
             }
             out.push(Row {
                 columns: columns.clone(),
                 values,
             });
+            if limit.is_some_and(|l| out.len() >= l) {
+                break;
+            }
         }
         Ok(out)
     }
 
+    pub async fn fetch_all(self, c: &Connection) -> Result<Vec<Row>> {
+        self.fetch(c, None)
+    }
+
     pub async fn fetch_optional(self, c: &Connection) -> Result<Option<Row>> {
-        let (sql, p) = self.params();
-        let mut rows = c.query(sql, p).await?;
-        let n = rows.column_count();
-        let columns: Arc<Vec<String>> = Arc::new(
-            (0..n)
-                .map(|i| rows.column_name(i).unwrap_or("").to_string())
-                .collect(),
-        );
-        let Some(r) = rows.next().await? else {
-            return Ok(None);
-        };
-        let mut values = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            values.push(r.get_value(i)?);
-        }
-        Ok(Some(Row { columns, values }))
+        Ok(self.fetch(c, Some(1))?.into_iter().next())
     }
 
     pub async fn fetch_one(self, c: &Connection) -> Result<Row> {
@@ -759,6 +787,12 @@ mod tests {
         assert_eq!(fk, 1);
         let mode: String = query("PRAGMA journal_mode").fetch_scalar(&c).await.unwrap();
         assert_eq!(mode, "wal");
+        let v: String = query("SELECT sqlite_version()").fetch_scalar(&c).await.unwrap();
+        let major_minor: Vec<u32> = v.split('.').take(2).filter_map(|p| p.parse().ok()).collect();
+        assert!(
+            major_minor >= vec![3, 45],
+            "the schema needs jsonb and the -> operators; bundled engine is {v}"
+        );
     }
 
     #[tokio::test]
@@ -863,9 +897,7 @@ mod tests {
     }
 
     /// The pool: a returned connection is the one handed out next, a
-    /// connection dropped mid-transaction is not, and the cap holds. The
-    /// crash this guards against needs hundreds of connections; the test
-    /// checks the mechanism rather than reproducing the crash.
+    /// connection dropped mid-transaction is not, and the cap holds.
     #[tokio::test]
     async fn connections_are_reused_and_capped() {
         let (_d, db) = temp().await;
@@ -885,14 +917,13 @@ mod tests {
         // A connection left inside a transaction is closed, not pooled.
         {
             let c = db.conn().await.unwrap();
-            c.execute("BEGIN", ()).await.unwrap();
+            c.execute_batch("BEGIN").unwrap();
             query("INSERT INTO t VALUES (1)").execute(&c).await.unwrap();
         }
         assert_eq!(db.inner.idle.lock().len(), 1, "a mid-transaction connection was pooled");
         let c = db.conn().await.unwrap();
         let n: i64 = query("SELECT count(*) FROM t").fetch_scalar(&c).await.unwrap();
         assert_eq!(n, 0, "the abandoned transaction leaked a row");
-        // Many sequential checkouts never exceed the idle cap.
         drop(c);
         let mut held = Vec::new();
         for _ in 0..(MAX_IDLE + 4) {
@@ -900,6 +931,30 @@ mod tests {
         }
         drop(held);
         assert!(db.inner.idle.lock().len() <= MAX_IDLE);
+    }
+
+    /// The pattern that took the libSQL fork down: many connections open at
+    /// once on one file, then closed. Kept so the engine underneath this
+    /// crate is held to it on every build.
+    #[tokio::test]
+    async fn many_open_connections_close_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("many.db");
+        let db = Db::open(&path).await.unwrap();
+        {
+            let c = db.conn().await.unwrap();
+            query("CREATE TABLE t (n INTEGER)").execute(&c).await.unwrap();
+        }
+        for _ in 0..20 {
+            let mut keep = Vec::new();
+            for _ in 0..64 {
+                let c = Connection::open(&path).unwrap();
+                let n: i64 = query("SELECT count(*) FROM t").fetch_scalar(&c).await.unwrap();
+                assert_eq!(n, 0);
+                keep.push(c);
+            }
+            drop(keep);
+        }
     }
 
     #[tokio::test]

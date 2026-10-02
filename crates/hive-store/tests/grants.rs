@@ -9,10 +9,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use common::{World, cred, org, user};
+use hive_db::query;
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_store::{
-    Access, GrantSource, GrantSpec, Reason, StoreError, Subject, enter_break_glass,
-    materialize_inherited, revoke_grant, unshare, write_grant,
+    Access, GrantSource, GrantSpec, Reason, StoreError, Subject, UnshareResult,
+    enter_break_glass, materialize_inherited, revoke_grant, write_grant,
 };
 use rand::{Rng, SeedableRng};
 use uuid::Uuid;
@@ -21,14 +22,27 @@ fn direct(subject: &Subject, target: Owner, access: Access, by: &Credential) -> 
     GrantSpec::direct(subject.clone(), target, access, *by)
 }
 
+/// `unshare` takes a transaction so the refusal and the writes cannot
+/// interleave; the tests want the one-call shape, so this commits for them.
+async fn unshare(
+    w: &World,
+    subj: &Subject,
+    target: Owner,
+    by: Uuid,
+    delete_direct: bool,
+) -> Result<UnshareResult, StoreError> {
+    let tx = w.store.begin().await.expect("begin");
+    let res = hive_store::unshare(&tx, subj, target, by, delete_direct).await?;
+    tx.commit().await.expect("commit");
+    Ok(res)
+}
+
 // --- 1. Revoking a parent removes every inherited child ---------------------
 
 /// Ported from `TestRevokingAParentRemovesEveryInheritedChild`.
 #[tokio::test]
 async fn revoking_a_parent_removes_every_inherited_child() {
-    let Some(w) = World::new("revoking_parent_removes_children").await else {
-        return;
-    };
+    let w = World::new("revoking_parent_removes_children").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
@@ -45,7 +59,7 @@ async fn revoking_a_parent_removes_every_inherited_child() {
     }
 
     let parent = write_grant(
-        w.pool(),
+        &*w.conn().await,
         &GrantSpec {
             reason: "shared the thread".into(),
             ..direct(&thread, user(bob), Access::Read, &alice_cred)
@@ -54,7 +68,7 @@ async fn revoking_a_parent_removes_every_inherited_child() {
     .await
     .expect("share thread");
     for r in &replies {
-        materialize_inherited(w.pool(), &thread, r, &alice_cred)
+        materialize_inherited(&*w.conn().await, &thread, r, &alice_cred)
             .await
             .expect("materialize");
     }
@@ -67,7 +81,7 @@ async fn revoking_a_parent_removes_every_inherited_child() {
     }
 
     // THE INVARIANT.
-    revoke_grant(w.pool(), parent).await.expect("revoke parent");
+    revoke_grant(&*w.conn().await, parent).await.expect("revoke parent");
     for (i, r) in replies.iter().enumerate() {
         assert_eq!(
             w.reason_of(&bob_cred, r, Access::Read).await,
@@ -75,9 +89,9 @@ async fn revoking_a_parent_removes_every_inherited_child() {
             "reply {i} after revoking the parent"
         );
     }
-    let orphans: i64 = sqlx::query_scalar("SELECT count(*) FROM grants WHERE inherited_from = $1")
+    let orphans: i64 = query("SELECT count(*) FROM grants WHERE inherited_from = ?1")
         .bind(parent)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
     assert_eq!(orphans, 0, "inherited children survived their parent");
@@ -86,9 +100,7 @@ async fn revoking_a_parent_removes_every_inherited_child() {
 /// Ported from `TestNarrowingSurvivesRematerializationButRevocationDoesNot`.
 #[tokio::test]
 async fn narrowing_survives_rematerialization_but_revocation_does_not() {
-    let Some(w) = World::new("narrowing_vs_revocation").await else {
-        return;
-    };
+    let w = World::new("narrowing_vs_revocation").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
@@ -99,20 +111,20 @@ async fn narrowing_survives_rematerialization_but_revocation_does_not() {
     let hide = Subject::entity(w.entity(inst, "entries", "hide", user(alice), alice).await);
 
     let parent = write_grant(
-        w.pool(),
+        &*w.conn().await,
         &direct(&thread, user(bob), Access::Read, &alice_cred),
     )
     .await
     .expect("share");
     for s in [&keep, &hide] {
-        materialize_inherited(w.pool(), &thread, s, &alice_cred)
+        materialize_inherited(&*w.conn().await, &thread, s, &alice_cred)
             .await
             .expect("materialize");
     }
 
     // "Shared with the thread except this one reply." Narrowing an inherited
     // child is reversible, so no explicit intent is needed.
-    let res = unshare(w.pool(), &hide, user(bob), alice, false)
+    let res = unshare(&w, &hide, user(bob), alice, false)
         .await
         .expect("unshare");
     assert_eq!(
@@ -123,7 +135,7 @@ async fn narrowing_survives_rematerialization_but_revocation_does_not() {
 
     // The materializer runs again and must not resurrect the narrowed row.
     for s in [&keep, &hide] {
-        materialize_inherited(w.pool(), &thread, s, &alice_cred)
+        materialize_inherited(&*w.conn().await, &thread, s, &alice_cred)
             .await
             .expect("re-materialize");
     }
@@ -139,7 +151,7 @@ async fn narrowing_survives_rematerialization_but_revocation_does_not() {
 
     // Revoking the parent deletes the tombstone with the live child, so a
     // later re-share starts clean.
-    revoke_grant(w.pool(), parent).await.expect("revoke");
+    revoke_grant(&*w.conn().await, parent).await.expect("revoke");
     assert_eq!(
         w.count("SELECT count(*) FROM grants WHERE source = 'inherited'")
             .await,
@@ -147,13 +159,13 @@ async fn narrowing_survives_rematerialization_but_revocation_does_not() {
     );
 
     let reshared = write_grant(
-        w.pool(),
+        &*w.conn().await,
         &direct(&thread, user(bob), Access::Read, &alice_cred),
     )
     .await
     .expect("re-share");
     assert_ne!(reshared, parent, "re-share reused the revoked grant id");
-    materialize_inherited(w.pool(), &thread, &hide, &alice_cred)
+    materialize_inherited(&*w.conn().await, &thread, &hide, &alice_cred)
         .await
         .expect("materialize after re-share");
     assert_eq!(
@@ -169,9 +181,7 @@ async fn narrowing_survives_rematerialization_but_revocation_does_not() {
 /// `authorize` turns deny into an error a caller cannot forget to check.
 #[tokio::test]
 async fn absence_is_deny_through_the_guard() {
-    let Some(w) = World::new("absence_is_deny_guard").await else {
-        return;
-    };
+    let w = World::new("absence_is_deny_guard").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let inst = w.install("journal", user(alice), alice).await;
@@ -206,11 +216,11 @@ async fn absence_is_deny_through_the_guard() {
             );
         }
     }
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let err = w
         .guard()
         .authorize(
-            &mut conn,
+            &conn,
             &cred(bob, PrincipalKind::User, bob),
             &entry,
             Access::Read,
@@ -224,9 +234,7 @@ async fn absence_is_deny_through_the_guard() {
 /// Ported from `TestDisabledActorIsDenied`.
 #[tokio::test]
 async fn disabled_actor_is_denied() {
-    let Some(w) = World::new("disabled_actor_is_denied").await else {
-        return;
-    };
+    let w = World::new("disabled_actor_is_denied").await;
     let alice = w.human("alice").await;
     let inst = w.install("journal", user(alice), alice).await;
     let entry = Subject::entity(w.entity(inst, "entries", "e", user(alice), alice).await);
@@ -235,9 +243,10 @@ async fn disabled_actor_is_denied() {
         w.reason_of(&c, &entry, Access::Read).await,
         Some(Reason::Owner)
     );
-    sqlx::query("UPDATE actors SET disabled_at = now() WHERE id = $1")
+    query("UPDATE actors SET disabled_at = ?2 WHERE id = ?1")
         .bind(alice)
-        .execute(w.pool())
+        .bind(common::now())
+        .execute(&*w.conn().await)
         .await
         .unwrap();
     assert_eq!(
@@ -252,9 +261,7 @@ async fn disabled_actor_is_denied() {
 /// Ported from `TestAIHoldsNoAuthorityBeyondItsPrincipal`.
 #[tokio::test]
 async fn ai_holds_no_authority_beyond_its_principal() {
-    let Some(w) = World::new("ai_no_authority_beyond_principal").await else {
-        return;
-    };
+    let w = World::new("ai_no_authority_beyond_principal").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let ava = w.ai("ava", "ava", user(alice), alice).await;
@@ -291,9 +298,7 @@ async fn ai_holds_no_authority_beyond_its_principal() {
 /// Ported from `TestOverrideNeverReachesAPersonallyOwnedRow`.
 #[tokio::test]
 async fn override_never_reaches_a_personally_owned_row() {
-    let Some(w) = World::new("override_never_reaches_personal_row").await else {
-        return;
-    };
+    let w = World::new("override_never_reaches_personal_row").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let acme = w.org("acme", alice).await;
@@ -306,9 +311,9 @@ async fn override_never_reaches_a_personally_owned_row() {
     let bob_row = Subject::entity(w.entity(m_inst, "entries", "m", user(bob), bob).await);
 
     {
-        let mut conn = w.conn().await;
+        let conn = w.conn().await;
         enter_break_glass(
-            &mut conn,
+            &conn,
             &org_row,
             &alice_cred,
             Duration::from_secs(1800),
@@ -318,24 +323,24 @@ async fn override_never_reaches_a_personally_owned_row() {
         .expect("break-glass on org row");
         let reason = w
             .guard()
-            .authorize(&mut conn, &alice_cred, &org_row, Access::Read, "incident")
+            .authorize(&conn, &alice_cred, &org_row, Access::Read, "incident")
             .await
             .expect("authorize org row");
         assert_eq!(reason, Reason::Override);
     }
     let audits: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM grant_override_audit WHERE actor_id = $1")
+        query("SELECT count(*) FROM grant_override_audit WHERE actor_id = ?1")
             .bind(alice)
-            .fetch_one(w.pool())
+            .fetch_scalar(&*w.audit().await)
             .await
             .unwrap();
     assert_eq!(audits, 1);
 
     // THE INVARIANT: being admin of the household is not being Bob.
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     assert!(
         enter_break_glass(
-            &mut conn,
+            &conn,
             &bob_row,
             &alice_cred,
             Duration::from_secs(1800),
@@ -350,7 +355,7 @@ async fn override_never_reaches_a_personally_owned_row() {
     // refuses it. The write path is a policy; the read path is the guarantee.
     w.issue_policy_off().await;
     enter_break_glass(
-        &mut conn,
+        &conn,
         &bob_row,
         &alice_cred,
         Duration::from_secs(1800),
@@ -369,9 +374,7 @@ async fn override_never_reaches_a_personally_owned_row() {
 /// Ported from `TestAIDoesNotInheritOverride` (D18.2.4).
 #[tokio::test]
 async fn ai_does_not_inherit_override() {
-    let Some(w) = World::new("ai_does_not_inherit_override").await else {
-        return;
-    };
+    let w = World::new("ai_does_not_inherit_override").await;
     let alice = w.human("alice").await;
     let acme = w.org("acme", alice).await;
     let ava = w.ai("ava", "ava", user(alice), alice).await;
@@ -379,9 +382,9 @@ async fn ai_does_not_inherit_override() {
     let row = Subject::entity(w.entity(inst, "entries", "o", org(acme), alice).await);
     let alice_cred = cred(alice, PrincipalKind::User, alice);
 
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     enter_break_glass(
-        &mut conn,
+        &conn,
         &row,
         &alice_cred,
         Duration::from_secs(3600),
@@ -405,18 +408,16 @@ async fn ai_does_not_inherit_override() {
 /// Ported from `TestOverrideExpires` (D18.2.3).
 #[tokio::test]
 async fn override_expires() {
-    let Some(w) = World::new("override_expires").await else {
-        return;
-    };
+    let w = World::new("override_expires").await;
     let alice = w.human("alice").await;
     let acme = w.org("acme", alice).await;
     let inst = w.install("shared", org(acme), alice).await;
     let row = Subject::entity(w.entity(inst, "entries", "o", org(acme), alice).await);
     let alice_cred = cred(alice, PrincipalKind::User, alice);
 
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let id = enter_break_glass(
-        &mut conn,
+        &conn,
         &row,
         &alice_cred,
         Duration::from_secs(3600),
@@ -432,9 +433,10 @@ async fn override_expires() {
     // A grant is immutable except for its revocation, so extending one in
     // place is refused. Ask the predicate what it will say later instead.
     assert!(
-        sqlx::query("UPDATE grants SET expires_at = now() + interval '2 hours' WHERE id = $1")
+        query("UPDATE grants SET expires_at = ?2 WHERE id = ?1")
             .bind(id)
-            .execute(w.pool())
+            .bind(common::now() + chrono::Duration::hours(2))
+            .execute(&*w.conn().await)
             .await
             .is_err(),
         "expires_at was mutable; break-glass could be extended in place"
@@ -456,18 +458,16 @@ async fn override_expires() {
 /// Ported from `TestBreakGlassWorksMoreThanOnce`.
 #[tokio::test]
 async fn break_glass_works_more_than_once() {
-    let Some(w) = World::new("break_glass_twice").await else {
-        return;
-    };
+    let w = World::new("break_glass_twice").await;
     let alice = w.human("alice").await;
     let acme = w.org("acme", alice).await;
     let inst = w.install("shared", org(acme), alice).await;
     let row = Subject::entity(w.entity(inst, "entries", "o", org(acme), alice).await);
     let alice_cred = cred(alice, PrincipalKind::User, alice);
 
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let first = enter_break_glass(
-        &mut conn,
+        &conn,
         &row,
         &alice_cred,
         Duration::from_secs(3600),
@@ -476,7 +476,7 @@ async fn break_glass_works_more_than_once() {
     .await
     .expect("first incident");
     let second = enter_break_glass(
-        &mut conn,
+        &conn,
         &row,
         &alice_cred,
         Duration::from_secs(3600),
@@ -495,9 +495,7 @@ async fn break_glass_works_more_than_once() {
 /// Ported from `TestUnshareThenReshareADirectGrant`.
 #[tokio::test]
 async fn unshare_then_reshare_a_direct_grant() {
-    let Some(w) = World::new("unshare_then_reshare").await else {
-        return;
-    };
+    let w = World::new("unshare_then_reshare").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
@@ -506,10 +504,10 @@ async fn unshare_then_reshare_a_direct_grant() {
     let entry = Subject::entity(w.entity(inst, "entries", "e", user(alice), alice).await);
     let spec = direct(&entry, user(bob), Access::Read, &alice_cred);
 
-    write_grant(w.pool(), &spec).await.expect("share");
+    write_grant(&*w.conn().await, &spec).await.expect("share");
     // Deletion is irreversible, so it takes explicit intent. Without it
     // nothing changes and the caller is told why.
-    let err = unshare(w.pool(), &entry, user(bob), alice, false)
+    let err = unshare(&w, &entry, user(bob), alice, false)
         .await
         .expect_err("unshare removed a direct grant without being asked to");
     assert!(
@@ -522,12 +520,12 @@ async fn unshare_then_reshare_a_direct_grant() {
         "a refused unshare changed something"
     );
 
-    let res = unshare(w.pool(), &entry, user(bob), alice, true)
+    let res = unshare(&w, &entry, user(bob), alice, true)
         .await
         .expect("unshare");
     assert_eq!((res.tombstoned, res.deleted), (0, 1));
     assert_eq!(w.reason_of(&bob_cred, &entry, Access::Read).await, None);
-    write_grant(w.pool(), &spec)
+    write_grant(&*w.conn().await, &spec)
         .await
         .expect("re-share after unshare");
     assert_eq!(
@@ -542,9 +540,7 @@ async fn unshare_then_reshare_a_direct_grant() {
 /// Ported from `TestAICannotClimb`.
 #[tokio::test]
 async fn ai_cannot_climb() {
-    let Some(w) = World::new("ai_cannot_climb").await else {
-        return;
-    };
+    let w = World::new("ai_cannot_climb").await;
     let alice = w.human("alice").await;
     let carol = w.human("carol").await;
     let ava = w.ai("ava", "ava", user(alice), alice).await;
@@ -558,13 +554,13 @@ async fn ai_cannot_climb() {
     // cannot create actors
     let puppet = Uuid::new_v4();
     assert!(
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', 'puppet', 'Puppet', 'user', $1, $2)",
+             VALUES (?1, 'human', 'puppet', 'Puppet', 'user', ?1, ?2)",
         )
         .bind(puppet)
         .bind(ava)
-        .execute(w.pool())
+        .execute(&*w.conn().await)
         .await
         .is_err(),
         "an AI created an actor"
@@ -572,15 +568,16 @@ async fn ai_cannot_climb() {
 
     // cannot issue credentials
     assert!(
-        sqlx::query(
+        query(
             "INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256,
                                       issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
-             VALUES ($1, 'user', $2, repeat('a', 64), $3, 'user', $2)",
+             VALUES (?1, 'user', ?2, ?4, ?3, 'user', ?2)",
         )
         .bind(ava)
         .bind(alice)
         .bind(ava)
-        .execute(w.pool())
+        .bind("a".repeat(64))
+        .execute(&*w.conn().await)
         .await
         .is_err(),
         "an AI issued a credential"
@@ -591,10 +588,10 @@ async fn ai_cannot_climb() {
         let acme = w.org("acme-2", alice).await;
         let o_inst = w.install("shared-2", org(acme), alice).await;
         let row = Subject::entity(w.entity(o_inst, "entries", "o", org(acme), alice).await);
-        let mut conn = w.conn().await;
+        let conn = w.conn().await;
         assert!(
             enter_break_glass(
-                &mut conn,
+                &conn,
                 &row,
                 &ava_cred,
                 Duration::from_secs(3600),
@@ -610,7 +607,7 @@ async fn ai_cannot_climb() {
     // exfiltration primitive; a helpful instinct produces a leak).
     assert!(
         write_grant(
-            w.pool(),
+            &*w.conn().await,
             &GrantSpec {
                 reason: "thought this would help".into(),
                 ..direct(&entry, user(carol), Access::Read, &ava_cred)
@@ -623,7 +620,7 @@ async fn ai_cannot_climb() {
 
     // may share within its own principal
     write_grant(
-        w.pool(),
+        &*w.conn().await,
         &direct(&entry, user(alice), Access::Read, &ava_cred),
     )
     .await
@@ -635,7 +632,7 @@ async fn ai_cannot_climb() {
         let acme = w.org("acme-3", alice).await;
         w.member(acme, bob, "member", alice).await;
         write_grant(
-            w.pool(),
+            &*w.conn().await,
             &direct(&entry, user(bob), Access::Read, &ava_cred),
         )
         .await
@@ -648,7 +645,7 @@ async fn ai_cannot_climb() {
         let theirs = Subject::entity(w.entity(s_inst, "entries", "s", user(carol), carol).await);
         assert!(
             write_grant(
-                w.pool(),
+                &*w.conn().await,
                 &direct(&theirs, user(alice), Access::Read, &ava_cred)
             )
             .await
@@ -804,9 +801,7 @@ fn pick<'a, T>(rng: &mut impl Rng, items: &'a [T]) -> &'a T {
 /// Ported from `TestAccessReasonMatchesTheModel`.
 #[tokio::test]
 async fn access_reason_matches_the_model() {
-    let Some(w) = World::new("access_reason_matches_model").await else {
-        return;
-    };
+    let w = World::new("access_reason_matches_model").await;
     let h = [
         w.human("h0").await,
         w.human("h1").await,
@@ -950,7 +945,7 @@ async fn access_reason_matches_the_model() {
     for (row, target, access, source) in directed {
         let expires = (source == GrantSource::Override).then(|| now + chrono::Duration::hours(2));
         write_grant(
-            w.pool(),
+            &*w.conn().await,
             &GrantSpec {
                 subject: row.subj.clone(),
                 target,
@@ -1002,7 +997,7 @@ async fn access_reason_matches_the_model() {
             }
         }
         let Ok(id) = write_grant(
-            w.pool(),
+            &*w.conn().await,
             &GrantSpec {
                 subject: row.subj.clone(),
                 target,
@@ -1023,10 +1018,11 @@ async fn access_reason_matches_the_model() {
         }
         let revoked = rng.random_range(0..4) == 0;
         if revoked {
-            sqlx::query("UPDATE grants SET revoked_at = now(), revoked_by = $2 WHERE id = $1")
+            query("UPDATE grants SET revoked_at = ?3, revoked_by = ?2 WHERE id = ?1")
                 .bind(id)
                 .bind(h[0])
-                .execute(w.pool())
+                .bind(common::now())
+                .execute(&*w.conn().await)
                 .await
                 .expect("revoke");
         }
@@ -1091,9 +1087,7 @@ async fn access_reason_matches_the_model() {
 /// Ported from `TestPredicateInvariantsHoldOverRandomGrants`.
 #[tokio::test]
 async fn predicate_invariants_hold_over_random_grants() {
-    let Some(w) = World::new("predicate_invariants_random").await else {
-        return;
-    };
+    let w = World::new("predicate_invariants_random").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let acme = w.org("acme", alice).await;
@@ -1127,7 +1121,7 @@ async fn predicate_invariants_hold_over_random_grants() {
             expires = Some(now + chrono::Duration::hours(1));
         }
         let _ = write_grant(
-            w.pool(),
+            &*w.conn().await,
             &GrantSpec {
                 subject: subj,
                 target,
@@ -1171,13 +1165,13 @@ async fn predicate_invariants_hold_over_random_grants() {
             }
             // Write never falls out of a read-only grant.
             if access == Access::Write && alice_reason == Some(Reason::Grant) {
-                let writes: i64 = sqlx::query_scalar(
+                let writes: i64 = query(
                     "SELECT count(*) FROM grants
-                      WHERE subject_id = $1 AND access = 'write'
+                      WHERE subject_id = ?1 AND access = 'write'
                         AND revoked_at IS NULL AND source <> 'override'",
                 )
                 .bind(subj.id)
-                .fetch_one(w.pool())
+                .fetch_scalar(&*w.conn().await)
                 .await
                 .unwrap();
                 assert!(
@@ -1198,9 +1192,7 @@ async fn predicate_invariants_hold_over_random_grants() {
 /// resolution actually happens.
 #[tokio::test]
 async fn predicate_resolves_ownership_itself() {
-    let Some(w) = World::new("predicate_resolves_ownership").await else {
-        return;
-    };
+    let w = World::new("predicate_resolves_ownership").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let acme = w.org("acme", alice).await;
@@ -1234,9 +1226,7 @@ async fn predicate_resolves_ownership_itself() {
 /// Ported from `TestVisibleEntityIDsAuditsOverrides`.
 #[tokio::test]
 async fn visible_entity_ids_audits_overrides() {
-    let Some(w) = World::new("visible_entity_ids_audits").await else {
-        return;
-    };
+    let w = World::new("visible_entity_ids_audits").await;
     let alice = w.human("alice").await;
     let acme = w.org("acme", alice).await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
@@ -1244,10 +1234,10 @@ async fn visible_entity_ids_audits_overrides() {
     let entity_id = w.entity(inst, "entries", "o", org(acme), alice).await;
     let row = Subject::entity(entity_id);
 
-    let mut conn = w.conn().await;
+    let conn = w.conn().await;
     let ids = w
         .guard()
-        .visible_entity_ids(&mut conn, &alice_cred, Access::Read, "", 100)
+        .visible_entity_ids(&conn, &alice_cred, Access::Read, "", 100)
         .await
         .expect("list");
     assert!(
@@ -1257,7 +1247,7 @@ async fn visible_entity_ids_audits_overrides() {
     );
 
     enter_break_glass(
-        &mut conn,
+        &conn,
         &row,
         &alice_cred,
         Duration::from_secs(3600),
@@ -1267,7 +1257,7 @@ async fn visible_entity_ids_audits_overrides() {
     .expect("break-glass");
     let ids = w
         .guard()
-        .visible_entity_ids(&mut conn, &alice_cred, Access::Read, "", 100)
+        .visible_entity_ids(&conn, &alice_cred, Access::Read, "", 100)
         .await
         .expect("list after break-glass");
     assert_eq!(ids, vec![entity_id]);
@@ -1276,21 +1266,20 @@ async fn visible_entity_ids_audits_overrides() {
     // THE POINT: the row came back solely because of break-glass, so the set
     // read owes the audit exactly as the point check does.
     let audits: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM grant_override_audit WHERE actor_id = $1")
+        query("SELECT count(*) FROM grant_override_audit WHERE actor_id = ?1")
             .bind(alice)
-            .fetch_one(w.pool())
+            .fetch_scalar(&*w.audit().await)
             .await
             .unwrap();
     assert!(
         audits > 0,
         "a set read returned an override-only row and wrote no audit row"
     );
-    let (owner_kind, owner_id): (String, Uuid) = sqlx::query_as(
-        "SELECT owner_kind, owner_id FROM grant_override_audit ORDER BY id DESC LIMIT 1",
-    )
-    .fetch_one(w.pool())
-    .await
-    .unwrap();
+    let last = query("SELECT owner_kind, owner_id FROM grant_override_audit ORDER BY id DESC LIMIT 1")
+        .fetch_one(&*w.audit().await)
+        .await
+        .unwrap();
+    let (owner_kind, owner_id): (String, Uuid) = (last.get("owner_kind"), last.get("owner_id"));
     assert_eq!(
         (owner_kind.as_str(), owner_id),
         ("org", acme),
@@ -1301,18 +1290,16 @@ async fn visible_entity_ids_audits_overrides() {
 /// Ported from `TestOverrideAuditSurvivesACallerRollback`.
 #[tokio::test]
 async fn override_audit_survives_a_caller_rollback() {
-    let Some(w) = World::new("override_audit_survives_rollback").await else {
-        return;
-    };
+    let w = World::new("override_audit_survives_rollback").await;
     let alice = w.human("alice").await;
     let acme = w.org("acme", alice).await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let inst = w.install("shared", org(acme), alice).await;
     let row = Subject::entity(w.entity(inst, "entries", "o", org(acme), alice).await);
     {
-        let mut conn = w.conn().await;
+        let conn = w.conn().await;
         enter_break_glass(
-            &mut conn,
+            &conn,
             &row,
             &alice_cred,
             Duration::from_secs(3600),
@@ -1322,17 +1309,17 @@ async fn override_audit_survives_a_caller_rollback() {
         .expect("break-glass");
     }
 
-    let mut tx = w.store.begin().await.expect("begin");
+    let tx = w.store.begin().await.expect("begin");
     w.guard()
-        .authorize(&mut tx, &alice_cred, &row, Access::Read, "incident")
+        .authorize(&tx, &alice_cred, &row, Access::Read, "incident")
         .await
         .expect("authorize in tx");
     tx.rollback().await.expect("rollback");
 
     let audits: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM grant_override_audit WHERE actor_id = $1")
+        query("SELECT count(*) FROM grant_override_audit WHERE actor_id = ?1")
             .bind(alice)
-            .fetch_one(w.pool())
+            .fetch_scalar(&*w.audit().await)
             .await
             .unwrap();
     assert_eq!(audits, 1, "audit rows surviving the caller's rollback");
@@ -1342,9 +1329,7 @@ async fn override_audit_survives_a_caller_rollback() {
 /// whole install onto the allowlist path, which can never satisfy 'call'.
 #[tokio::test]
 async fn tool_allowlist() {
-    let Some(w) = World::new("tool_allowlist").await else {
-        return;
-    };
+    let w = World::new("tool_allowlist").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let acme = w.org("acme", alice).await;
@@ -1360,9 +1345,9 @@ async fn tool_allowlist() {
     let call = |c: Credential, tool: &'static str| {
         let w = &w;
         async move {
-            let mut conn = w.conn().await;
+            let conn = w.conn().await;
             w.guard()
-                .tool_reason(&mut conn, &c, inst, tool)
+                .tool_reason(&conn, &c, inst, tool)
                 .await
                 .expect("tool_access_reason")
         }
@@ -1373,7 +1358,7 @@ async fn tool_allowlist() {
 
     // An install grant with no allowlist implies the full tool set.
     write_grant(
-        w.pool(),
+        &*w.conn().await,
         &direct(
             &Subject::install(inst),
             org(acme),
@@ -1395,9 +1380,9 @@ async fn tool_allowlist() {
 
     // THE BUG: break-glass on one tool.
     {
-        let mut conn = w.conn().await;
+        let conn = w.conn().await;
         enter_break_glass(
-            &mut conn,
+            &conn,
             &Subject::tool(inst, "summarize"),
             &alice_cred,
             Duration::from_secs(3600),
@@ -1421,7 +1406,7 @@ async fn tool_allowlist() {
 
     // One tool grant turns the allowlist on, and it means exactly those tools.
     write_grant(
-        w.pool(),
+        &*w.conn().await,
         &direct(
             &Subject::tool(inst, "search"),
             org(acme),
@@ -1444,22 +1429,20 @@ async fn tool_allowlist() {
 /// override" ... found by mutating the model and watching zero divergences.
 #[tokio::test]
 async fn org_members_are_human() {
-    let Some(w) = World::new("org_members_are_human").await else {
-        return;
-    };
+    let w = World::new("org_members_are_human").await;
     let alice = w.human("alice").await;
     let acme = w.org("acme", alice).await;
     let ava = w.ai("ava", "ava", user(alice), alice).await;
 
     let seat = |org_id: Uuid, member: Uuid, role: &'static str, by: Uuid| {
-        let pool = w.pool().clone();
+        let db = w.db().clone();
         async move {
-            sqlx::query("INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1,$2,$3,$4)")
+            query("INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES (?1,?2,?3,?4)")
                 .bind(org_id)
                 .bind(member)
                 .bind(role)
                 .bind(by)
-                .execute(&pool)
+                .execute(&*db.conn().await.unwrap())
                 .await
         }
     };

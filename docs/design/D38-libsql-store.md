@@ -1,4 +1,4 @@
-# D38: the store is SQLite through libSQL, one file per daemon now and one per owner next; the client stays htmx
+# D38: the store is SQLite, one file per daemon now and one per owner next; the client stays htmx
 
 **Decided** 2026-10-02 by Nate: "forget postgres ... the sqlite stuff i want
 to do with libsql", against a design note he brought that day: Turso/libSQL
@@ -34,7 +34,49 @@ before.
 
 ## The decision
 
-### 1. The engine is libSQL, the C fork, through the `libsql` crate
+### 1. The engine is SQLite; the libSQL fork was the first pick and was measured out
+
+The decision as made named the `libsql` crate, Turso's C fork of SQLite,
+and the port was built against it. It is recorded below as it was decided,
+and then what the measurement found, because the reasons are what outlive
+the pick.
+
+**What the port found (2026-10-02, the same day).** With the whole store
+ported and its suites green test by test, the test process died
+intermittently with `STATUS_ACCESS_VIOLATION`. Reduced to a probe with no
+hive code in it: open N connections on one file, run one `SELECT` each,
+close them. With N up to about ten it holds; at N=16 it dies on the first
+round, at N=64 every time, in `sqlite3_close_v2` reading a database handle
+that was already freed (gdb on a GNU build of the same probe, with the
+Windows debug heap off). Rollback-journal mode crashes the same way; the
+threshold is per process, not per file (64 files, one connection each,
+crashes). `libsql` 0.9.30 and 0.10.0-pre.4, MSVC and GNU builds, both.
+The identical pattern against vanilla SQLite (`rusqlite`, bundled 3.50)
+ran 600 connections at a time, twenty rounds, clean.
+
+A daemon with a heap-corruption bug ten connections away is not a daemon,
+so **the engine is vanilla SQLite through `rusqlite`**, bundled. Everything
+below the wrapper changed; nothing above it did, which is what `hive-db`
+is for. What that costs and where it is paid:
+
+- **Vectors are not in the engine.** `F32_BLOB` and `vector_top_k` were
+  libSQL additions. sqlite-vec comes back as the candidate (the note's
+  original pick), registered per connection; its registration is one
+  `unsafe` call to `sqlite3_auto_extension`, in `hive-db` and nowhere
+  else, when vector indexes are built. `IndexMethod::Vector` refuses
+  today for the manifest reason as well, so nothing is lost yet.
+- **Replicas are not in the crate.** Phase 3 chooses between the fork
+  (if fixed; the probe is the acceptance test), Litestream-style WAL
+  shipping, or `sqld`. Nothing in phases 1 and 2 depends on the choice.
+- **The pool is load-bearing either way.** `hive-db` keeps a bounded
+  checkout pool because opening a connection per statement is wasteful on
+  any engine; it was written first as a mitigation for the fork's bug and
+  kept for the reason it should have been written anyway.
+- **Every call blocks the calling thread.** It did under libSQL too: the
+  fork's async API is synchronous underneath for a local file. Nothing
+  changed; it is now visible in the type.
+
+**The decision as made**, kept for the reasons:
 
 Not `rusqlite` with the sqlite-vec extension, and not Turso's pure-Rust
 engine (the `turso` crate, the rewrite the vendor now recommends for new
@@ -60,8 +102,9 @@ projects). The criteria, which outlive the pick:
   (`replication`, `sync`, `encryption`) the daemon can turn on when phase
   3 arrives, without a second driver.
 - **It builds where the gate runs.** Probed on the Windows desktop with
-  MSVC and on Linux CI: vectors, `RETURNING`, JSON and JSONB, `ATTACH`,
-  triggers with `RAISE`, WAL with two connections.
+  MSVC: vectors, `RETURNING`, JSON and JSONB, `ATTACH`, triggers with
+  `RAISE`, WAL with two connections. (Two connections. The probe that
+  found the crash opened sixteen.)
 
 What it costs, accepted: `libsql-ffi` compiles the C amalgamation into the
 binary. D24's rule was "a host with no `unsafe` cannot smuggle a native
@@ -117,6 +160,7 @@ Recorded so nobody rediscovers them:
 | `pg_advisory_lock` | `BEGIN IMMEDIATE` | the write lock is the mutex across processes |
 | monthly partitions | gone; `(created_at, id)` index | the cursor stays a pair, because a replica's clock is not the primary's |
 | `DEFERRABLE INITIALLY DEFERRED` | write order: the reference before the flip to live | SQLite triggers are immediate |
+| the override audit on a second connection | the override audit in a second FILE, `hive-audit.db` | one writer per file: a second connection on the same file waits on the caller's write lock, which is a deadlock when the caller waits on the audit; D18.2 wants the evidence to survive the caller's rollback, and a file of its own is what makes it independent |
 | `CREATE SCHEMA` per install | a table-name prefix, `<schema_name>__<collection>`, in the one file | phase 2 moves these to the owner's file |
 | plpgsql `set_updated_at` per app | a `BEFORE UPDATE` trigger per collection table | |
 
@@ -214,14 +258,15 @@ Until then the only replica is the daemon's own.
   Raft; neither runs libSQL's vectors or its replica protocol. The
   self-hosted replica story is libSQL's own server (`sqld`) and is a
   phase 3 question.
-- *sqlite-vec on the server.* Above.
+- *sqlite-vec on the server.* Above, and back on the table with the engine
+  change in §1.
 
 ## Open
 
 - Phase 2's file layout and the central-events question.
-- Whether `hive-db` keeps a connection pool. Today a connection is opened
-  per operation; it is cheap and it is keyed on nothing, which is the
-  safe default under invariant 14 until a measurement says otherwise.
+- (Closed the same day.) Whether `hive-db` keeps a connection pool: it
+  does, bounded, checkout semantics, a connection mid-transaction closed
+  rather than returned. See §1 for what measured it.
 - The vector index method for app collections (`IndexMethod::Vector`
   still refuses, now for a different reason: the manifest has no way to
   declare a dimension, and `F32_BLOB` needs one).

@@ -45,9 +45,11 @@ pub fn now() -> DateTime<Utc> {
     hive_db::now()
 }
 
+/// `store` is declared before `db` so its clones of the files drop first and
+/// the fixture can delete them.
 pub struct World {
-    db: TestDb,
     pub store: Store,
+    db: TestDb,
     pub root: Uuid,
 }
 
@@ -55,7 +57,7 @@ impl World {
     /// Migrates a private file and bootstraps a root.
     pub async fn new(test: &str) -> World {
         let db = TestDb::new(test).await;
-        let store = Store::from_db(db.db().clone());
+        let store = Store::from_dbs(db.db().clone(), db.audit().clone());
         let res = store
             .bootstrap_in_tx(&BootstrapConfig {
                 root_handle: "root".into(),
@@ -65,8 +67,8 @@ impl World {
             .await
             .expect("bootstrap");
         World {
-            db,
             store,
+            db,
             root: res.root_actor_id,
         }
     }
@@ -74,10 +76,10 @@ impl World {
     /// A migrated file with no root, for the bootstrap tests.
     pub async fn bare(test: &str) -> World {
         let db = TestDb::new(test).await;
-        let store = Store::from_db(db.db().clone());
+        let store = Store::from_dbs(db.db().clone(), db.audit().clone());
         World {
-            db,
             store,
+            db,
             root: Uuid::nil(),
         }
     }
@@ -92,6 +94,11 @@ impl World {
 
     pub async fn conn(&self) -> Conn {
         self.store.conn().await.expect("open connection")
+    }
+
+    /// A connection on the override audit's file.
+    pub async fn audit(&self) -> Conn {
+        self.store.audit().conn().await.expect("open audit connection")
     }
 
     /// A person. Every actor after the root names its creator.

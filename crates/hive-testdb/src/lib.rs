@@ -21,10 +21,13 @@ use hive_db::Db;
 /// Overrides where test files are created. Optional.
 pub const DIR_ENV: &str = "HIVE_SANDBOX_TEST_DB_DIR";
 
-/// One test's private file, migrated.
+/// One test's private files, migrated: the platform file and the override
+/// audit's file beside it, exactly as the daemon lays them out.
 pub struct TestDb {
-    db: Db,
+    db: Option<Db>,
+    audit: Option<Db>,
     path: PathBuf,
+    audit_path: PathBuf,
 }
 
 impl TestDb {
@@ -37,19 +40,37 @@ impl TestDb {
             _ => std::env::temp_dir().join("hive-sandbox-tests"),
         };
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
-        let path = dir.join(format!("{}.db", file_stem(test_name)));
+        let stem = file_stem(test_name);
+        let path = dir.join(format!("{stem}.db"));
+        let audit_path = dir.join(format!("{stem}-audit.db"));
         let db = Db::open(&path)
             .await
             .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
         hive_schema::migrate(&db)
             .await
             .unwrap_or_else(|e| panic!("migrate {}: {e}", path.display()));
-        Self { db, path }
+        let audit = Db::open(&audit_path)
+            .await
+            .unwrap_or_else(|e| panic!("open {}: {e}", audit_path.display()));
+        hive_schema::migrate_audit(&audit)
+            .await
+            .unwrap_or_else(|e| panic!("migrate {}: {e}", audit_path.display()));
+        Self {
+            db: Some(db),
+            audit: Some(audit),
+            path,
+            audit_path,
+        }
     }
 
-    /// The file, for everything that opens connections on it.
+    /// The platform file, for everything that opens connections on it.
     pub fn db(&self) -> &Db {
-        &self.db
+        self.db.as_ref().expect("present until drop")
+    }
+
+    /// The override audit's file.
+    pub fn audit(&self) -> &Db {
+        self.audit.as_ref().expect("present until drop")
     }
 
     /// Where the file is, for a test that wants to open it a second way.
@@ -59,18 +80,23 @@ impl TestDb {
 }
 
 impl Drop for TestDb {
-    /// Deletes the file and its WAL companions. Best effort: a connection the
-    /// test leaked (a store cloned into a task still running) keeps the file
-    /// open on Windows, and the unique name means the leftover collides with
-    /// nothing. It is reported rather than hidden, so a test that leaks shows
-    /// up as a message instead of as a full temp directory.
+    /// Closes the pooled connections first, then deletes the files and their
+    /// WAL companions. Best effort: a connection the test leaked (a store
+    /// cloned into a task still running) keeps the file open on Windows, and
+    /// the unique name means the leftover collides with nothing. It is
+    /// reported rather than hidden, so a test that leaks shows up as a message
+    /// instead of as a full temp directory.
     fn drop(&mut self) {
-        for suffix in ["", "-wal", "-shm"] {
-            let p = PathBuf::from(format!("{}{suffix}", self.path.display()));
-            if p.exists()
-                && let Err(e) = std::fs::remove_file(&p)
-            {
-                eprintln!("testdb: could not delete {}: {e}", p.display());
+        drop(self.db.take());
+        drop(self.audit.take());
+        for base in [&self.path, &self.audit_path] {
+            for suffix in ["", "-wal", "-shm"] {
+                let p = PathBuf::from(format!("{}{suffix}", base.display()));
+                if p.exists()
+                    && let Err(e) = std::fs::remove_file(&p)
+                {
+                    eprintln!("testdb: could not delete {}: {e}", p.display());
+                }
             }
         }
     }

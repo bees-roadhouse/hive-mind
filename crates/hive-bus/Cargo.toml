@@ -13,7 +13,7 @@ workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
-sqlx.workspace = true
+hive-db = { path = "../hive-db" }
 uuid.workspace = true
 chrono.workspace = true
 serde_json.workspace = true

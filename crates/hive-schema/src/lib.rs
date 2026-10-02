@@ -34,8 +34,17 @@ pub const MIGRATIONS: &[Migration] = &[Migration {
     sql: include_str!("../migrations/0001_init.sql"),
 }];
 
-/// The shared directory, for the test that keeps `MIGRATIONS` honest.
+/// The override audit's own file (D38 §3): evidence that must survive any
+/// caller's transaction, which on one file per writer means its own file.
+pub const AUDIT_MIGRATIONS: &[Migration] = &[Migration {
+    version: "0001",
+    name: "override_audit",
+    sql: include_str!("../migrations-audit/0001_override_audit.sql"),
+}];
+
+/// The shared directories, for the tests that keep the lists honest.
 pub const SHARED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
+pub const AUDIT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations-audit");
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrateError {
@@ -67,6 +76,15 @@ pub enum MigrateError {
 /// engine's write lock is the mutex and the loser waits, then finds nothing to
 /// do. (The Postgres port used an advisory lock for the same reason.)
 pub async fn migrate(db: &Db) -> Result<Vec<String>, MigrateError> {
+    apply_all(db, MIGRATIONS).await
+}
+
+/// The audit file's migrations, same machinery.
+pub async fn migrate_audit(db: &Db) -> Result<Vec<String>, MigrateError> {
+    apply_all(db, AUDIT_MIGRATIONS).await
+}
+
+async fn apply_all(db: &Db, list: &[Migration]) -> Result<Vec<String>, MigrateError> {
     let tx = db.begin().await?;
     query(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -87,7 +105,7 @@ pub async fn migrate(db: &Db) -> Result<Vec<String>, MigrateError> {
         .collect();
 
     let mut ran = Vec::new();
-    for m in MIGRATIONS {
+    for m in list {
         let embedded = m.checksum();
         if let Some((_, recorded)) = applied.iter().find(|(v, _)| v == m.version) {
             // Migrations are immutable once applied. A silent edit means two
@@ -112,7 +130,7 @@ pub async fn migrate(db: &Db) -> Result<Vec<String>, MigrateError> {
     // migration file. The schema in front of us is not one this binary knows
     // how to talk to, so say that rather than proceeding hopefully.
     for (version, _) in &applied {
-        if !MIGRATIONS.iter().any(|m| m.version == version) {
+        if !list.iter().any(|m| m.version == version) {
             return Err(MigrateError::Unknown(version.clone()));
         }
     }
@@ -150,25 +168,41 @@ mod tests {
     /// first shape.
     #[test]
     fn embedded_migrations_match_the_shared_directory() {
-        let mut on_disk: Vec<String> = std::fs::read_dir(SHARED_DIR)
-            .expect("shared migrations directory")
-            .map(|e| {
-                e.expect("dir entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .filter(|n| n.ends_with(".sql"))
-            .collect();
-        on_disk.sort();
-        let embedded: Vec<String> = MIGRATIONS
-            .iter()
-            .map(|m| format!("{}_{}.sql", m.version, m.name))
-            .collect();
-        assert_eq!(
-            on_disk, embedded,
-            "crates/hive-schema/migrations and MIGRATIONS disagree"
-        );
+        for (dir, list, what) in [
+            (SHARED_DIR, MIGRATIONS, "MIGRATIONS"),
+            (AUDIT_DIR, AUDIT_MIGRATIONS, "AUDIT_MIGRATIONS"),
+        ] {
+            let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+                .expect("shared migrations directory")
+                .map(|e| {
+                    e.expect("dir entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .filter(|n| n.ends_with(".sql"))
+                .collect();
+            on_disk.sort();
+            let embedded: Vec<String> = list
+                .iter()
+                .map(|m| format!("{}_{}.sql", m.version, m.name))
+                .collect();
+            assert_eq!(on_disk, embedded, "{dir} and {what} disagree");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_audit_file_migrates_on_its_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(dir.path().join("hive-audit.db")).await.expect("open");
+        assert_eq!(migrate_audit(&db).await.expect("migrate"), vec!["0001".to_string()]);
+        assert!(migrate_audit(&db).await.expect("again").is_empty());
+        let c = db.conn().await.unwrap();
+        let n: i64 = query("SELECT count(*) FROM grant_override_audit")
+            .fetch_scalar(&c)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

@@ -75,7 +75,7 @@ pub use guestblobs::GuestBlobs;
 pub use guestevents::{GuestEvents, platform_kind, visible_to};
 pub use hive_db::{Conn, Connection, Db, Transaction};
 pub use hive_identity::{Credential, Owner, PrincipalKind};
-pub use hive_schema::{MIGRATIONS, MigrateError, Migration, migrate};
+pub use hive_schema::{AUDIT_MIGRATIONS, MIGRATIONS, MigrateError, Migration, migrate, migrate_audit};
 pub use installs::{
     CAPABILITY_ACTIVATE, InstallSpec, activate_install, grant_install_authority,
     revoke_install_authority, stage_install,
@@ -182,37 +182,58 @@ impl StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// Holds the database file. Open it once per process.
+/// The platform's file inside a data directory.
+pub const DB_FILE: &str = "hive.db";
+/// The override audit's file beside it (D38 §3).
+pub const AUDIT_FILE: &str = "hive-audit.db";
+
+/// Holds the database files. Open it once per process.
 #[derive(Clone)]
 pub struct Store {
     db: Db,
+    audit: Db,
 }
 
 impl Store {
-    /// Opens the file (creating it) and verifies a connection. It does not
-    /// migrate; call [`migrate`] explicitly so a read-only role can open the
-    /// store.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Store> {
-        let db = Db::open(path).await.map_err(|e| StoreError::db("open", e))?;
-        let c = db.conn().await.map_err(|e| StoreError::db("connect", e))?;
-        hive_db::query("SELECT 1")
-            .execute(&c)
+    /// Opens (creating) the platform file and the audit file in `data_dir`
+    /// and verifies a connection to each. It does not migrate; call
+    /// [`migrate`] and [`migrate_audit`] explicitly so a read-only role can
+    /// open the store.
+    pub async fn open(data_dir: impl AsRef<Path>) -> Result<Store> {
+        let dir = data_dir.as_ref();
+        let db = Db::open(dir.join(DB_FILE))
             .await
-            .map_err(|e| StoreError::db("ping", e))?;
-        Ok(Store::from_db(db))
+            .map_err(|e| StoreError::db("open", e))?;
+        let audit = Db::open(dir.join(AUDIT_FILE))
+            .await
+            .map_err(|e| StoreError::db("open audit", e))?;
+        for d in [&db, &audit] {
+            let c = d.conn().await.map_err(|e| StoreError::db("connect", e))?;
+            hive_db::query("SELECT 1")
+                .execute(&c)
+                .await
+                .map_err(|e| StoreError::db("ping", e))?;
+        }
+        Ok(Store::from_dbs(db, audit))
     }
 
-    /// Wraps a file the caller already opened. The daemon uses `open`; this
+    /// Wraps files the caller already opened. The daemon uses `open`; this
     /// exists for tests and for tooling.
-    pub fn from_db(db: Db) -> Store {
-        Store { db }
+    pub fn from_dbs(db: Db, audit: Db) -> Store {
+        Store { db, audit }
     }
 
-    /// The file, for subsystems that need their own connections and
+    /// The platform file, for subsystems that need their own connections and
     /// transactions. It deliberately exposes no query helper that bypasses
     /// the guard.
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// The override audit's file. Append-only evidence; nothing authorizes
+    /// against it and nothing in the daemon reads it on a request path.
+    pub fn audit(&self) -> &Db {
+        &self.audit
     }
 
     /// The in-process wakeup bell `append_events` rings. The bus listens to
@@ -231,13 +252,12 @@ impl Store {
     }
 
     /// A guard over this store. Reads go through the connection the caller
-    /// hands each method; audit rows land on a connection of their own,
-    /// outside any transaction, because an override audit records that
-    /// something happened and riding the caller's transaction would let a read
-    /// stream rows to a client and then roll the evidence back with everything
-    /// else.
+    /// hands each method; audit rows land in the audit FILE, on a connection
+    /// of their own, because an override audit records that something
+    /// happened and riding the caller's transaction would let a read stream
+    /// rows to a client and then roll the evidence back with everything else.
     pub fn guard(&self) -> Guard {
-        Guard::new(self.db.clone())
+        Guard::new(self.audit.clone())
     }
 
     /// One connection, for the multi-statement reads the guard needs outside

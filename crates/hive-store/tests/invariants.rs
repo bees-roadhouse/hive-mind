@@ -958,7 +958,7 @@ async fn the_point_check_will_not_decide_a_collection_blind() {
     let w = World::new("the_point_check_will_not_decide_a_collection_blind").await;
     let alice = w.human("alice").await;
     let journal = w.install("journal", "user", alice, alice).await;
-    let store = hive_store::Store::from_db(w.db.db().clone());
+    let store = hive_store::Store::from_dbs(w.db.db().clone(), w.db.audit().clone());
     let c = hive_store::Credential::new(alice, hive_store::PrincipalKind::User, alice);
     let subj = hive_store::Subject::collection(journal, "contacts");
     let conn = w.conn().await;

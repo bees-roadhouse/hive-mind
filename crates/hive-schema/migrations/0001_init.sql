@@ -1080,24 +1080,10 @@ END;
 
 -- D18.2: every access that succeeded ONLY because of an override is audited.
 -- The predicate returns 'override' exactly in that case, which is what makes
--- "only because" mechanically decidable rather than a judgement call.
-CREATE TABLE grant_override_audit (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    grant_id       TEXT REFERENCES grants (id) ON DELETE SET NULL,
-    actor_id       TEXT NOT NULL REFERENCES actors (id),
-    principal_kind TEXT NOT NULL CHECK (principal_kind IN ('user', 'org')),
-    principal_id   TEXT NOT NULL REFERENCES actors (id),
-    subject_kind   TEXT NOT NULL,
-    subject_id     TEXT NOT NULL,
-    subject_name   TEXT,
-    owner_kind     TEXT NOT NULL CHECK (owner_kind IN ('user', 'org')),
-    owner_id       TEXT NOT NULL REFERENCES actors (id),
-    access         TEXT NOT NULL,
-    reason         TEXT NOT NULL DEFAULT '',
-    occurred_at    INTEGER NOT NULL DEFAULT (CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER))
-);
-
-CREATE INDEX grant_override_audit_actor_idx ON grant_override_audit (actor_id, occurred_at DESC);
+-- "only because" mechanically decidable rather than a judgement call. The
+-- audit table is NOT in this file: it lives in the audit file
+-- (migrations-audit/), because its rows must survive any caller's
+-- transaction and on one file per writer that means its own file (D38 §3).
 
 -- ---------------------------------------------------------------------------
 -- Events: append-only, the transport of record (D4.5).

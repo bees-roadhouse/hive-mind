@@ -20,9 +20,8 @@ services:
     env_file:
       - ./garage/garage.env
     ports:
-      # Loopback only, and off the default 3900 for the same reason Postgres
-      # sits on 55432: a dev fixture must not collide with, or shadow, anything
-      # real on this machine.
+      # Loopback only, and off the default 3900: a dev fixture must not
+      # collide with, or shadow, anything real on this machine.
       - "127.0.0.1:53900:3900"
     volumes:
       # :z relabels for SELinux, as the stack compose does; without it rootless

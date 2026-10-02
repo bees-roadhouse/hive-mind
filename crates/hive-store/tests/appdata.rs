@@ -9,6 +9,7 @@ use common::{World, cred, user};
 use hive_blob::{
     Catalog, CreateUpload, Descriptor, DiskDriver, Driver, Hash, Provenance, RefSpec, SourceKind,
 };
+use hive_db::query;
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_manifest::{Collection, Kind, Manifest, Storage};
 use hive_store::{
@@ -34,8 +35,8 @@ impl AppFixture {
     /// Registers a build declaring one collection, stages and activates an
     /// install, and provisions the per-app schema through the real plan so
     /// this fixture cannot drift from what the registry creates.
-    async fn install(test: &str, slug: &str, collection: &str) -> Option<(AppFixture, Uuid)> {
-        let w = World::new(test).await?;
+    async fn install(test: &str, slug: &str, collection: &str) -> (AppFixture, Uuid) {
+        let w = World::new(test).await;
         let alice = w.human("alice").await;
         let owner = user(alice);
         let m = Manifest {
@@ -60,10 +61,10 @@ impl AppFixture {
             .schema_plan(owner.kind.as_str(), &owner.id.to_string())
             .expect("schema plan");
         let raw = serde_json::to_value(&m).unwrap();
-        let build_id: Uuid = sqlx::query_scalar(
+        let build_id: Uuid = query(
             "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
                                      author_actor, owner_kind, owner_id, visibility, trust, status)
-             VALUES ($1, 'app', 'host', $2, $3, $4, $5, $6, 'private', 'builtin', 'registered')
+             VALUES (?1, 'app', 'host', ?2, ?3, ?4, ?5, ?6, 'private', 'builtin', 'registered')
              RETURNING id",
         )
         .bind(slug)
@@ -72,13 +73,13 @@ impl AppFixture {
         .bind(alice)
         .bind(owner.kind.as_str())
         .bind(owner.id)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .expect("register build");
         let by = cred(alice, PrincipalKind::User, alice);
-        let mut conn = w.conn().await;
+        let conn = w.conn().await;
         let install = stage_install(
-            &mut conn,
+            &conn,
             &InstallSpec {
                 build_id,
                 slug: slug.into(),
@@ -88,11 +89,11 @@ impl AppFixture {
         )
         .await
         .expect("stage install");
-        activate_install(&mut conn, install, &by)
+        activate_install(&conn, install, &by)
             .await
             .expect("activate install");
-        let mut tx = w.store.begin().await.unwrap();
-        hive_store::apply_schema_plan(&mut tx, &plan)
+        let tx = w.store.begin().await.unwrap();
+        hive_store::apply_schema_plan(&tx, &plan)
             .await
             .expect("apply schema plan");
         tx.commit().await.unwrap();
@@ -101,11 +102,11 @@ impl AppFixture {
         let dir = tempfile::tempdir().unwrap();
         let driver = DiskDriver::new(dir.path()).await.expect("blob driver");
         let catalog = Arc::new(Catalog::new(
-            w.pool().clone(),
+            w.db().clone(),
             Box::new(DiskDriver::new(dir.path()).await.unwrap()),
         ));
         let data = AppData::new(w.store.clone(), catalog.clone());
-        Some((
+        (
             AppFixture {
                 w,
                 data,
@@ -117,17 +118,14 @@ impl AppFixture {
                 _dir: dir,
             },
             alice,
-        ))
+        )
     }
 
-    /// The app schema lives outside the test's private schema, so it is
-    /// dropped by hand at the end of each test. `Drop` below covers the test
-    /// that never gets here.
+    /// Drops the collection tables. The file goes with the test either way;
+    /// this keeps the uninstall path exercised on the ordinary path.
     async fn cleanup(&self) {
-        let mut tx = self.w.store.begin().await.unwrap();
-        hive_store::drop_schema_plan(&mut tx, &self.plan)
-            .await
-            .unwrap();
+        let tx = self.w.store.begin().await.unwrap();
+        hive_store::drop_schema_plan(&tx, &self.plan).await.unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -143,11 +141,11 @@ impl AppFixture {
             .expect("create upload");
         up.write(content).await.expect("write upload");
         let sealed = up.seal().await.expect("seal");
-        let mut tx = self.w.store.begin().await.unwrap();
+        let tx = self.w.store.begin().await.unwrap();
         let (desc, _) = self
             .blobs
             .publish(
-                &mut tx,
+                &tx,
                 sealed,
                 "text/plain",
                 &Provenance::capture(),
@@ -165,23 +163,23 @@ impl AppFixture {
     }
 
     async fn live_refs(&self, doc_id: Uuid) -> i64 {
-        sqlx::query_scalar(
-            "SELECT count(*) FROM blob_refs WHERE source_kind = 'collection' AND source_id = $1 AND released_at IS NULL",
+        query(
+            "SELECT count(*) FROM blob_refs WHERE source_kind = 'collection' AND source_id = ?1 AND released_at IS NULL",
         )
         .bind(doc_id.to_string())
-        .fetch_one(self.w.pool())
+        .fetch_scalar(&*self.w.conn().await)
         .await
         .unwrap()
     }
 
     async fn holds_ref(&self, doc_id: Uuid, h: Hash) -> bool {
-        let n: i64 = sqlx::query_scalar(
+        let n: i64 = query(
             "SELECT count(*) FROM blob_refs
-              WHERE sha256 = $1 AND source_kind = 'collection' AND source_id = $2 AND released_at IS NULL",
+              WHERE sha256 = ?1 AND source_kind = 'collection' AND source_id = ?2 AND released_at IS NULL",
         )
         .bind(h.to_string())
         .bind(doc_id.to_string())
-        .fetch_one(self.w.pool())
+        .fetch_scalar(&*self.w.conn().await)
         .await
         .unwrap();
         n > 0
@@ -236,10 +234,10 @@ impl AppFixture {
             .schema_plan(owner.kind.as_str(), &owner.id.to_string())
             .expect("schema plan");
         let raw = serde_json::to_value(&m).unwrap();
-        let build_id: Uuid = sqlx::query_scalar(
+        let build_id: Uuid = query(
             "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
                                      author_actor, owner_kind, owner_id, visibility, trust, status)
-             VALUES ($1, 'app', 'host', $2, $3, $4, $5, $6, 'private', 'builtin', 'registered')
+             VALUES (?1, 'app', 'host', ?2, ?3, ?4, ?5, ?6, 'private', 'builtin', 'registered')
              RETURNING id",
         )
         .bind(slug)
@@ -248,13 +246,13 @@ impl AppFixture {
         .bind(actor)
         .bind(owner.kind.as_str())
         .bind(owner.id)
-        .fetch_one(self.w.pool())
+        .fetch_scalar(&*self.w.conn().await)
         .await
         .expect("register build");
         let by = cred(actor, owner.kind, owner.id);
-        let mut conn = self.w.conn().await;
+        let conn = self.w.conn().await;
         let install = stage_install(
-            &mut conn,
+            &conn,
             &InstallSpec {
                 build_id,
                 slug: slug.into(),
@@ -264,12 +262,12 @@ impl AppFixture {
         )
         .await
         .expect("stage install");
-        activate_install(&mut conn, install, &by)
+        activate_install(&conn, install, &by)
             .await
             .expect("activate install");
         drop(conn);
-        let mut tx = self.w.store.begin().await.unwrap();
-        hive_store::apply_schema_plan(&mut tx, &plan)
+        let tx = self.w.store.begin().await.unwrap();
+        hive_store::apply_schema_plan(&tx, &plan)
             .await
             .expect("apply schema plan");
         tx.commit().await.unwrap();
@@ -277,17 +275,17 @@ impl AppFixture {
     }
 
     async fn drop_plan(&self, plan: &hive_manifest::SchemaPlan) {
-        let mut tx = self.w.store.begin().await.unwrap();
-        hive_store::drop_schema_plan(&mut tx, plan).await.unwrap();
+        let tx = self.w.store.begin().await.unwrap();
+        hive_store::drop_schema_plan(&tx, plan).await.unwrap();
         tx.commit().await.unwrap();
     }
 
     /// Which install a document's entity row belongs to. The point of several
     /// tests below is WHERE a write landed, not whether it succeeded.
     async fn install_of(&self, doc: Uuid) -> Uuid {
-        sqlx::query_scalar("SELECT install_id FROM entities WHERE id = $1")
+        query("SELECT install_id FROM entities WHERE id = ?1")
             .bind(doc)
-            .fetch_one(self.w.pool())
+            .fetch_scalar(&*self.w.conn().await)
             .await
             .unwrap()
     }
@@ -333,56 +331,21 @@ impl AppFixture {
     /// Rewrites a document's stored body WITHOUT touching its references, so a
     /// test can prove which of the two an implementation reads.
     async fn diverge(&self, id: Uuid, body: &str) {
-        let schema: String = sqlx::query_scalar("SELECT schema_name FROM installs WHERE id = $1")
+        let schema: String = query("SELECT schema_name FROM installs WHERE id = ?1")
             .bind(self.install)
-            .fetch_one(self.w.pool())
+            .fetch_scalar(&*self.w.conn().await)
             .await
             .unwrap();
-        let res = sqlx::query(&format!(
-            "UPDATE \"{schema}\".\"{}\" SET doc = $2::jsonb WHERE id = $1",
+        let rows = query(&format!(
+            "UPDATE \"{schema}__{}\" SET doc = ?2 WHERE id = ?1",
             self.collection
         ))
         .bind(id)
         .bind(body)
-        .execute(self.w.pool())
+        .execute(&*self.w.conn().await)
         .await
         .expect("diverge document");
-        assert_eq!(
-            res.rows_affected(),
-            1,
-            "diverge is not rewriting what it thinks it is"
-        );
-    }
-}
-
-impl Drop for AppFixture {
-    /// A failing test still drops its app schema, from a fresh connection on
-    /// its own thread, the way the test schema itself is dropped. IF EXISTS,
-    /// because the ordinary path has usually already removed it.
-    fn drop(&mut self) {
-        let Ok(url) = std::env::var(hive_testdb::URL_ENV) else {
-            return;
-        };
-        let schema = self.plan.schema.clone();
-        let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                use sqlx::Connection;
-                if let Ok(mut conn) = sqlx::PgConnection::connect(&url).await {
-                    let _ = sqlx::query("SET lock_timeout = '15s'")
-                        .execute(&mut conn)
-                        .await;
-                    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
-                        .execute(&mut conn)
-                        .await;
-                    let _ = conn.close().await;
-                }
-            });
-        });
-        let _ = handle.join();
+        assert_eq!(rows, 1, "diverge is not rewriting what it thinks it is");
     }
 }
 
@@ -396,10 +359,7 @@ fn status_of(e: &hive_wasmhost::HostError) -> Status {
 /// invariant 9 wrong after every other one got it right.
 #[tokio::test]
 async fn write_inherits_invocation_taint() {
-    let Some((f, alice)) = AppFixture::install("write_inherits_taint", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("write_inherits_taint", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let clean = f
         .insert(
@@ -435,10 +395,7 @@ async fn write_inherits_invocation_taint() {
 /// Ported from `TestUpdateNeverLaundersTrust`.
 #[tokio::test]
 async fn update_never_launders_trust() {
-    let Some((f, alice)) = AppFixture::install("update_never_launders", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("update_never_launders", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let id = f
         .insert(
@@ -487,11 +444,7 @@ async fn update_never_launders_trust() {
 /// Ported from `TestQueryTrustIsTheWeakestRow`.
 #[tokio::test]
 async fn query_trust_is_the_weakest_row() {
-    let Some((f, alice)) =
-        AppFixture::install("query_trust_weakest_row", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("query_trust_weakest_row", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     f.insert(&alice_cred, Level::Trusted, serde_json::json!({"n": 1}))
         .await;
@@ -529,11 +482,8 @@ async fn query_trust_is_the_weakest_row() {
 /// Ported from `TestStorageDeniesWithoutAGrant`.
 #[tokio::test]
 async fn storage_denies_without_a_grant() {
-    let Some((f, alice)) =
-        AppFixture::install("storage_denies_without_grant", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) =
+        AppFixture::install("storage_denies_without_grant", "journal", "entries").await;
     let bob = f.w.human("bob").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let bob_cred = cred(bob, PrincipalKind::User, bob);
@@ -618,11 +568,7 @@ async fn storage_denies_without_a_grant() {
 /// Ported from `TestGranteeCanReadButNotDelete` (D13.10).
 #[tokio::test]
 async fn grantee_can_read_but_not_delete() {
-    let Some((f, alice)) =
-        AppFixture::install("grantee_reads_not_deletes", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("grantee_reads_not_deletes", "journal", "entries").await;
     let bob = f.w.human("bob").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let bob_cred = cred(bob, PrincipalKind::User, bob);
@@ -634,7 +580,7 @@ async fn grantee_can_read_but_not_delete() {
         )
         .await;
     write_grant(
-        f.w.pool(),
+        &*f.w.conn().await,
         &GrantSpec::direct(Subject::entity(id), user(bob), Access::Write, alice_cred),
     )
     .await
@@ -676,11 +622,7 @@ async fn grantee_can_read_but_not_delete() {
 /// Ported from `TestStorageRefusesAnInactiveInstall` (D19.4 at the last step).
 #[tokio::test]
 async fn storage_refuses_an_inactive_install() {
-    let Some((f, alice)) =
-        AppFixture::install("storage_refuses_inactive", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("storage_refuses_inactive", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     f.insert(
         &alice_cred,
@@ -688,9 +630,9 @@ async fn storage_refuses_an_inactive_install() {
         serde_json::json!({"title": "written while active"}),
     )
     .await;
-    sqlx::query("UPDATE installs SET state = 'disabled', activated_by_actor = NULL WHERE id = $1")
+    query("UPDATE installs SET state = 'disabled', activated_by_actor = NULL WHERE id = ?1")
         .bind(f.install)
-        .execute(f.w.pool())
+        .execute(&*f.w.conn().await)
         .await
         .unwrap();
     let c = f.collection.clone();
@@ -724,11 +666,8 @@ async fn storage_refuses_an_inactive_install() {
 /// Ported from `TestUndeclaredCollectionIsRefused`.
 #[tokio::test]
 async fn undeclared_collection_is_refused() {
-    let Some((f, alice)) =
-        AppFixture::install("undeclared_collection_refused", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) =
+        AppFixture::install("undeclared_collection_refused", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     for name in ["secrets", "entries; drop table entities", "Entries", ""] {
         let err = f
@@ -752,10 +691,7 @@ async fn undeclared_collection_is_refused() {
 /// Ported from `TestWriteEmitsAnEventInTheSameTransaction` (D13.2).
 #[tokio::test]
 async fn write_emits_an_event_in_the_same_transaction() {
-    let Some((f, alice)) = AppFixture::install("write_emits_event", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("write_emits_event", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let id = f
         .insert(
@@ -764,22 +700,22 @@ async fn write_emits_an_event_in_the_same_transaction() {
             serde_json::json!({"title": "from the web"}),
         )
         .await;
-    let (kind, level): (String, String) =
-        sqlx::query_as("SELECT kind, trust FROM events WHERE subject_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1")
-            .bind(id)
-            .fetch_one(f.w.pool())
-            .await
-            .expect("read event");
+    let row = query("SELECT kind, trust FROM events WHERE subject_id = ?1 ORDER BY created_at DESC, id DESC LIMIT 1")
+        .bind(id)
+        .fetch_one(&*f.w.conn().await)
+        .await
+        .expect("read event");
+    let (kind, level): (String, String) = (row.get("kind"), row.get("trust"));
     assert_eq!(kind, "journal.entries.created");
     assert_eq!(level, "untrusted", "the event carries the write's trust");
 
     // Filtered by the same predicate the document is: bob sees neither.
     let bob = f.w.human("bob").await;
-    let mut conn = f.w.conn().await;
+    let conn = f.w.conn().await;
     let seen =
         f.w.guard()
             .replay(
-                &mut conn,
+                &conn,
                 &cred(bob, PrincipalKind::User, bob),
                 hive_store::Cursor::default(),
                 hive_store::Cursor::default().at_or_epoch(),
@@ -801,10 +737,7 @@ async fn write_emits_an_event_in_the_same_transaction() {
 /// Ported from `TestInsertHoldsDownTheBlobsItsDocumentNames`.
 #[tokio::test]
 async fn insert_holds_down_the_blobs_its_document_names() {
-    let Some((f, alice)) = AppFixture::install("insert_holds_blobs", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("insert_holds_blobs", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let photo = f.hold(&alice_cred, b"a photograph").await;
     let scan = f.hold(&alice_cred, b"a scanned receipt").await;
@@ -837,11 +770,8 @@ async fn insert_holds_down_the_blobs_its_document_names() {
 /// load-bearing rule of this whole path (invariant 3, fifth instance).
 #[tokio::test]
 async fn a_document_cannot_name_a_blob_its_principal_does_not_hold() {
-    let Some((f, alice)) =
-        AppFixture::install("document_cannot_name_unheld_blob", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) =
+        AppFixture::install("document_cannot_name_unheld_blob", "journal", "entries").await;
     let bob = f.w.human("bob").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let bob_cred = cred(bob, PrincipalKind::User, bob);
@@ -883,9 +813,9 @@ async fn a_document_cannot_name_a_blob_its_principal_does_not_hold() {
     );
 
     // Nothing was written: a refused descriptor fails the whole transaction.
-    let docs: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE install_id = $1")
+    let docs: i64 = query("SELECT count(*) FROM entities WHERE install_id = ?1")
         .bind(f.install)
-        .fetch_one(f.w.pool())
+        .fetch_scalar(&*f.w.conn().await)
         .await
         .unwrap();
     assert_eq!(
@@ -898,11 +828,8 @@ async fn a_document_cannot_name_a_blob_its_principal_does_not_hold() {
 /// Ported from `TestUpdateTakesTheHeldSetFromTheCatalogNotTheOldDocument`.
 #[tokio::test]
 async fn update_takes_the_held_set_from_the_catalog_not_the_old_document() {
-    let Some((f, alice)) =
-        AppFixture::install("update_held_set_from_catalog", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) =
+        AppFixture::install("update_held_set_from_catalog", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let original = f.hold(&alice_cred, b"the first attachment").await;
     let id = f
@@ -942,11 +869,7 @@ async fn update_takes_the_held_set_from_the_catalog_not_the_old_document() {
 /// Ported from `TestUpdateKeepsAReferenceItStillNames`.
 #[tokio::test]
 async fn update_keeps_a_reference_it_still_names() {
-    let Some((f, alice)) =
-        AppFixture::install("update_keeps_reference", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("update_keeps_reference", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let kept = f.hold(&alice_cred, b"an attachment that stays").await;
     let id = f
@@ -957,16 +880,17 @@ async fn update_keeps_a_reference_it_still_names() {
         )
         .await;
     let ref_id = |f: &AppFixture| {
-        let pool = f.w.pool().clone();
+        let db = f.w.db().clone();
         let h = kept.hash.to_string();
         let src = id.to_string();
         async move {
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM blob_refs WHERE sha256 = $1 AND source_kind = 'collection' AND source_id = $2 AND released_at IS NULL",
+            let c = db.conn().await.unwrap();
+            query(
+                "SELECT id FROM blob_refs WHERE sha256 = ?1 AND source_kind = 'collection' AND source_id = ?2 AND released_at IS NULL",
             )
             .bind(h)
             .bind(src)
-            .fetch_one(&pool)
+            .fetch_scalar::<Uuid>(&c)
             .await
             .unwrap()
         }
@@ -993,11 +917,7 @@ async fn update_keeps_a_reference_it_still_names() {
 /// re-reading the body that is going away.
 #[tokio::test]
 async fn delete_releases_everything_the_document_held() {
-    let Some((f, alice)) =
-        AppFixture::install("delete_releases_everything", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("delete_releases_everything", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let one = f.hold(&alice_cred, b"first").await;
     let two = f.hold(&alice_cred, b"second").await;
@@ -1025,11 +945,8 @@ async fn delete_releases_everything_the_document_held() {
 /// Ported from `TestADocumentWithNoDescriptorsHoldsNothing`.
 #[tokio::test]
 async fn a_document_with_no_descriptors_holds_nothing() {
-    let Some((f, alice)) =
-        AppFixture::install("no_descriptors_holds_nothing", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) =
+        AppFixture::install("no_descriptors_holds_nothing", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     // A 64-hex string NOT under the reserved key is not a descriptor.
     let id = f
@@ -1054,11 +971,8 @@ async fn a_document_with_no_descriptors_holds_nothing() {
 /// Ported from `TestALinkedReferenceInheritsTheWritesTaint` (invariants 3, 12).
 #[tokio::test]
 async fn a_linked_reference_inherits_the_writes_taint() {
-    let Some((f, alice)) =
-        AppFixture::install("linked_reference_inherits_taint", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) =
+        AppFixture::install("linked_reference_inherits_taint", "journal", "entries").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     // Held trusted: if the link echoed the existing hold rather than taking
     // the weaker of the two, this would measure nothing.
@@ -1070,12 +984,12 @@ async fn a_linked_reference_inherits_the_writes_taint() {
             serde_json::json!({"file": quoted}),
         )
         .await;
-    let level: String = sqlx::query_scalar(
-        "SELECT trust FROM blob_refs WHERE sha256 = $1 AND source_kind = 'collection' AND source_id = $2 AND released_at IS NULL",
+    let level: String = query(
+        "SELECT trust FROM blob_refs WHERE sha256 = ?1 AND source_kind = 'collection' AND source_id = ?2 AND released_at IS NULL",
     )
     .bind(quoted.hash.to_string())
     .bind(id.to_string())
-    .fetch_one(f.w.pool())
+    .fetch_scalar(&*f.w.conn().await)
     .await
     .unwrap();
     assert_eq!(
@@ -1098,10 +1012,7 @@ fn _owner(o: Owner) -> Owner {
 /// place either way.
 #[tokio::test]
 async fn a_qualified_name_for_your_own_app_is_the_bare_name() {
-    let Some((f, alice)) = AppFixture::install("qualified_own_app", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("qualified_own_app", "journal", "entries").await;
     let c = cred(alice, PrincipalKind::User, alice);
 
     let bare = f
@@ -1131,10 +1042,7 @@ async fn a_qualified_name_for_your_own_app_is_the_bare_name() {
 /// branch used to wave through (D33).
 #[tokio::test]
 async fn an_app_cannot_reach_another_apps_collection_without_a_grant() {
-    let Some((f, alice)) = AppFixture::install("qualified_no_grant", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("qualified_no_grant", "journal", "entries").await;
     let c = cred(alice, PrincipalKind::User, alice);
     let (mail, mail_plan) = f.second_app("mail", "messages", alice, user(alice)).await;
 
@@ -1163,24 +1071,21 @@ async fn an_app_cannot_reach_another_apps_collection_without_a_grant() {
 /// feature unbuildable.
 #[tokio::test]
 async fn an_install_grant_opens_another_apps_collection() {
-    let Some((f, alice)) = AppFixture::install("qualified_with_grant", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("qualified_with_grant", "journal", "entries").await;
     let c = cred(alice, PrincipalKind::User, alice);
     let (mail, mail_plan) = f.second_app("mail", "messages", alice, user(alice)).await;
 
-    let mut conn = f.w.conn().await;
-    sqlx::query(
+    let conn = f.w.conn().await;
+    query(
         "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind,
                              target_install_id, access, source, granted_by_actor,
                              granted_by_principal_kind, granted_by_principal_id)
-         VALUES ('collection', $1, 'entries', 'install', $2, 'write', 'direct', $3, 'user', $3)",
+         VALUES ('collection', ?1, 'entries', 'install', ?2, 'write', 'direct', ?3, 'user', ?3)",
     )
     .bind(f.install)
     .bind(mail)
     .bind(alice)
-    .execute(&mut *conn)
+    .execute(&conn)
     .await
     .expect("write the install grant");
     drop(conn);
@@ -1219,11 +1124,7 @@ async fn an_install_grant_opens_another_apps_collection() {
 /// resolved against the credential's owner rather than the slug.
 #[tokio::test]
 async fn the_qualifier_names_an_app_not_an_owner() {
-    let Some((f, _alice)) =
-        AppFixture::install("qualifier_is_per_owner", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, _alice) = AppFixture::install("qualifier_is_per_owner", "journal", "entries").await;
     let bob = f.w.human("bob").await;
     let bob_c = cred(bob, PrincipalKind::User, bob);
 
@@ -1233,17 +1134,17 @@ async fn the_qualifier_names_an_app_not_an_owner() {
     let (bobs_mail, bob_mail_plan) = f.second_app("mail", "messages", bob, user(bob)).await;
     assert_ne!(bobs_journal, f.install, "the fixture needs two journals");
 
-    let mut conn = f.w.conn().await;
-    sqlx::query(
+    let conn = f.w.conn().await;
+    query(
         "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind,
                              target_install_id, access, source, granted_by_actor,
                              granted_by_principal_kind, granted_by_principal_id)
-         VALUES ('collection', $1, 'entries', 'install', $2, 'write', 'direct', $3, 'user', $3)",
+         VALUES ('collection', ?1, 'entries', 'install', ?2, 'write', 'direct', ?3, 'user', ?3)",
     )
     .bind(bobs_journal)
     .bind(bobs_mail)
     .bind(bob)
-    .execute(&mut *conn)
+    .execute(&conn)
     .await
     .expect("grant bob's mail access to bob's journal");
     drop(conn);
@@ -1268,9 +1169,9 @@ async fn the_qualifier_names_an_app_not_an_owner() {
     );
 
     // And alice's journal never saw it.
-    let in_alices: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE install_id = $1")
+    let in_alices: i64 = query("SELECT count(*) FROM entities WHERE install_id = ?1")
         .bind(f.install)
-        .fetch_one(f.w.pool())
+        .fetch_scalar(&*f.w.conn().await)
         .await
         .unwrap();
     assert_eq!(in_alices, 0, "bob's write reached alice's journal");
@@ -1285,10 +1186,7 @@ async fn the_qualifier_names_an_app_not_an_owner() {
 /// side and a second separator all have to be answers rather than surprises.
 #[tokio::test]
 async fn a_malformed_qualified_name_is_refused() {
-    let Some((f, alice)) = AppFixture::install("qualified_syntax", "journal", "entries").await
-    else {
-        return;
-    };
+    let (f, alice) = AppFixture::install("qualified_syntax", "journal", "entries").await;
     let c = cred(alice, PrincipalKind::User, alice);
     for name in [
         "a/b/c",

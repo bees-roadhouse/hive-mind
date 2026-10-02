@@ -27,7 +27,7 @@ hive-harness = { path = "../hive-harness" }
 
 [dev-dependencies]
 hive-testdb = { path = "../hive-testdb" }
-sqlx.workspace = true
+hive-db = { path = "../hive-db" }
 tempfile.workspace = true
 
 [[test]]

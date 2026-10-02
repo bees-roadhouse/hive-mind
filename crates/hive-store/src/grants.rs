@@ -4,10 +4,11 @@ use std::fmt;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use hive_db::{Connection, Db, Transaction, query};
 use hive_identity::{Credential, Owner, PrincipalKind};
-use sqlx::{Executor, PgConnection, PgPool, Postgres, Row};
 use uuid::Uuid;
 
+use crate::predicate::{self, Args};
 use crate::{Result, StoreError};
 
 /// What a grant is written against (D18.1). Allowlist only ... there is no deny
@@ -20,7 +21,7 @@ pub enum SubjectKind {
     Route,
     Collection,
     Entity,
-    /// A whole chat thread. It resolves through `subject_owner` like every
+    /// A whole chat thread. It resolves through `subject_owners` like every
     /// other kind, so nothing above the data layer learns a new shape.
     Conversation,
 }
@@ -137,7 +138,7 @@ impl Reason {
             // A reason the predicate returns and this enum does not know is a
             // deny here, which is fail-closed but silent: an allowed access
             // would be reported as denied and look like a policy bug. The
-            // migration and this match are edited together.
+            // predicate text and this match are edited together.
             _ => return None,
         })
     }
@@ -204,7 +205,7 @@ impl Subject {
 /// Which install a call is being made THROUGH, when it is being made through
 /// one at all (D33).
 ///
-/// This is the dimension `access_decision` was missing: a `collection` subject
+/// This is the dimension the predicate was missing: a `collection` subject
 /// resolves its owner to the INSTALL's owner, so without this the predicate
 /// cannot tell one of a principal's apps from another and every collection
 /// grant it derives decides nothing (invariant 14).
@@ -231,9 +232,26 @@ impl Subject {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ActingInstall(pub Uuid);
 
+/// The point check's text, with every argument a placeholder: subject kind,
+/// id, name, principal kind, id, actor, access, now, acting install.
+pub(crate) fn point_sql() -> String {
+    predicate::decision(&Args {
+        subject_kind: "?1",
+        subject_id: "?2",
+        subject_name: "?3",
+        principal_kind: "?4",
+        principal_id: "?5",
+        actor_id: "?6",
+        access: "?7",
+        now: "?8",
+        acting_install: "?9",
+    })
+}
+
 /// Answers "may this actor do this" and is the only thing in the platform
-/// allowed to. It holds no policy of its own: every decision comes from
-/// `access_decision()`, the SQL function migration one installs.
+/// allowed to. It holds no policy of its own: every decision comes from the
+/// predicate text in `predicate.rs`, which is the SQL function migration one
+/// used to install.
 ///
 /// Two properties are structural rather than conventional, because both were
 /// lost once when they were conventions:
@@ -248,43 +266,43 @@ pub struct ActingInstall(pub Uuid);
 ///   it loses: the set-read form skipped the audit entirely.
 ///
 /// Reads go through the connection each method is handed, so a caller inside a
-/// transaction sees its own writes. Audit rows land on the pool, outside any
-/// transaction, on purpose.
+/// transaction sees its own writes. Audit rows land in the audit file, on a
+/// connection of its own, on purpose: with one writer per file a second
+/// connection on the SAME file would wait on the caller's write lock, so the
+/// evidence has a file to itself (D38 §3).
 #[derive(Clone)]
 pub struct Guard {
-    audit: PgPool,
+    audit: Db,
 }
 
 impl Guard {
-    pub(crate) fn new(audit: PgPool) -> Guard {
+    pub(crate) fn new(audit: Db) -> Guard {
         Guard { audit }
     }
 
     /// The single call every method here funnels through. Nothing outside this
-    /// module may reference `access_decision`, `access_reason` or the grants
-    /// table.
+    /// module and `events.rs` may reference the predicate or the grants table.
     pub(crate) async fn decision(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         subj: &Subject,
         access: Access,
         acting: Option<ActingInstall>,
     ) -> Result<(Option<Reason>, Option<Uuid>)> {
-        let row = sqlx::query(
-            "SELECT reason, grant_id FROM access_decision($1, $2, $3, $4, $5, $6, $7, now(), $8)",
-        )
-        .bind(subj.kind.as_str())
-        .bind(subj.id)
-        .bind(subj.name())
-        .bind(cred.principal_kind.as_str())
-        .bind(cred.principal_id)
-        .bind(cred.actor_id)
-        .bind(access.as_str())
-        .bind(acting.map(|a| a.0))
-        .fetch_one(&mut *db)
-        .await
-        .map_err(|e| StoreError::db("access_decision", e))?;
+        let row = query(&point_sql())
+            .bind(subj.kind.as_str())
+            .bind(subj.id)
+            .bind(subj.name())
+            .bind(cred.principal_kind.as_str())
+            .bind(cred.principal_id)
+            .bind(cred.actor_id)
+            .bind(access.as_str())
+            .bind(hive_db::now())
+            .bind(acting.map(|a| a.0))
+            .fetch_one(db)
+            .await
+            .map_err(|e| StoreError::db("access_decision", e))?;
         let reason: Option<String> = row.get("reason");
         let grant_id: Option<Uuid> = row.get("grant_id");
         Ok((reason.as_deref().and_then(Reason::parse), grant_id))
@@ -294,7 +312,7 @@ impl Guard {
     /// an override before returning.
     pub async fn authorize(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         subj: &Subject,
         access: Access,
@@ -329,7 +347,7 @@ impl Guard {
     /// discouraged ... it cannot be written here at all.
     pub async fn authorize_collection(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         subj: &Subject,
         acting: ActingInstall,
@@ -349,7 +367,7 @@ impl Guard {
     /// one argument different.
     pub async fn authorize_collection_as_person(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         subj: &Subject,
         access: Access,
@@ -361,7 +379,7 @@ impl Guard {
 
     async fn collection_decision(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         subj: &Subject,
         acting: Option<ActingInstall>,
@@ -387,7 +405,7 @@ impl Guard {
     /// private so there is still no exported entry point that skips the audit.
     async fn decide_and_audit(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         subj: &Subject,
         access: Access,
@@ -399,7 +417,7 @@ impl Guard {
         if reason == Reason::Override {
             // Refuse the access rather than let it happen unaudited.
             // Visibility is what makes the power acceptable.
-            self.record_override(cred, subj, access, grant_id, note)
+            self.record_override(db, cred, subj, access, grant_id, note)
                 .await
                 .map_err(|e| {
                     StoreError::Other(format!("override audit failed, access refused: {e}"))
@@ -412,7 +430,7 @@ impl Guard {
     /// branch fired. It still audits.
     pub async fn allowed(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         subj: &Subject,
         access: Access,
@@ -424,30 +442,47 @@ impl Guard {
         }
     }
 
-    /// Writes the audit row on the audit pool, outside whatever transaction
+    /// Writes the audit row in the audit file, outside whatever transaction
     /// the caller is running, and fails loudly if it wrote nothing.
     ///
-    /// A zero-row insert is not an error to Postgres, so without the
-    /// rows_affected check the guarantee would be "the audit statement did not
-    /// error", which is a weaker claim than the one D18.2 makes. The owner
-    /// comes from `subject_owner()` for the same reason the predicate resolves
-    /// it: an audit row naming an owner the caller supplied would record the
-    /// caller's belief rather than the fact.
+    /// The owner comes from `subject_owners`, read on the caller's connection
+    /// so it is the same fact the decision just resolved, for the same reason
+    /// the predicate resolves it: an audit row naming an owner the caller
+    /// supplied would record the caller's belief rather than the fact. A
+    /// subject that resolves to no owner cannot have reached 'override', so
+    /// that reads as an error rather than as an unowned audit row.
     async fn record_override(
         &self,
+        db: &Connection,
         cred: &Credential,
         subj: &Subject,
         access: Access,
         grant_id: Option<Uuid>,
         note: &str,
     ) -> Result<()> {
-        let res = sqlx::query(
+        let owner = query(
+            "SELECT owner_kind, owner_id FROM subject_owners
+              WHERE subject_kind = ?1 AND subject_id = ?2",
+        )
+        .bind(subj.kind.as_str())
+        .bind(subj.id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| StoreError::db("resolve audit owner", e))?
+        .ok_or_else(|| StoreError::Other("override audit: subject has no owner".into()))?;
+        let owner_kind: String = owner.get("owner_kind");
+        let owner_id: Uuid = owner.get("owner_id");
+        let c = self
+            .audit
+            .conn()
+            .await
+            .map_err(|e| StoreError::db("audit connection", e))?;
+        let n = query(
             "INSERT INTO grant_override_audit (
                  grant_id, actor_id, principal_kind, principal_id,
                  subject_kind, subject_id, subject_name,
-                 owner_kind, owner_id, access, reason)
-             SELECT $1, $2, $3, $4, $5, $6, $7, so.owner_kind, so.owner_id, $8, $9
-               FROM subject_owner($5, $6) so",
+                 owner_kind, owner_id, access, reason, occurred_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(grant_id)
         .bind(cred.actor_id)
@@ -456,88 +491,97 @@ impl Guard {
         .bind(subj.kind.as_str())
         .bind(subj.id)
         .bind(subj.name())
+        .bind(owner_kind)
+        .bind(owner_id)
         .bind(access.as_str())
         .bind(note)
-        .execute(&self.audit)
+        .bind(hive_db::now())
+        .execute(&c)
         .await
         .map_err(|e| StoreError::db("write override audit", e))?;
-        if res.rows_affected() == 0 {
+        if n == 0 {
             return Err(StoreError::Other("override audit wrote no row".into()));
         }
         Ok(())
+    }
+
+    /// The allowlist-only rule (D18.1) for a named kind under an install: an
+    /// install grant with no allowlist implies the full set; with one, exactly
+    /// those names.
+    async fn named_reason(
+        &self,
+        db: &Connection,
+        cred: &Credential,
+        kind: SubjectKind,
+        install_id: Uuid,
+        name: &str,
+        note: &str,
+    ) -> Result<Option<Reason>> {
+        let probe = predicate::has_allowlist("?1", "?2", "?3", "?4", "?5");
+        let has_allowlist: bool = query(&probe)
+            .bind(kind.as_str())
+            .bind(install_id)
+            .bind(cred.principal_kind.as_str())
+            .bind(cred.principal_id)
+            .bind(hive_db::now())
+            .fetch_scalar(db)
+            .await
+            .map_err(|e| StoreError::db(format!("{kind} allowlist probe"), e))?;
+        let subj = if has_allowlist {
+            Subject::named(kind, install_id, name)
+        } else {
+            Subject::install(install_id)
+        };
+        // A tool or route subject, never a collection: D33's dimension does
+        // not apply and `None` here is the fact, not a default.
+        let (reason, grant_id) = self.decision(db, cred, &subj, Access::Call, None).await?;
+        let Some(r) = reason else {
+            return Ok(None);
+        };
+        if r == Reason::Override {
+            let audited = Subject::named(kind, install_id, name);
+            self.record_override(db, cred, &audited, Access::Call, grant_id, note)
+                .await
+                .map_err(|e| {
+                    StoreError::Other(format!("override audit failed, access refused: {e}"))
+                })?;
+        }
+        Ok(Some(r))
     }
 
     /// Applies the allowlist-only rule (D18.1): an install grant with no tool
     /// allowlist implies the full tool set; with one, exactly those tools.
     pub async fn tool_reason(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         install_id: Uuid,
         tool: &str,
     ) -> Result<Option<Reason>> {
-        let reason: Option<String> =
-            sqlx::query_scalar("SELECT tool_access_reason($1, $2, $3, $4, $5, now())")
-                .bind(install_id)
-                .bind(tool)
-                .bind(cred.principal_kind.as_str())
-                .bind(cred.principal_id)
-                .bind(cred.actor_id)
-                .fetch_one(&mut *db)
-                .await
-                .map_err(|e| StoreError::db("tool_access_reason", e))?;
-        let Some(r) = reason.as_deref().and_then(Reason::parse) else {
-            return Ok(None);
-        };
-        if r == Reason::Override {
-            let subj = Subject::tool(install_id, tool);
-            // A tool subject, never a collection: D33's dimension does not
-            // apply and `None` here is the fact, not a default.
-            let (_, grant_id) = self.decision(db, cred, &subj, Access::Call, None).await?;
-            self.record_override(cred, &subj, Access::Call, grant_id, "tool call")
-                .await
-                .map_err(|e| {
-                    StoreError::Other(format!("override audit failed, access refused: {e}"))
-                })?;
-        }
-        Ok(Some(r))
+        self.named_reason(db, cred, SubjectKind::Tool, install_id, tool, "tool call")
+            .await
     }
 
-    /// The route twin of `tool_reason`, over `route_access_reason` (migration
-    /// 0004): an install grant with no route allowlist implies every route the
-    /// app mounts; with one, exactly those. A route is named
-    /// `"<METHOD> <path template>"`, which the manifest keeps unique per app.
+    /// The route twin of `tool_reason`: an install grant with no route
+    /// allowlist implies every route the app mounts; with one, exactly those.
+    /// A route is named `"<METHOD> <path template>"`, which the manifest keeps
+    /// unique per app.
     pub async fn route_reason(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         install_id: Uuid,
         route: &str,
     ) -> Result<Option<Reason>> {
-        let reason: Option<String> =
-            sqlx::query_scalar("SELECT route_access_reason($1, $2, $3, $4, $5, now())")
-                .bind(install_id)
-                .bind(route)
-                .bind(cred.principal_kind.as_str())
-                .bind(cred.principal_id)
-                .bind(cred.actor_id)
-                .fetch_one(&mut *db)
-                .await
-                .map_err(|e| StoreError::db("route_access_reason", e))?;
-        let Some(r) = reason.as_deref().and_then(Reason::parse) else {
-            return Ok(None);
-        };
-        if r == Reason::Override {
-            let subj = Subject::named(SubjectKind::Route, install_id, route);
-            // A route subject, never a collection. As above.
-            let (_, grant_id) = self.decision(db, cred, &subj, Access::Call, None).await?;
-            self.record_override(cred, &subj, Access::Call, grant_id, "route call")
-                .await
-                .map_err(|e| {
-                    StoreError::Other(format!("override audit failed, access refused: {e}"))
-                })?;
-        }
-        Ok(Some(r))
+        self.named_reason(
+            db,
+            cred,
+            SubjectKind::Route,
+            install_id,
+            route,
+            "route call",
+        )
+        .await
     }
 
     /// The set-read form, and it carries the same audit obligation as the point
@@ -549,29 +593,40 @@ impl Guard {
     /// which is every list, search and graph query there will ever be.
     pub async fn visible_entity_ids(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         access: Access,
         kind: &str,
         limit: i64,
     ) -> Result<Vec<Uuid>> {
-        let rows = sqlx::query(
-            "SELECT e.id, d.reason
+        let reason = predicate::reason(&Args {
+            subject_kind: "'entity'",
+            subject_id: "e.id",
+            subject_name: "NULL",
+            principal_kind: "?2",
+            principal_id: "?3",
+            actor_id: "?4",
+            access: "?5",
+            now: "?6",
+            acting_install: "NULL",
+        });
+        let rows = query(&format!(
+            "SELECT e.id, {reason} AS reason
                FROM entities e
-              CROSS JOIN LATERAL access_decision('entity', e.id, NULL, $2, $3, $4, $5, now()) d
               WHERE e.deleted_at IS NULL
-                AND ($1 = '' OR e.kind = $1)
-                AND d.reason IS NOT NULL
+                AND (?1 = '' OR e.kind = ?1)
+                AND reason IS NOT NULL
               ORDER BY e.created_at DESC
-              LIMIT $6",
-        )
+              LIMIT ?7"
+        ))
         .bind(kind)
         .bind(cred.principal_kind.as_str())
         .bind(cred.principal_id)
         .bind(cred.actor_id)
         .bind(access.as_str())
+        .bind(hive_db::now())
         .bind(limit)
-        .fetch_all(&mut *db)
+        .fetch_all(db)
         .await
         .map_err(|e| StoreError::db("visible entities", e))?;
         self.visible_ids(db, cred, access, SubjectKind::Entity, rows)
@@ -583,26 +638,37 @@ impl Guard {
     /// owner putting a thread away, and a stranger's grant does not unpack it.
     pub async fn visible_conversation_ids(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         access: Access,
         limit: i64,
     ) -> Result<Vec<Uuid>> {
-        let rows = sqlx::query(
-            "SELECT c.id, d.reason
+        let reason = predicate::reason(&Args {
+            subject_kind: "'conversation'",
+            subject_id: "c.id",
+            subject_name: "NULL",
+            principal_kind: "?1",
+            principal_id: "?2",
+            actor_id: "?3",
+            access: "?4",
+            now: "?5",
+            acting_install: "NULL",
+        });
+        let rows = query(&format!(
+            "SELECT c.id, {reason} AS reason
                FROM conversations c
-              CROSS JOIN LATERAL access_decision('conversation', c.id, NULL, $1, $2, $3, $4, now()) d
               WHERE c.archived_at IS NULL
-                AND d.reason IS NOT NULL
+                AND reason IS NOT NULL
               ORDER BY c.updated_at DESC
-              LIMIT $5",
-        )
+              LIMIT ?6"
+        ))
         .bind(cred.principal_kind.as_str())
         .bind(cred.principal_id)
         .bind(cred.actor_id)
         .bind(access.as_str())
+        .bind(hive_db::now())
         .bind(limit)
-        .fetch_all(&mut *db)
+        .fetch_all(db)
         .await
         .map_err(|e| StoreError::db("visible conversations", e))?;
         self.visible_ids(db, cred, access, SubjectKind::Conversation, rows)
@@ -616,17 +682,17 @@ impl Guard {
     /// is the thing that was missing the first time.
     async fn visible_ids(
         &self,
-        db: &mut PgConnection,
+        db: &Connection,
         cred: &Credential,
         access: Access,
         kind: SubjectKind,
-        rows: Vec<sqlx::postgres::PgRow>,
+        rows: Vec<hive_db::Row>,
     ) -> Result<Vec<Uuid>> {
         let mut ids = Vec::with_capacity(rows.len());
         let mut overrides = Vec::new();
         for row in rows {
-            let id: Uuid = row.get(0);
-            let reason: String = row.get(1);
+            let id: Uuid = row.get("id");
+            let reason: String = row.get("reason");
             ids.push(id);
             if Reason::parse(&reason) == Some(Reason::Override) {
                 overrides.push(id);
@@ -639,7 +705,7 @@ impl Guard {
             // `kind` is Entity or Conversation on every path that reaches here;
             // neither is install-scoped, so there is no asking install to name.
             let (_, grant_id) = self.decision(db, cred, &subj, access, None).await?;
-            self.record_override(cred, &subj, access, grant_id, "list")
+            self.record_override(db, cred, &subj, access, grant_id, "list")
                 .await
                 .map_err(|e| {
                     StoreError::Other(format!(
@@ -653,7 +719,7 @@ impl Guard {
 }
 
 /// One grant to write. The database enforces who may write it
-/// (`grant_issue_denial`), so a caller cannot widen anything by constructing
+/// (`grants_issue_policy`), so a caller cannot widen anything by constructing
 /// this carefully.
 #[derive(Clone, Debug)]
 pub struct GrantSpec {
@@ -684,19 +750,17 @@ impl GrantSpec {
 }
 
 /// Inserts one grant. Returns the new id.
-pub async fn write_grant<'e, E>(db: E, spec: &GrantSpec) -> Result<Uuid>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    sqlx::query_scalar(
+pub async fn write_grant(db: &Connection, spec: &GrantSpec) -> Result<Uuid> {
+    query(
         "INSERT INTO grants (
-             subject_kind, subject_id, subject_name,
+             id, subject_kind, subject_id, subject_name,
              target_kind, target_id, access, source, inherited_from,
              granted_by_actor, granted_by_principal_kind, granted_by_principal_id,
-             reason, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             reason, expires_at, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
          RETURNING id",
     )
+    .bind(Uuid::new_v4())
     .bind(spec.subject.kind.as_str())
     .bind(spec.subject.id)
     .bind(spec.subject.name())
@@ -710,7 +774,8 @@ where
     .bind(spec.by.principal_id)
     .bind(&spec.reason)
     .bind(spec.expires_at)
-    .fetch_one(db)
+    .bind(hive_db::now())
+    .fetch_scalar(db)
     .await
     .map_err(|e| StoreError::db("write grant", e))
 }
@@ -719,16 +784,13 @@ where
 /// inherited child goes with it through the foreign key cascade, so "revoking a
 /// parent removes every inherited child" is a database property rather than
 /// something application code has to remember to do.
-pub async fn revoke_grant<'e, E>(db: E, id: Uuid) -> Result<()>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let res = sqlx::query("DELETE FROM grants WHERE id = $1")
+pub async fn revoke_grant(db: &Connection, id: Uuid) -> Result<()> {
+    let n = query("DELETE FROM grants WHERE id = ?1")
         .bind(id)
         .execute(db)
         .await
         .map_err(|e| StoreError::db("revoke grant", e))?;
-    if res.rows_affected() == 0 {
+    if n == 0 {
         return Err(StoreError::NoRows);
     }
     Ok(())
@@ -754,38 +816,79 @@ pub struct UnshareResult {
 ///
 /// `delete_direct` is the caller stating intent. Without it, a subject that has
 /// a direct grant returns `WouldDeleteDirectGrant` and NOTHING is changed.
-/// Attention is not a safety mechanism; intent is. The check and the writes are
-/// one statement in the database, so nothing can slip between them.
-pub async fn unshare<'e, E>(
-    db: E,
+/// Attention is not a safety mechanism; intent is. It takes a transaction so
+/// the refusal and the writes cannot interleave with another writer between
+/// the check and the act: the Postgres version was one statement, and a
+/// `BEGIN IMMEDIATE` is the same guarantee here.
+pub async fn unshare(
+    tx: &Transaction,
     subj: &Subject,
     target: Owner,
     by: Uuid,
     delete_direct: bool,
-) -> Result<UnshareResult>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let row = sqlx::query("SELECT tombstoned, deleted FROM unshare($1,$2,$3,$4,$5,$6,$7)")
+) -> Result<UnshareResult> {
+    let directs: i64 = query(
+        "SELECT count(*) FROM grants g
+          WHERE g.subject_kind = ?1 AND g.subject_id = ?2
+            AND g.subject_name IS ?3
+            AND g.target_kind = ?4 AND g.target_id = ?5
+            AND g.source = 'direct' AND g.revoked_at IS NULL",
+    )
+    .bind(subj.kind.as_str())
+    .bind(subj.id)
+    .bind(subj.name())
+    .bind(target.kind.as_str())
+    .bind(target.id)
+    .fetch_scalar(tx)
+    .await
+    .map_err(|e| StoreError::db("unshare", e))?;
+    if directs > 0 && !delete_direct {
+        return Err(StoreError::WouldDeleteDirectGrant(format!(
+            "unshare would delete {directs} directly-issued grant(s), which cannot be undone; \
+             say so explicitly or narrow only the inherited ones"
+        )));
+    }
+    let tombstoned = query(
+        "UPDATE grants
+            SET revoked_at = ?6, revoked_by = ?7
+          WHERE subject_kind = ?1 AND subject_id = ?2
+            AND subject_name IS ?3
+            AND target_kind = ?4 AND target_id = ?5
+            AND source = 'inherited' AND revoked_at IS NULL",
+    )
+    .bind(subj.kind.as_str())
+    .bind(subj.id)
+    .bind(subj.name())
+    .bind(target.kind.as_str())
+    .bind(target.id)
+    .bind(hive_db::now())
+    .bind(by)
+    .execute(tx)
+    .await
+    .map_err(|e| StoreError::db("unshare: narrow inherited", e))?;
+    let deleted = if delete_direct {
+        query(
+            "DELETE FROM grants
+              WHERE subject_kind = ?1 AND subject_id = ?2
+                AND subject_name IS ?3
+                AND target_kind = ?4 AND target_id = ?5
+                AND source = 'direct' AND revoked_at IS NULL",
+        )
         .bind(subj.kind.as_str())
         .bind(subj.id)
         .bind(subj.name())
         .bind(target.kind.as_str())
         .bind(target.id)
-        .bind(by)
-        .bind(delete_direct)
-        .fetch_one(db)
-        .await;
-    match row {
-        Ok(row) => Ok(UnshareResult {
-            tombstoned: row.get(0),
-            deleted: row.get(1),
-        }),
-        Err(sqlx::Error::Database(e)) if e.message().contains("cannot be undone") => {
-            Err(StoreError::WouldDeleteDirectGrant(e.message().to_string()))
-        }
-        Err(e) => Err(StoreError::db("unshare", e)),
-    }
+        .execute(tx)
+        .await
+        .map_err(|e| StoreError::db("unshare: delete direct", e))?
+    } else {
+        0
+    };
+    Ok(UnshareResult {
+        tombstoned: tombstoned as i64,
+        deleted: deleted as i64,
+    })
 }
 
 /// Copies every live, non-override grant from parent to child as real rows
@@ -797,34 +900,35 @@ where
 /// deliberately narrowed child stays narrowed, because its tombstone row still
 /// occupies the key; and a parent that was revoked and re-granted gets a new
 /// grant id, so its children re-materialize under the new parent.
-pub async fn materialize_inherited<'e, E>(
-    db: E,
+pub async fn materialize_inherited(
+    db: &Connection,
     parent: &Subject,
     child: &Subject,
     by: &Credential,
-) -> Result<u64>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let res = sqlx::query(
+) -> Result<u64> {
+    // One id per row the SELECT produces, minted in SQL: the column default
+    // does not apply to INSERT ... SELECT with the column named, and a bound
+    // value would give every row the same id.
+    query(&format!(
         "INSERT INTO grants (
-             subject_kind, subject_id, subject_name,
+             id, subject_kind, subject_id, subject_name,
              target_kind, target_id, access, source, inherited_from,
              granted_by_actor, granted_by_principal_kind, granted_by_principal_id,
-             reason, expires_at)
-         SELECT $4, $5, $6,
+             reason, expires_at, created_at)
+         SELECT {uuid}, ?4, ?5, ?6,
                 p.target_kind, p.target_id, p.access, 'inherited', p.id,
-                $7, $8, $9,
+                ?7, ?8, ?9,
                 'inherited from ' || p.subject_kind || ' ' || p.subject_id,
-                p.expires_at
+                p.expires_at, ?10
            FROM grants p
-          WHERE p.subject_kind = $1 AND p.subject_id = $2
-            AND p.subject_name IS NOT DISTINCT FROM $3
+          WHERE p.subject_kind = ?1 AND p.subject_id = ?2
+            AND p.subject_name IS ?3
             AND p.source <> 'override'
             AND p.revoked_at IS NULL
-            AND (p.expires_at IS NULL OR p.expires_at > now())
+            AND (p.expires_at IS NULL OR p.expires_at > ?10)
          ON CONFLICT DO NOTHING",
-    )
+        uuid = hive_db::UUID_SQL
+    ))
     .bind(parent.kind.as_str())
     .bind(parent.id)
     .bind(parent.name())
@@ -834,10 +938,10 @@ where
     .bind(by.actor_id)
     .bind(by.principal_kind.as_str())
     .bind(by.principal_id)
+    .bind(hive_db::now())
     .execute(db)
     .await
-    .map_err(|e| StoreError::db("materialize inherited grants", e))?;
-    Ok(res.rows_affected())
+    .map_err(|e| StoreError::db("materialize inherited grants", e))
 }
 
 /// Writes a time-boxed override grant (D18.2). It is a grant produced by
@@ -850,7 +954,7 @@ where
 /// stress, so it cleans up after itself rather than depending on a sweeper
 /// somebody has not written yet.
 pub async fn enter_break_glass(
-    conn: &mut PgConnection,
+    conn: &Connection,
     subj: &Subject,
     admin: &Credential,
     window: Duration,
@@ -864,26 +968,27 @@ pub async fn enter_break_glass(
     if reason.is_empty() {
         return Err(StoreError::Other("break-glass needs a reason".into()));
     }
-    sqlx::query(
+    query(
         "DELETE FROM grants
           WHERE source = 'override'
-            AND subject_kind = $1 AND subject_id = $2
-            AND subject_name IS NOT DISTINCT FROM $3
-            AND target_kind = 'user' AND target_id = $4
-            AND (revoked_at IS NOT NULL OR expires_at <= now())",
+            AND subject_kind = ?1 AND subject_id = ?2
+            AND subject_name IS ?3
+            AND target_kind = 'user' AND target_id = ?4
+            AND (revoked_at IS NOT NULL OR expires_at <= ?5)",
     )
     .bind(subj.kind.as_str())
     .bind(subj.id)
     .bind(subj.name())
     .bind(admin.actor_id)
-    .execute(&mut *conn)
+    .bind(hive_db::now())
+    .execute(conn)
     .await
     .map_err(|e| StoreError::db("reap expired break-glass", e))?;
 
     let expires =
         Utc::now() + chrono::Duration::from_std(window).unwrap_or(chrono::Duration::hours(1));
     write_grant(
-        &mut *conn,
+        conn,
         &GrantSpec {
             subject: subj.clone(),
             target: Owner::new(PrincipalKind::User, admin.actor_id),

@@ -1,13 +1,14 @@
 //! Forward-only migrations.
 //!
-//! The SQL files under `migrations/` are the ones the Go daemon applied before
-//! the port (D31): the same `schema_migrations` table, the same advisory lock
-//! key, the same checksum over the same bytes, so a database the Go daemon
-//! migrated is a database this one continues, and a file that was applied
-//! differently is refused rather than reapplied.
+//! The SQL files under `migrations/` are embedded and applied in order to the
+//! one file the daemon opens (D38). The history restarts at 0001 with the
+//! engine change, because no hive-mind database was ever deployed on the
+//! Postgres schema; the machinery is the one the Go tree and the Postgres
+//! port used: a `schema_migrations` table, a SHA-256 over the bytes, and a
+//! file that was applied differently refused rather than reapplied.
 
+use hive_db::{Db, Transaction, query};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, PgPool};
 
 /// One forward-only step. There are no down migrations: rolling back a schema
 /// on live data is a restore, not a migration.
@@ -19,7 +20,7 @@ pub struct Migration {
 }
 
 impl Migration {
-    /// SHA-256 of the file bytes, hex. What the Go tree records.
+    /// SHA-256 of the file bytes, hex. What the Go tree recorded.
     pub fn checksum(&self) -> String {
         hex::encode(Sha256::digest(self.sql.as_bytes()))
     }
@@ -27,41 +28,23 @@ impl Migration {
 
 /// Every migration this binary carries, in order. Adding a file to the shared
 /// directory means adding a line here, and a test fails until it is.
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: "0001",
-        name: "init",
-        sql: include_str!("../migrations/0001_init.sql"),
-    },
-    Migration {
-        version: "0002",
-        name: "agent_runs",
-        sql: include_str!("../migrations/0002_agent_runs.sql"),
-    },
-    Migration {
-        version: "0003",
-        name: "chat",
-        sql: include_str!("../migrations/0003_chat.sql"),
-    },
-    Migration {
-        version: "0004",
-        name: "route_access",
-        sql: include_str!("../migrations/0004_route_access.sql"),
-    },
-    Migration {
-        version: "0005",
-        name: "collection_acting_install",
-        sql: include_str!("../migrations/0005_collection_acting_install.sql"),
-    },
-];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: "0001",
+    name: "init",
+    sql: include_str!("../migrations/0001_init.sql"),
+}];
 
-/// The shared directory, for the test that keeps `MIGRATIONS` honest.
+/// The override audit's own file (D38 §3): evidence that must survive any
+/// caller's transaction, which on one file per writer means its own file.
+pub const AUDIT_MIGRATIONS: &[Migration] = &[Migration {
+    version: "0001",
+    name: "override_audit",
+    sql: include_str!("../migrations-audit/0001_override_audit.sql"),
+}];
+
+/// The shared directories, for the tests that keep the lists honest.
 pub const SHARED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
-
-/// An arbitrary but fixed key for `pg_advisory_lock`. Two daemons booting at
-/// once must not both run migration one; the loser waits and then finds
-/// nothing to do. "HIVESAND", and the same number the Go tree uses.
-const LOCK_KEY: i64 = 0x4849_5645_5341_4e44;
+pub const AUDIT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations-audit");
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrateError {
@@ -81,59 +64,48 @@ pub enum MigrateError {
         version: String,
         name: String,
         #[source]
-        source: sqlx::Error,
+        source: hive_db::Error,
     },
     #[error(transparent)]
-    Db(#[from] sqlx::Error),
+    Db(#[from] hive_db::Error),
 }
 
 /// Applies every embedded migration that has not been applied yet and returns
 /// the versions it applied. Safe to call concurrently from any number of
-/// processes.
-///
-/// Await it on the calling task rather than spawning it. rustc cannot prove
-/// this future `Send` (rust-lang/rust#100013, the higher-ranked reborrows in
-/// sqlx's `Executor` impls), and the daemon migrates at boot before it spawns
-/// anything, so nothing needs it to be.
-pub async fn migrate(pool: &PgPool) -> Result<Vec<String>, MigrateError> {
-    // The advisory lock is session-scoped, so it has to live on one
-    // connection for the whole run rather than on whatever the pool hands
-    // out per query.
-    let mut conn = pool.acquire().await?;
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(LOCK_KEY)
-        .execute(&mut *conn)
-        .await?;
-
-    let result = migrate_locked(&mut conn).await;
-
-    // Best effort: releasing the session also releases the lock.
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(LOCK_KEY)
-        .execute(&mut *conn)
-        .await;
-    result
+/// processes: the whole run is one `BEGIN IMMEDIATE` transaction, so the
+/// engine's write lock is the mutex and the loser waits, then finds nothing to
+/// do. (The Postgres port used an advisory lock for the same reason.)
+pub async fn migrate(db: &Db) -> Result<Vec<String>, MigrateError> {
+    apply_all(db, MIGRATIONS).await
 }
 
-async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<Vec<String>, MigrateError> {
-    sqlx::query(
+/// The audit file's migrations, same machinery.
+pub async fn migrate_audit(db: &Db) -> Result<Vec<String>, MigrateError> {
+    apply_all(db, AUDIT_MIGRATIONS).await
+}
+
+async fn apply_all(db: &Db, list: &[Migration]) -> Result<Vec<String>, MigrateError> {
+    let tx = db.begin().await?;
+    query(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version    text PRIMARY KEY,
-            name       text NOT NULL,
-            checksum   text NOT NULL,
-            applied_at timestamptz NOT NULL DEFAULT now()
+            version    TEXT PRIMARY KEY,
+            name       TEXT NOT NULL,
+            checksum   TEXT NOT NULL,
+            applied_at INTEGER NOT NULL
         )",
     )
-    .execute(&mut *conn)
+    .execute(&tx)
     .await?;
 
-    let applied: Vec<(String, String)> =
-        sqlx::query_as("SELECT version, checksum FROM schema_migrations")
-            .fetch_all(&mut *conn)
-            .await?;
+    let applied: Vec<(String, String)> = query("SELECT version, checksum FROM schema_migrations")
+        .fetch_all(&tx)
+        .await?
+        .iter()
+        .map(|r| (r.get("version"), r.get("checksum")))
+        .collect();
 
     let mut ran = Vec::new();
-    for m in MIGRATIONS {
+    for m in list {
         let embedded = m.checksum();
         if let Some((_, recorded)) = applied.iter().find(|(v, _)| v == m.version) {
             // Migrations are immutable once applied. A silent edit means two
@@ -150,7 +122,7 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<Vec<String>, Mi
             }
             continue;
         }
-        apply(conn, m, &embedded).await?;
+        apply(&tx, m, &embedded).await?;
         ran.push(m.version.to_string());
     }
 
@@ -158,35 +130,32 @@ async fn migrate_locked(conn: &mut sqlx::PgConnection) -> Result<Vec<String>, Mi
     // migration file. The schema in front of us is not one this binary knows
     // how to talk to, so say that rather than proceeding hopefully.
     for (version, _) in &applied {
-        if !MIGRATIONS.iter().any(|m| m.version == version) {
+        if !list.iter().any(|m| m.version == version) {
             return Err(MigrateError::Unknown(version.clone()));
         }
     }
+    tx.commit().await?;
     Ok(ran)
 }
 
-async fn apply(
-    conn: &mut sqlx::PgConnection,
-    m: &Migration,
-    checksum: &str,
-) -> Result<(), MigrateError> {
-    let wrap = |source: sqlx::Error| MigrateError::Apply {
+async fn apply(tx: &Transaction, m: &Migration, checksum: &str) -> Result<(), MigrateError> {
+    let wrap = |source: hive_db::Error| MigrateError::Apply {
         version: m.version.to_string(),
         name: m.name.to_string(),
         source,
     };
-    let mut tx = conn.begin().await.map_err(wrap)?;
-    // raw_sql: a migration is many statements, and the extended protocol
-    // prepares exactly one.
-    sqlx::raw_sql(m.sql).execute(&mut *tx).await.map_err(wrap)?;
-    sqlx::query("INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)")
+    // A migration is many statements; the batch runs them in the enclosing
+    // transaction, so a file that fails halfway leaves nothing behind.
+    Db::batch(tx, m.sql).await.map_err(wrap)?;
+    query("INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES (?1, ?2, ?3, ?4)")
         .bind(m.version)
         .bind(m.name)
         .bind(checksum)
-        .execute(&mut *tx)
+        .bind(hive_db::now())
+        .execute(tx)
         .await
         .map_err(wrap)?;
-    tx.commit().await.map_err(wrap)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -199,25 +168,46 @@ mod tests {
     /// first shape.
     #[test]
     fn embedded_migrations_match_the_shared_directory() {
-        let mut on_disk: Vec<String> = std::fs::read_dir(SHARED_DIR)
-            .expect("shared migrations directory")
-            .map(|e| {
-                e.expect("dir entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .filter(|n| n.ends_with(".sql"))
-            .collect();
-        on_disk.sort();
-        let embedded: Vec<String> = MIGRATIONS
-            .iter()
-            .map(|m| format!("{}_{}.sql", m.version, m.name))
-            .collect();
+        for (dir, list, what) in [
+            (SHARED_DIR, MIGRATIONS, "MIGRATIONS"),
+            (AUDIT_DIR, AUDIT_MIGRATIONS, "AUDIT_MIGRATIONS"),
+        ] {
+            let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+                .expect("shared migrations directory")
+                .map(|e| {
+                    e.expect("dir entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .filter(|n| n.ends_with(".sql"))
+                .collect();
+            on_disk.sort();
+            let embedded: Vec<String> = list
+                .iter()
+                .map(|m| format!("{}_{}.sql", m.version, m.name))
+                .collect();
+            assert_eq!(on_disk, embedded, "{dir} and {what} disagree");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_audit_file_migrates_on_its_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(dir.path().join("hive-audit.db"))
+            .await
+            .expect("open");
         assert_eq!(
-            on_disk, embedded,
-            "crates/hive-schema/migrations and MIGRATIONS disagree"
+            migrate_audit(&db).await.expect("migrate"),
+            vec!["0001".to_string()]
         );
+        assert!(migrate_audit(&db).await.expect("again").is_empty());
+        let c = db.conn().await.unwrap();
+        let n: i64 = query("SELECT count(*) FROM grant_override_audit")
+            .fetch_scalar(&c)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
@@ -236,8 +226,82 @@ mod tests {
             name: "probe",
             sql: "SELECT 1;\n",
         };
-        // sha256("SELECT 1;\n"), computed once outside this crate.
         assert_eq!(m.checksum().len(), 64);
         assert_eq!(m.checksum(), hex::encode(Sha256::digest(b"SELECT 1;\n")));
+    }
+
+    async fn fresh() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(dir.path().join("hive.db")).await.expect("open");
+        (dir, db)
+    }
+
+    /// The file parses and applies. This is the test that catches a SQL
+    /// mistake in migration one before any store test does, and it is the
+    /// first thing to run after editing the file.
+    #[tokio::test]
+    async fn migration_one_applies_to_a_fresh_file_and_is_idempotent() {
+        let (_d, db) = fresh().await;
+        let ran = migrate(&db).await.expect("first migrate");
+        assert_eq!(ran, vec!["0001".to_string()]);
+        let again = migrate(&db).await.expect("second migrate");
+        assert!(again.is_empty(), "nothing to apply the second time");
+        let c = db.conn().await.unwrap();
+        let tables: Vec<String> =
+            query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .fetch_scalars(&c)
+                .await
+                .unwrap();
+        for want in [
+            "actors",
+            "grants",
+            "events",
+            "installs",
+            "chat_turns",
+            "schema_migrations",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == want),
+                "missing table {want}: {tables:?}"
+            );
+        }
+        let views: Vec<String> = query("SELECT name FROM sqlite_master WHERE type = 'view'")
+            .fetch_scalars(&c)
+            .await
+            .unwrap();
+        assert!(views.iter().any(|v| v == "subject_owners"), "{views:?}");
+        assert!(
+            views.iter().any(|v| v == "builds_awaiting_promotion"),
+            "{views:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edited_migration_is_refused() {
+        let (_d, db) = fresh().await;
+        migrate(&db).await.expect("migrate");
+        let c = db.conn().await.unwrap();
+        query("UPDATE schema_migrations SET checksum = 'not-the-bytes' WHERE version = '0001'")
+            .execute(&c)
+            .await
+            .unwrap();
+        let err = migrate(&db).await.unwrap_err();
+        assert!(matches!(err, MigrateError::Changed { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_applied_version_is_refused() {
+        let (_d, db) = fresh().await;
+        migrate(&db).await.expect("migrate");
+        let c = db.conn().await.unwrap();
+        query("INSERT INTO schema_migrations (version, name, checksum, applied_at) VALUES ('0999', 'future', 'x', 0)")
+            .execute(&c)
+            .await
+            .unwrap();
+        let err = migrate(&db).await.unwrap_err();
+        assert!(
+            matches!(err, MigrateError::Unknown(ref v) if v == "0999"),
+            "{err}"
+        );
     }
 }

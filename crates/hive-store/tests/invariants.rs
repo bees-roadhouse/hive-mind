@@ -1,14 +1,14 @@
 //! The invariants, ported before the behaviour (docs/design/D24-rust-rewrite.md).
 //!
-//! Every test here runs against the SAME migrations the Go tree uses, through
-//! the predicate and the triggers those migrations install, with no Rust
-//! behaviour behind it. Each names the Go test it was ported from, so the two
-//! trees can be compared line by line while both live. A test that cannot
-//! fail is worse than none, so the owner-reads-own-entity case is here too:
-//! it is what proves the predicate answers at all.
+//! Every test here runs against migration one and the predicate text, through
+//! the triggers the migration installs and the one SQL text `Guard` composes,
+//! with no Rust behaviour behind it beyond binding the arguments. Each names
+//! the Go test it was ported from, so the trees can be compared line by line.
+//! A test that cannot fail is worse than none, so the owner-reads-own-entity
+//! case is here too: it is what proves the predicate answers at all.
 
+use hive_db::{Conn, Connection, Value, query};
 use hive_testdb::TestDb;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// The credential every read is filtered by. Invariant 2: actor and principal
@@ -35,7 +35,11 @@ struct Subject {
     id: Uuid,
 }
 
-/// The fixture the Go tree calls `world`: a migrated private schema with a root
+fn now() -> chrono::DateTime<chrono::Utc> {
+    hive_db::now()
+}
+
+/// The fixture the Go tree calls `world`: a migrated private file with a root
 /// actor, and helpers that write rows the way the Go fixtures do.
 struct World {
     db: TestDb,
@@ -43,37 +47,36 @@ struct World {
 }
 
 impl World {
-    async fn new(test: &str) -> Option<Self> {
-        let db = TestDb::new(test).await?;
-        hive_store::migrate(db.pool()).await.expect("migrate");
+    async fn new(test: &str) -> Self {
+        let db = TestDb::new(test).await;
         // The root is the one actor without a creator (actors_single_root).
         let root = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', 'root', 'Root', 'user', $1, NULL)",
+             VALUES (?1, 'human', 'root', 'Root', 'user', ?1, NULL)",
         )
         .bind(root)
-        .execute(db.pool())
+        .execute(&db.db().conn().await.unwrap())
         .await
         .expect("root actor");
-        Some(Self { db, root })
+        Self { db, root }
     }
 
-    fn pool(&self) -> &PgPool {
-        self.db.pool()
+    async fn conn(&self) -> Conn {
+        self.db.db().conn().await.expect("connection")
     }
 
     /// A person. Every actor after the root names its creator.
     async fn human(&self, handle: &str) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', $2, $2, 'user', $1, $3)",
+             VALUES (?1, 'human', ?2, ?2, 'user', ?1, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(self.root)
-        .execute(self.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create human {handle}: {e}"));
         id
@@ -82,14 +85,14 @@ impl World {
     /// An org with `creator` as its first admin.
     async fn org(&self, handle: &str, creator: Uuid) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'org', $2, $2, 'org', $1, $3)",
+             VALUES (?1, 'org', ?2, ?2, 'org', ?1, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(creator)
-        .execute(self.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create org {handle}: {e}"));
         self.member(id, creator, "admin", creator).await;
@@ -97,15 +100,15 @@ impl World {
     }
 
     async fn member(&self, org: Uuid, user: Uuid, role: &str, by: Uuid) {
-        sqlx::query(
-            "INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (org_id, user_id) DO UPDATE SET role = $3",
+        query(
+            "INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (org_id, user_id) DO UPDATE SET role = ?3",
         )
         .bind(org)
         .bind(user)
         .bind(role)
         .bind(by)
-        .execute(self.pool())
+        .execute(&*self.conn().await)
         .await
         .expect("add member");
     }
@@ -113,16 +116,16 @@ impl World {
     /// An AI persona instance owned by one principal (D13.9).
     async fn ai(&self, handle: &str, principal_kind: &str, principal: Uuid, creator: Uuid) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, persona, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'ai', $2, $2, $2, $3, $4, $5)",
+             VALUES (?1, 'ai', ?2, ?2, ?2, ?3, ?4, ?5)",
         )
         .bind(id)
         .bind(handle)
         .bind(principal_kind)
         .bind(principal)
         .bind(creator)
-        .execute(self.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create ai {handle}: {e}"));
         id
@@ -132,36 +135,38 @@ impl World {
     /// an install, and grants on collections and tools are install-scoped.
     async fn install(&self, slug: &str, owner_kind: &str, owner: Uuid, by: Uuid) -> Uuid {
         let sum = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let (build_id,): (Uuid,) = sqlx::query_as(
-            "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
+        let c = self.conn().await;
+        let build_id: Uuid = query(
+            "INSERT INTO app_builds (id, slug, kind, impl, manifest, content_hash,
                                      author_actor, owner_kind, owner_id, visibility, trust, status)
-             VALUES ($1, 'app', 'host', '{}', $2, $3, $4, $5, 'private', 'builtin', 'registered')
+             VALUES (?1, ?2, 'app', 'host', '{}', ?3, ?4, ?5, ?6, 'private', 'builtin', 'registered')
              RETURNING id",
         )
+        .bind(Uuid::new_v4())
         .bind(slug)
         .bind(&sum)
         .bind(by)
         .bind(owner_kind)
         .bind(owner)
-        .fetch_one(self.pool())
+        .fetch_scalar(&c)
         .await
         .expect("create build");
-        let (install_id,): (Uuid,) = sqlx::query_as(
-            "INSERT INTO installs (build_id, slug, owner_kind, owner_id, installed_by_actor,
+        query(
+            "INSERT INTO installs (id, build_id, slug, owner_kind, owner_id, installed_by_actor,
                                    activated_by_actor, schema_name, state)
-             VALUES ($1, $2, $3, $4, $5, $5, $6, 'active')
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 'active')
              RETURNING id",
         )
+        .bind(Uuid::new_v4())
         .bind(build_id)
         .bind(slug)
         .bind(owner_kind)
         .bind(owner)
         .bind(by)
         .bind(format!("app_{slug}_{}", &sum[..8]))
-        .fetch_one(self.pool())
+        .fetch_scalar(&c)
         .await
-        .expect("create install");
-        install_id
+        .expect("create install")
     }
 
     /// One owned row.
@@ -174,25 +179,25 @@ impl World {
         owner: Uuid,
         author: Uuid,
     ) -> Uuid {
-        let (id,): (Uuid,) = sqlx::query_as(
-            "INSERT INTO entities (kind, install_id, collection, ref, owner_kind, owner_id, author_actor)
-             VALUES ('entry', $1, $2, $3, $4, $5, $6)
+        query(
+            "INSERT INTO entities (id, kind, install_id, collection, ref, owner_kind, owner_id, author_actor)
+             VALUES (?1, 'entry', ?2, ?3, ?4, ?5, ?6, ?7)
              RETURNING id",
         )
+        .bind(Uuid::new_v4())
         .bind(install)
         .bind(collection)
         .bind(r)
         .bind(owner_kind)
         .bind(owner)
         .bind(author)
-        .fetch_one(self.pool())
+        .fetch_scalar(&*self.conn().await)
         .await
-        .expect("create entity");
-        id
+        .expect("create entity")
     }
 
     /// The predicate for an install-scoped subject that needs a name:
-    /// collection, tool, route. Same function, same rules; only `subject_name`
+    /// collection, tool, route. Same text, same rules; only `subject_name`
     /// is non-NULL.
     async fn decision_named(
         &self,
@@ -202,33 +207,30 @@ impl World {
         access: &str,
         acting: Option<Uuid>,
     ) -> Option<String> {
-        let (reason,): (Option<String>,) = sqlx::query_as(
-            "SELECT reason FROM access_decision($1, $2, $3, $4, $5, $6, $7, now(), $8)",
-        )
-        .bind(s.kind)
-        .bind(s.id)
-        .bind(name)
-        .bind(c.principal_kind)
-        .bind(c.principal)
-        .bind(c.actor)
-        .bind(access)
-        .bind(acting)
-        .fetch_one(self.pool())
-        .await
-        .expect("access_decision");
-        reason
+        let row = query(&hive_store::__predicate_sql_for_tests())
+            .bind(s.kind)
+            .bind(s.id)
+            .bind(name)
+            .bind(c.principal_kind)
+            .bind(c.principal)
+            .bind(c.actor)
+            .bind(access)
+            .bind(now())
+            .bind(acting)
+            .fetch_one(&*self.conn().await)
+            .await
+            .expect("access_decision");
+        row.get("reason")
     }
 
-    /// A collection grant whose target is an INSTALL rather than a principal
-    /// (D33). This is the row the registry will write when it derives an app's
-    /// `uses` declaration at activation.
     /// Revokes a grant the way `revoke_grant` does, so the test exercises the
     /// predicate's tombstone clause rather than deleting the row.
     async fn revoke(&self, grant: Uuid, by: Uuid) {
-        sqlx::query("UPDATE grants SET revoked_at = now(), revoked_by = $2 WHERE id = $1")
+        query("UPDATE grants SET revoked_at = ?3, revoked_by = ?2 WHERE id = ?1")
             .bind(grant)
             .bind(by)
-            .execute(self.pool())
+            .bind(now())
+            .execute(&*self.conn().await)
             .await
             .expect("revoke");
     }
@@ -241,24 +243,26 @@ impl World {
         to_install: Uuid,
         by: Uuid,
     ) -> Uuid {
-        let (id,): (Uuid,) = sqlx::query_as(
+        query(
             "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind,
                                  target_install_id, access, source, granted_by_actor,
                                  granted_by_principal_kind, granted_by_principal_id, expires_at)
-             VALUES ('collection', $1, $2, 'install', $3, 'read', 'direct', $4, 'user', $4,
-                     now() - interval '1 hour')
+             VALUES ('collection', ?1, ?2, 'install', ?3, 'read', 'direct', ?4, 'user', ?4, ?5)
              RETURNING id",
         )
         .bind(subject_install)
         .bind(collection)
         .bind(to_install)
         .bind(by)
-        .fetch_one(self.pool())
+        .bind(now() - chrono::Duration::hours(1))
+        .fetch_scalar(&*self.conn().await)
         .await
-        .expect("expired install grant");
-        id
+        .expect("expired install grant")
     }
 
+    /// A collection grant whose target is an INSTALL rather than a principal
+    /// (D33). This is the row the registry will write when it derives an app's
+    /// `uses` declaration at activation.
     async fn install_grant(
         &self,
         subject_install: Uuid,
@@ -267,11 +271,11 @@ impl World {
         access: &str,
         by: Uuid,
     ) -> Uuid {
-        let (id,): (Uuid,) = sqlx::query_as(
+        query(
             "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind,
                                  target_install_id, access, source, granted_by_actor,
                                  granted_by_principal_kind, granted_by_principal_id)
-             VALUES ('collection', $1, $2, 'install', $3, $4, 'direct', $5, 'user', $5)
+             VALUES ('collection', ?1, ?2, 'install', ?3, ?4, 'direct', ?5, 'user', ?5)
              RETURNING id",
         )
         .bind(subject_install)
@@ -279,30 +283,30 @@ impl World {
         .bind(to_install)
         .bind(access)
         .bind(by)
-        .fetch_one(self.pool())
+        .fetch_scalar(&*self.conn().await)
         .await
-        .expect("install grant");
-        id
+        .expect("install grant")
     }
 
-    /// The predicate itself. `None` is deny. This is the one call every
+    /// The predicate itself. `None` is deny. This is the one text every
     /// enforcement funnels through (invariant 1), and it resolves the owner
     /// from the subject rather than taking one (invariant 11): there is no
     /// argument here through which a caller could supply the answer.
     async fn decision(&self, c: Cred, s: Subject, access: &str) -> Option<String> {
-        let (reason,): (Option<String>,) = sqlx::query_as(
-            "SELECT reason FROM access_decision($1, $2, NULL, $3, $4, $5, $6, now())",
-        )
-        .bind(s.kind)
-        .bind(s.id)
-        .bind(c.principal_kind)
-        .bind(c.principal)
-        .bind(c.actor)
-        .bind(access)
-        .fetch_one(self.pool())
-        .await
-        .expect("access_decision");
-        reason
+        let row = query(&hive_store::__predicate_sql_for_tests())
+            .bind(s.kind)
+            .bind(s.id)
+            .bind(None::<String>)
+            .bind(c.principal_kind)
+            .bind(c.principal)
+            .bind(c.actor)
+            .bind(access)
+            .bind(now())
+            .bind(None::<Uuid>)
+            .fetch_one(&*self.conn().await)
+            .await
+            .expect("access_decision");
+        row.get("reason")
     }
 }
 
@@ -311,9 +315,7 @@ impl World {
 /// Ported from `TestAbsenceIsDeny`.
 #[tokio::test]
 async fn absence_is_deny() {
-    let Some(w) = World::new("absence_is_deny").await else {
-        return;
-    };
+    let w = World::new("absence_is_deny").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let inst = w.install("journal", "user", alice, alice).await;
@@ -350,9 +352,7 @@ async fn absence_is_deny() {
 /// predicate that returned NULL for everything would pass absence_is_deny.
 #[tokio::test]
 async fn owner_reads_their_own_entity() {
-    let Some(w) = World::new("owner_reads_their_own_entity").await else {
-        return;
-    };
+    let w = World::new("owner_reads_their_own_entity").await;
     let alice = w.human("alice").await;
     let inst = w.install("journal", "user", alice, alice).await;
     let entry = Subject {
@@ -373,30 +373,32 @@ async fn owner_reads_their_own_entity() {
 }
 
 /// Ported from `TestConversationIsAGrantableSubject`: a conversation is a
-/// subject kind, resolved through subject_owner like every other, so the
+/// subject kind, resolved through `subject_owners` like every other, so the
 /// owner reads it and a stranger does not, with no new enforcement anywhere.
 #[tokio::test]
 async fn conversation_is_a_grantable_subject() {
-    let Some(w) = World::new("conversation_is_a_grantable_subject").await else {
-        return;
-    };
+    let w = World::new("conversation_is_a_grantable_subject").await;
     let alice = w.human("alice").await;
     let stranger = w.human("stranger").await;
-    let (conv,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO conversations (author_actor, owner_kind, owner_id, runtime)
-         VALUES ($1, 'user', $1, 'claude') RETURNING id",
+    let conv: Uuid = query(
+        "INSERT INTO conversations (id, author_actor, owner_kind, owner_id, runtime)
+         VALUES (?1, ?2, 'user', ?2, 'claude') RETURNING id",
     )
+    .bind(Uuid::new_v4())
     .bind(alice)
-    .fetch_one(w.pool())
+    .fetch_scalar(&*w.conn().await)
     .await
     .expect("insert conversation");
 
-    let (kind, id): (String, Uuid) =
-        sqlx::query_as("SELECT owner_kind, owner_id FROM subject_owner('conversation', $1)")
-            .bind(conv)
-            .fetch_one(w.pool())
-            .await
-            .expect("subject_owner resolves a conversation");
+    let row = query(
+        "SELECT owner_kind, owner_id FROM subject_owners
+          WHERE subject_kind = 'conversation' AND subject_id = ?1",
+    )
+    .bind(conv)
+    .fetch_one(&*w.conn().await)
+    .await
+    .expect("subject_owners resolves a conversation");
+    let (kind, id): (String, Uuid) = (row.get("owner_kind"), row.get("owner_id"));
     assert_eq!((kind.as_str(), id), ("user", alice));
 
     let subject = Subject {
@@ -417,24 +419,24 @@ async fn conversation_is_a_grantable_subject() {
     );
 }
 
-/// Ported from `TestConversationSubjectHasNoName`. Scoped through the table,
-/// not the constraint name alone: every schema in the shared database has one.
+/// Ported from `TestConversationSubjectHasNoName`. Read off the table's own
+/// definition in the catalogue, so a named-subject drift cannot be silent.
 #[tokio::test]
 async fn conversation_subject_has_no_name() {
-    let Some(w) = World::new("conversation_subject_has_no_name").await else {
-        return;
-    };
-    let (ok,): (bool,) = sqlx::query_as(
-        "SELECT pg_get_constraintdef(oid) LIKE '%conversation%'
-           FROM pg_constraint
-          WHERE conrelid = 'grants'::regclass AND conname = 'grants_named_subjects'",
-    )
-    .fetch_one(w.pool())
-    .await
-    .expect("read constraint");
+    let w = World::new("conversation_subject_has_no_name").await;
+    let ddl: String =
+        query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'grants'")
+            .fetch_scalar(&*w.conn().await)
+            .await
+            .expect("read table definition");
+    let clause = ddl
+        .split("grants_named_subjects")
+        .nth(1)
+        .and_then(|rest| rest.split("CONSTRAINT").next())
+        .unwrap_or_default();
     assert!(
-        ok,
-        "grants_named_subjects does not mention conversation; a named-subject drift would be silent"
+        clause.contains("'conversation'"),
+        "grants_named_subjects does not mention conversation; a named-subject drift would be silent: {clause}"
     );
 }
 
@@ -446,23 +448,22 @@ async fn conversation_subject_has_no_name() {
 /// one distinction invariant 2 exists to preserve.
 #[tokio::test]
 async fn org_member_cannot_mint_credentials_for_another_actor() {
-    let Some(w) = World::new("org_member_cannot_mint_credentials").await else {
-        return;
-    };
+    let w = World::new("org_member_cannot_mint_credentials").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let acme = w.org("acme", alice).await;
     w.member(acme, bob, "member", alice).await;
 
-    let forged = sqlx::query(
+    let forged = query(
         "INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256,
                                   issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
-         VALUES ($1, 'org', $2, repeat('a', 64), $3, 'org', $2)",
+         VALUES (?1, 'org', ?2, ?4, ?3, 'org', ?2)",
     )
     .bind(alice)
     .bind(acme)
     .bind(bob)
-    .execute(w.pool())
+    .bind("a".repeat(64))
+    .execute(&*w.conn().await)
     .await;
     assert!(
         forged.is_err(),
@@ -470,30 +471,31 @@ async fn org_member_cannot_mint_credentials_for_another_actor() {
     );
 
     // The admin branch is the intended route and still works.
-    sqlx::query(
+    query(
         "INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256,
                                   issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
-         VALUES ($1, 'org', $2, repeat('b', 64), $3, 'user', $3)",
+         VALUES (?1, 'org', ?2, ?4, ?3, 'user', ?3)",
     )
     .bind(bob)
     .bind(acme)
     .bind(alice)
-    .execute(w.pool())
+    .bind("b".repeat(64))
+    .execute(&*w.conn().await)
     .await
     .expect("an org admin could not issue for a member");
 
     // A person issues for themselves, and for an AI they own.
     let ava = w.ai("ava", "user", alice, alice).await;
     for (actor, token) in [(alice, 'c'), (ava, 'd')] {
-        sqlx::query(
+        query(
             "INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256,
                                       issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
-             VALUES ($1, 'user', $2, repeat($3, 64), $2, 'user', $2)",
+             VALUES (?1, 'user', ?2, ?3, ?2, 'user', ?2)",
         )
         .bind(actor)
         .bind(alice)
-        .bind(token.to_string())
-        .execute(w.pool())
+        .bind(token.to_string().repeat(64))
+        .execute(&*w.conn().await)
         .await
         .unwrap_or_else(|e| panic!("a person could not issue for {actor}: {e}"));
     }
@@ -505,9 +507,7 @@ async fn org_member_cannot_mint_credentials_for_another_actor() {
 /// INSERT trigger; every one of these used to succeed by going around it.
 #[tokio::test]
 async fn grants_cannot_be_rewritten_by_update() {
-    let Some(w) = World::new("grants_cannot_be_rewritten_by_update").await else {
-        return;
-    };
+    let w = World::new("grants_cannot_be_rewritten_by_update").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let carol = w.human("carol").await;
@@ -515,17 +515,17 @@ async fn grants_cannot_be_rewritten_by_update() {
     let inst = w.install("journal", "user", alice, alice).await;
     let entry = w.entity(inst, "entries", "e", "user", alice, alice).await;
 
-    let (grant,): (Uuid,) = sqlx::query_as(
+    let grant: Uuid = query(
         "INSERT INTO grants (subject_kind, subject_id, subject_name, target_kind, target_id, access, source,
                              inherited_from, granted_by_actor, granted_by_principal_kind, granted_by_principal_id,
                              reason, expires_at)
-         VALUES ('entity', $1, NULL, 'user', $2, 'read', 'direct', NULL, $3, 'user', $3, '', NULL)
+         VALUES ('entity', ?1, NULL, 'user', ?2, 'read', 'direct', NULL, ?3, 'user', ?3, '', NULL)
          RETURNING id",
     )
     .bind(entry)
     .bind(bob)
     .bind(alice)
-    .fetch_one(w.pool())
+    .fetch_scalar(&*w.conn().await)
     .await
     .expect("share");
     assert_eq!(
@@ -542,54 +542,63 @@ async fn grants_cannot_be_rewritten_by_update() {
         Some("grant")
     );
 
-    let attacks: Vec<(&str, &str, Vec<Uuid>)> = vec![
+    let tomorrow = now() + chrono::Duration::days(1);
+    let next_year = now() + chrono::Duration::days(365);
+    let attacks: Vec<(&str, &str, Vec<Value>)> = vec![
         (
             "retarget",
-            "UPDATE grants SET target_id = $2 WHERE id = $1",
-            vec![grant, carol],
+            "UPDATE grants SET target_id = ?2 WHERE id = ?1",
+            vec![grant.into_value(), carol.into_value()],
         ),
         (
             "widen",
-            "UPDATE grants SET access = 'write' WHERE id = $1",
-            vec![grant],
+            "UPDATE grants SET access = 'write' WHERE id = ?1",
+            vec![grant.into_value()],
         ),
         (
             "reattribute to an AI",
-            "UPDATE grants SET granted_by_actor = $2 WHERE id = $1",
-            vec![grant, ava],
+            "UPDATE grants SET granted_by_actor = ?2 WHERE id = ?1",
+            vec![grant.into_value(), ava.into_value()],
         ),
         (
             "promote to override",
-            "UPDATE grants SET source = 'override', expires_at = now() + interval '1 day' WHERE id = $1",
-            vec![grant],
+            "UPDATE grants SET source = 'override', expires_at = ?2 WHERE id = ?1",
+            vec![
+                grant.into_value(),
+                Value::Integer(hive_db::micros(tomorrow)),
+            ],
         ),
         (
             "move the subject",
-            "UPDATE grants SET subject_id = $2 WHERE id = $1",
-            vec![grant, Uuid::new_v4()],
+            "UPDATE grants SET subject_id = ?2 WHERE id = ?1",
+            vec![grant.into_value(), Uuid::new_v4().into_value()],
         ),
         (
             "extend the window",
-            "UPDATE grants SET expires_at = now() + interval '1 year' WHERE id = $1",
-            vec![grant],
+            "UPDATE grants SET expires_at = ?2 WHERE id = ?1",
+            vec![
+                grant.into_value(),
+                Value::Integer(hive_db::micros(next_year)),
+            ],
         ),
     ];
     for (name, sql, args) in attacks {
-        let mut q = sqlx::query(sql);
-        for a in &args {
+        let mut q = query(sql);
+        for a in args {
             q = q.bind(a);
         }
         assert!(
-            q.execute(w.pool()).await.is_err(),
+            q.execute(&*w.conn().await).await.is_err(),
             "{name} succeeded; the issue policy can be walked around by UPDATE"
         );
     }
 
     // Revocation is the one write a live grant accepts.
-    sqlx::query("UPDATE grants SET revoked_at = now(), revoked_by = $2 WHERE id = $1")
+    query("UPDATE grants SET revoked_at = ?3, revoked_by = ?2 WHERE id = ?1")
         .bind(grant)
         .bind(alice)
-        .execute(w.pool())
+        .bind(now())
+        .execute(&*w.conn().await)
         .await
         .expect("revocation was refused");
     assert!(
@@ -607,40 +616,45 @@ async fn grants_cannot_be_rewritten_by_update() {
     );
 }
 
+trait IntoValue {
+    fn into_value(self) -> Value;
+}
+impl IntoValue for Uuid {
+    fn into_value(self) -> Value {
+        Value::Text(self.to_string())
+    }
+}
+
 // --- invariant 4: the events table is the transport --------------------------
 
-/// The partition key is a local ingest time, and a row dated past the last
-/// partition would land in the default partition forever. The trigger refuses
+/// created_at is a local ingest time, and a row dated far into the future
+/// would sit ahead of every consumer's watermark forever. The trigger refuses
 /// anything more than an hour ahead of the server clock. (Go: the trigger's
 /// own tests in events_test.go; the tailer half of invariant 4 is hive-bus's.)
 #[tokio::test]
 async fn events_reject_a_timestamp_ahead_of_the_clock() {
-    let Some(w) = World::new("events_reject_future").await else {
-        return;
-    };
+    let w = World::new("events_reject_future").await;
     let alice = w.human("alice").await;
-    sqlx::query(
-        "SELECT ensure_events_partition((date_trunc('month', now() AT TIME ZONE 'UTC'))::date)",
-    )
-    .execute(w.pool())
-    .await
-    .expect("partition");
 
-    async fn insert_ahead(pool: &PgPool, actor: Uuid, offset: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    async fn insert_ahead(
+        c: &Connection,
+        actor: Uuid,
+        offset: chrono::Duration,
+    ) -> Result<(), hive_db::Error> {
+        query(
             "INSERT INTO events (created_at, kind, owner_kind, owner_id, author_actor, principal_kind, principal_id)
-             VALUES (now() + $2::interval, 'test.event', 'user', $1, $1, 'user', $1)",
+             VALUES (?2, 'test.event', 'user', ?1, ?1, 'user', ?1)",
         )
         .bind(actor)
-        .bind(offset)
-        .execute(pool)
+        .bind(now() + offset)
+        .execute(c)
         .await
         .map(|_| ())
     }
-    insert_ahead(w.pool(), alice, "30 minutes")
+    insert_ahead(&*w.conn().await, alice, chrono::Duration::minutes(30))
         .await
         .expect("half an hour ahead is inside the tolerance");
-    let err = insert_ahead(w.pool(), alice, "2 hours")
+    let err = insert_ahead(&*w.conn().await, alice, chrono::Duration::hours(2))
         .await
         .expect_err("two hours ahead was accepted");
     assert!(err.to_string().contains("more than an hour ahead"), "{err}");
@@ -650,45 +664,43 @@ async fn events_reject_a_timestamp_ahead_of_the_clock() {
 
 /// Migrating twice applies nothing the second time, and what it recorded is
 /// every embedded migration in order, with sha256 hex checksums. The expected
-/// list is the embedded one rather than a literal: the literal was a parity
-/// check against the Go migrator (D31 removed it), and hive-schema's own test
-/// keeps the embedded list honest against the directory.
+/// list is the embedded one rather than a literal, and hive-schema's own test
+/// keeps the embedded list honest against the directory. A bare file rather
+/// than `TestDb`, which migrates on its own.
 #[tokio::test]
 async fn migrate_is_idempotent_and_records_checksums() {
-    let Some(db) = TestDb::new("migrate_is_idempotent").await else {
-        return;
-    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = hive_db::Db::open(dir.path().join("hive.db")).await.unwrap();
     let expected: Vec<&str> = hive_store::MIGRATIONS.iter().map(|m| m.version).collect();
     assert!(
-        expected.len() >= 4,
+        !expected.is_empty(),
         "the embedded list lost entries: {expected:?}"
     );
-    let first = hive_store::migrate(db.pool()).await.expect("first migrate");
+    let first = hive_store::migrate(&db).await.expect("first migrate");
     assert_eq!(first, expected);
-    let second = hive_store::migrate(db.pool())
-        .await
-        .expect("second migrate");
+    let second = hive_store::migrate(&db).await.expect("second migrate");
     assert!(second.is_empty(), "second run applied {second:?}");
 
-    let rows: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT version, name, checksum FROM schema_migrations ORDER BY version")
-            .fetch_all(db.pool())
-            .await
-            .expect("read schema_migrations");
+    let rows = query("SELECT version, name, checksum FROM schema_migrations ORDER BY version")
+        .fetch_all(&db.conn().await.unwrap())
+        .await
+        .expect("read schema_migrations");
     assert_eq!(rows.len(), expected.len());
-    for (version, _, checksum) in &rows {
+    for row in &rows {
+        let version: String = row.get("version");
+        let checksum: String = row.get("checksum");
         let m = hive_store::MIGRATIONS
             .iter()
             .find(|m| m.version == version)
             .expect("known version");
-        assert_eq!(checksum, &m.checksum(), "{version}");
+        assert_eq!(checksum, m.checksum(), "{version}");
         assert!(checksum.len() == 64 && checksum.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
 
 // --- invariant 14 / D33: the collection key needs the asking install --------
 //
-// A `collection` subject resolves its owner through `subject_owner()`, which
+// A `collection` subject resolves its owner through `subject_owners`, which
 // for install-scoped kinds is the INSTALL's owner. So before D33 the
 // predicate's first branch ... "the principal owns the row" ... fired on the
 // owner of the install being read, and it never learned which install was
@@ -712,9 +724,7 @@ async fn migrate_is_idempotent_and_records_checksums() {
 /// all, which is failure shape 1.
 #[tokio::test]
 async fn an_owner_reaches_their_own_apps_collection() {
-    let Some(w) = World::new("an_owner_reaches_their_own_apps_collection").await else {
-        return;
-    };
+    let w = World::new("an_owner_reaches_their_own_apps_collection").await;
     let alice = w.human("alice").await;
     let journal = w.install("journal", "user", alice, alice).await;
     let subj = Subject {
@@ -756,10 +766,7 @@ async fn an_owner_reaches_their_own_apps_collection() {
 /// which the asking install could reach it.
 #[tokio::test]
 async fn owning_two_apps_is_not_a_reason_for_one_to_read_the_other() {
-    let Some(w) = World::new("owning_two_apps_is_not_a_reason_for_one_to_read_the_other").await
-    else {
-        return;
-    };
+    let w = World::new("owning_two_apps_is_not_a_reason_for_one_to_read_the_other").await;
     let alice = w.human("alice").await;
     let journal = w.install("journal", "user", alice, alice).await;
     let mail = w.install("mail", "user", alice, alice).await;
@@ -794,9 +801,7 @@ async fn owning_two_apps_is_not_a_reason_for_one_to_read_the_other() {
 /// make the whole feature unbuildable.
 #[tokio::test]
 async fn an_install_grant_opens_one_collection_and_no_other() {
-    let Some(w) = World::new("an_install_grant_opens_one_collection_and_no_other").await else {
-        return;
-    };
+    let w = World::new("an_install_grant_opens_one_collection_and_no_other").await;
     let alice = w.human("alice").await;
     let journal = w.install("journal", "user", alice, alice).await;
     let mail = w.install("mail", "user", alice, alice).await;
@@ -868,9 +873,7 @@ async fn an_install_grant_opens_one_collection_and_no_other() {
 /// in the file still passed. Single-site property, single catcher, checked.
 #[tokio::test]
 async fn an_install_grant_does_not_widen_past_the_principal() {
-    let Some(w) = World::new("an_install_grant_does_not_widen_past_the_principal").await else {
-        return;
-    };
+    let w = World::new("an_install_grant_does_not_widen_past_the_principal").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     // Alice owns the journal. Bob owns the mail app, and it runs for bob.
@@ -905,14 +908,12 @@ async fn an_install_grant_does_not_widen_past_the_principal() {
 /// This is the property the whole `install_grant` reason exists to enable: a
 /// person can shut one app out of one collection without touching their own
 /// access. Nothing tested it, and the clauses that implement it
-/// (`revoked_at IS NULL`, `expires_at > now()`) were carried over from the
+/// (`revoked_at IS NULL`, `expires_at > now`) were carried over from the
 /// principal branches by hand, which is exactly the kind of copy that is right
 /// until it is not.
 #[tokio::test]
 async fn a_revoked_or_expired_install_grant_shuts_the_door() {
-    let Some(w) = World::new("a_revoked_or_expired_install_grant_shuts_the_door").await else {
-        return;
-    };
+    let w = World::new("a_revoked_or_expired_install_grant_shuts_the_door").await;
     let alice = w.human("alice").await;
     let journal = w.install("journal", "user", alice, alice).await;
     let mail = w.install("mail", "user", alice, alice).await;
@@ -951,82 +952,77 @@ async fn a_revoked_or_expired_install_grant_shuts_the_door() {
     );
 }
 
-/// The composable form refuses to answer a collection question with no acting
+/// The point check refuses to answer a collection question with no acting
 /// install, rather than answering it the fail-open way (D33).
 ///
-/// `access_reason` keeps a NULL default so the three callers written before
-/// D33 resolve unchanged, and that default is the permissive direction for a
-/// collection. Only `visible_events` passes a subject kind it did not write
-/// literally, and the events CHECK permits 'collection', so this raises for
-/// nobody today and raises for whoever writes the first such event.
+/// On Postgres this was a RAISE in the composable SQL form. The predicate is
+/// now a text `Guard` composes, and SQL cannot tell a forgotten argument from
+/// an absent one, so the refusal lives in `Guard::authorize`: the only
+/// signature that can decide a collection is the one that names the asking
+/// install, and the person-with-no-install case has its own name.
 #[tokio::test]
-async fn the_composable_form_will_not_decide_a_collection_blind() {
-    let Some(w) = World::new("the_composable_form_will_not_decide_a_collection_blind").await else {
-        return;
-    };
+async fn the_point_check_will_not_decide_a_collection_blind() {
+    let w = World::new("the_point_check_will_not_decide_a_collection_blind").await;
     let alice = w.human("alice").await;
     let journal = w.install("journal", "user", alice, alice).await;
+    let store = hive_store::Store::from_dbs(w.db.db().clone(), w.db.audit().clone());
+    let c = hive_store::Credential::new(alice, hive_store::PrincipalKind::User, alice);
+    let subj = hive_store::Subject::collection(journal, "contacts");
+    let conn = w.conn().await;
 
-    let err = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT access_reason('collection', $1, 'contacts', 'user', $2, $2, 'read', now())",
-    )
-    .bind(journal)
-    .bind(alice)
-    .fetch_one(w.pool())
-    .await
-    .expect_err("the 8-argument form answered a collection question");
+    let err = store
+        .guard()
+        .authorize(&conn, &c, &subj, hive_store::Access::Read, "")
+        .await
+        .expect_err("the plain form answered a collection question");
     assert!(
-        format!("{err}").contains("without an acting install"),
-        "raised for the wrong reason: {err}"
+        format!("{err}").contains("acting install"),
+        "refused for the wrong reason: {err}"
     );
 
-    // And the explicit form still answers, so the refusal above is about the
+    // And the explicit forms still answer, so the refusal above is about the
     // missing dimension rather than about collections being unanswerable.
-    let ok: Option<String> = sqlx::query_scalar(
-        "SELECT access_reason('collection', $1, 'contacts', 'user', $2, $2, 'read', now(), $1)",
-    )
-    .bind(journal)
-    .bind(alice)
-    .fetch_one(w.pool())
-    .await
-    .expect("the 9-argument form should answer");
-    assert_eq!(ok.as_deref(), Some("owner"));
+    let ok = store
+        .guard()
+        .authorize_collection_as_person(&conn, &c, &subj, hive_store::Access::Read, "")
+        .await
+        .expect("the person form should answer");
+    assert_eq!(ok, hive_store::Reason::Owner);
 }
 
 /// The events CHECK refuses a collection-subject row, in front of the writer.
 ///
-/// This is the guard; the `RAISE` in `access_reason` is the backstop, and the
-/// distinction is about blast radius rather than belt-and-braces for its own
-/// sake. `visible_events` calls `access_reason` inside a set read over
-/// `events`, so a RAISE there aborts the whole statement instead of skipping
-/// one row: a single bad row would break the event feed for every reader until
-/// someone found it, and the person seeing the error would not be the person
-/// who caused it. The CHECK fails the one INSERT that is wrong, at the moment
-/// it is wrong.
+/// This is the one guard. `visible_events` embeds the predicate inside a set
+/// read over `events`, and the predicate cannot decide a collection without
+/// an acting install; the CHECK is what makes it safe for the feed to assume
+/// the question never arises, and it fails the one INSERT that is wrong, at
+/// the moment it is wrong, rather than breaking the feed for every reader.
 #[tokio::test]
 async fn a_collection_subject_event_is_refused_at_the_insert() {
-    let Some(w) = World::new("a_collection_subject_event_is_refused_at_the_insert").await else {
-        return;
-    };
+    let w = World::new("a_collection_subject_event_is_refused_at_the_insert").await;
     let alice = w.human("alice").await;
     let inst = w.install("journal", "user", alice, alice).await;
 
     let insert = |kind: &'static str| {
-        sqlx::query(
-            "INSERT INTO events (kind, subject_kind, subject_id, subject_name,
-                                 owner_kind, owner_id, author_actor,
-                                 principal_kind, principal_id, body)
-             VALUES ('app.journal.touched', $1, $2, $3, 'user', $4, $4, 'user', $4, '{}'::jsonb)",
-        )
-        .bind(kind)
-        .bind(inst)
-        .bind(if kind == "collection" {
-            Some("entries")
-        } else {
-            None
-        })
-        .bind(alice)
-        .execute(w.pool())
+        let w = &w;
+        async move {
+            query(
+                "INSERT INTO events (kind, subject_kind, subject_id, subject_name,
+                                     owner_kind, owner_id, author_actor,
+                                     principal_kind, principal_id, body)
+                 VALUES ('app.journal.touched', ?1, ?2, ?3, 'user', ?4, ?4, 'user', ?4, '{}')",
+            )
+            .bind(kind)
+            .bind(inst)
+            .bind(if kind == "collection" {
+                Some("entries")
+            } else {
+                None
+            })
+            .bind(alice)
+            .execute(&*w.conn().await)
+            .await
+        }
     };
 
     let err = insert("collection")

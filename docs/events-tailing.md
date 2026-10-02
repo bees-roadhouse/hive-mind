@@ -1,51 +1,73 @@
 # Tailing the events table
 
-Read this before writing anything that consumes `events`. Migration one made a
-choice that changes the shape of the cursor, and getting it wrong produces a bug
-that only shows up under load or after a few months of partitions.
+Read this before writing anything that consumes `events`. The cursor has a
+shape, the shape has reasons, and getting it wrong produces a bug that only
+shows up under load or when a second writer arrives.
 
 ## The rules that do not change
 
-From D4 (Hallie's findings), unchanged by partitioning:
+From D4 (Hallie's findings), unchanged by the engine (D38):
 
 1. **The events table is the transport. NOTIFY is a wakeup bell carrying an id.**
    Every consumer must stay correct if every notification is dropped.
-2. **Never tail with a naive `WHERE id > last`.** `bigserial` ids are assigned
-   before commit, so an id assigned early and committed late is permanently
-   skipped. Use an overlap window and dedupe by id.
-3. **Backstop poll every 5 to 30 seconds** regardless of connection health. That
-   is what turns a missed notification into a latency event rather than a
+2. **Never tail with a naive `WHERE id > last`.** Ids are assigned before
+   commit, so an id assigned early and committed late is permanently skipped.
+   Use an overlap window and dedupe by id.
+3. **Backstop poll every 5 to 30 seconds** regardless of whether anything rang.
+   That is what turns a missed ring into a latency event rather than a
    correctness event.
 
-## What partitioning changed
+## What the engine changed
 
-`events` is `PARTITION BY RANGE (created_at)`, monthly, because retention is
-"keep" and growth has to stay an operational non-event. Two consequences:
+The store is one SQLite file per daemon (D38). Three consequences, and one
+thing that deliberately did not change.
 
-### The cursor is `(created_at, id)`, not `id`
+### The bell is in-process
 
-A partitioned table has no global index on `id` alone. There is a *local* index
-on each partition, so `WHERE id > $1 ORDER BY id` still works, but it probes
-every partition on every poll and that cost grows forever. After two years that
-is twenty-four index probes per tailer per poll, for one row.
+`hive_store::event_wake()` is a process-wide `Notify`; `append_events` rings
+it once per call after the commit, and the bus's listener task forwards each
+ring to the tail loop. There is no connection to lose and nothing to
+reconnect, so the old rule about never listening on a pooled connection has
+nothing to apply to.
 
-Carry both halves of the cursor and bound the time range:
+What it means for a writer **outside** the daemon's process: it cannot ring
+the bell at all. Its rows arrive by the backstop poll, within one poll
+interval. The e2e suite writes events that way on purpose, because that is
+rule 1 stated the hard way.
+
+### One writer at a time
+
+Every write transaction is `BEGIN IMMEDIATE`, and the engine admits one. A
+second writer waits for the first to finish before its `INSERT` runs, so its
+id is assigned after the first one commits. **A lower id cannot commit late
+today.** `crates/hive-bus/tests/bus.rs` proves the ordering rather than
+arranging the hazard it rules out.
+
+The overlap window and the dedupe set stay anyway. Phase 2 of D38 gives each
+owner a file and the daemon `ATTACH`es them, and a second process on a file
+is a second writer; the sweep costs one indexed read per cycle and the day it
+earns its keep is not a day anyone will be reading this.
+
+### The cursor is still `(created_at, id)`
+
+Not because the table is partitioned (it is not, any more) but because the
+two halves answer different questions: `created_at` bounds the sweep in time,
+`id` breaks ties and is the only thing guaranteed unique. Both are indexed
+together (`events_cursor_idx`). Carry both halves:
 
 ```sql
 SELECT id, created_at, kind, body
   FROM events
- WHERE created_at >= $1::timestamptz - interval '5 seconds'   -- overlap window
-   AND (created_at, id) > ($1, $2)
+ WHERE created_at >= ?1 - 5000000        -- overlap window, in microseconds
+   AND (created_at > ?1 OR (created_at = ?1 AND id > ?2))
  ORDER BY created_at, id
  LIMIT 500;
 ```
 
-The time bound is what prunes to one or two partitions. The overlap window is
-rule 2 above, and it is still required: **partitioning does not fix the id gap,
-and it does not fix the timestamp gap either.** `created_at` defaults to
-`clock_timestamp()` rather than `now()` precisely so a long transaction does not
-file rows under its start time, but a row is still only *visible* at commit, so
-a consumer that advanced past a timestamp can miss a row bearing it.
+Timestamps are integer microseconds since the epoch, assigned by the engine's
+clock at the `INSERT` (`created_at` defaults to it), and the tailer reads the
+same clock once per cycle through `hive_store::now` so that "five seconds ago"
+is five seconds of the store's time and never the host's.
 
 Dedupe by `id` after the overlap re-read. Handlers must be idempotent anyway.
 
@@ -60,47 +82,27 @@ id: 1736899200123456-4711
 
 that is `<created_at as microseconds since epoch>-<id>`. A client never parses
 it; it hands it back verbatim and the host splits it. A host that receives a
-bare integer (an old client, or a hand-written curl) should fall back to
-resolving the timestamp with one lookup:
-
-```sql
-SELECT created_at FROM events WHERE id = $1;
-```
-
-That is one all-partition probe per connect, which is fine. One per poll is not.
+bare integer (an old client, or a hand-written curl) resolves the timestamp
+with one lookup on connect (`hive_store::resolve_cursor`), never per poll.
 
 **Replay filters with CURRENT permissions**, never permissions as of the event
-(D4.13). Use `access_reason()` like any other read; a revoked grant must not be
+(D4.13). Use the predicate like any other read; a revoked grant must not be
 replayed around.
 
-## Partitions are created ahead of time
+## Retention
 
-`store.EnsureEventPartitions(ctx, db, monthsAhead)` creates the current month
-plus N ahead. Call it at boot and on a daily timer.
-
-There is also a `DEFAULT` partition, because an append-only table that rejects
-an insert because nobody made next month's partition is an outage. It should
-stay empty. **Rows that land in the default partition cannot be pruned by
-dropping a partition later**, and attaching a partition covering their range
-requires moving them first, so treat a non-empty default partition as an alert
-rather than as a working state:
-
-```sql
-SELECT count(*) FROM events_default;
-```
+The table is append-only and there are no partitions to drop. Retention is
+"keep" today; the day it is not, the pruning is a `DELETE ... WHERE created_at
+< ?` under the same write lock as everything else, and the cursor's time half
+is what makes that cheap.
 
 ## `(origin, origin_id)` uniqueness lives in a side table
 
 D4.12 asks for a unique constraint on `(origin, origin_id)` from migration one,
-so cross-hive bridging can dedupe later. A `UNIQUE` constraint on a partitioned
-table **must include the partition key**, which would make it unique per month
-and useless for that purpose.
-
-So `event_origins (origin, origin_id) PRIMARY KEY` carries the real constraint,
-written by an `AFTER INSERT` trigger on `events`, and only for rows where
-`origin_id IS NOT NULL`. Locally produced events leave it NULL and cost nothing.
-A duplicate bridged event raises a unique violation on insert, which is the
-behaviour D4.12 wanted.
-
-Do not add a `UNIQUE (created_at, origin, origin_id)` to `events` believing it
-does the same thing. It does not.
+so cross-hive bridging can dedupe later. `event_origins (origin, origin_id)
+PRIMARY KEY` carries it, written by an `AFTER INSERT` trigger on `events` only
+for rows where `origin_id IS NOT NULL`. Locally produced events leave it NULL
+and cost nothing; a duplicate bridged event raises a unique violation on
+insert, which is the behaviour D4.12 wanted. The side table outlived the
+partitions that first required it because it also records which event a
+bridged id landed as, which a bare index would not.

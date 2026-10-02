@@ -33,19 +33,21 @@ The daemon starts itself. There is no prep step, no port to remember, and no
 process when the worker ends, and a failed test gets the daemon's own log
 attached to its report.
 
-Postgres **is** wired in here, as of `/events`. The daemon serves its event
-stream off the database, so the browser specs need one; set
-`HIVE_SANDBOX_TEST_DATABASE_URL` the same way the Rust tests do.
+The store is wired in here, as of `/events`. The daemon serves its event
+stream off its SQLite files (D38), and nothing has to be running first: each
+worker gets its own store directory, created before the daemon starts and
+deleted when the worker ends, and the daemon migrates into it. That isolation
+is not tidiness: these specs assert on what a stream did **not** deliver, and
+one stray event from another worker would look exactly like a broken
+visibility filter.
 
-Each worker gets its own schema, created before the daemon starts and dropped
-when the worker ends, and the daemon migrates into it. That isolation is not
-tidiness: these specs assert on what a stream did **not** deliver, and one stray
-event from another worker would look exactly like a broken visibility filter.
-
-Events are written straight to Postgres by the spec rather than through the
-daemon. The design claim is that the events table is the transport and NOTIFY is
-only a wakeup bell, so a test that publishes through the daemon proves the
-daemon can talk to itself and nothing more.
+Events are written straight to the store file by the spec (`node:sqlite`, so
+no native module to build) rather than through the daemon. The design claim
+is that the events table is the transport and NOTIFY is only a wakeup bell,
+so a test that publishes through the daemon proves the daemon can talk to
+itself and nothing more. A writer in another process cannot ring the daemon's
+in-process bell, so everything these specs append arrives by the backstop
+poll, which is the claim stated the hard way.
 
 ## Writing an SSE spec
 

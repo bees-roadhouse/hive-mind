@@ -2,16 +2,15 @@
 # The born-green gate. Run before pushing; read the OUTPUT, never the exit code
 # of a piped command.
 #
-#   export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
 #   ./scripts/gate-rust.sh
 #
 # fmt, clippy, build, test, and a NAMED list of every test that skipped, because
 # a skip is a test saying it is not answering the question and that only helps
 # if somebody hears it.
 #
-# The database line is not optional and the gate refuses without it. It used to
-# be a suggestion, and the result was every Postgres-backed test in the repo
-# skipping itself while the gate printed GATE GREEN in about the same wall time.
+# Nothing has to be running first. The store is SQLite (D38) and every
+# database test makes its own files under the temp directory; the tiers that
+# still need a backend (Podman, Garage, chromium) skip by name without one.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,12 +22,6 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "cargo not found. rustup.rs installs it; rust-toolchain.toml pins the version." >&2
   exit 1
 fi
-if [ -z "${HIVE_SANDBOX_TEST_DATABASE_URL:-}" ]; then
-  echo "refusing to run: HIVE_SANDBOX_TEST_DATABASE_URL is unset." >&2
-  echo "  export HIVE_SANDBOX_TEST_DATABASE_URL=\"\$(./scripts/db-up.sh --quiet)\"" >&2
-  exit 1
-fi
-
 failed=()
 step() {
   local name=$1; shift

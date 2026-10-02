@@ -1,8 +1,9 @@
+#![cfg(unix)]
 //! MCP is reachable over the unix socket, not only the port (invariant 13). A
 //! harness container runs `--network=none` with the socket bind-mounted, so a
 //! tool call from inside a run has exactly this way in.
 //!
-//! Needs a database, because the endpoint authenticates like every other; the
+//! Needs a store, because the endpoint authenticates like every other; the
 //! MCP server behind it is a fake with no tools, since what is under test is
 //! the transport.
 
@@ -69,11 +70,8 @@ async fn post_over_socket(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_answers_over_the_unix_socket() {
-    let Some(db) = TestDb::new("mcp_over_socket").await else {
-        return;
-    };
-    hive_store::migrate(db.pool()).await.expect("migrate");
-    let store = Store::from_pool(db.pool().clone());
+    let db = TestDb::new("mcp_over_socket").await;
+    let store = Store::from_dbs(db.db().clone(), db.audit().clone());
     let res = store
         .bootstrap_in_tx(&BootstrapConfig {
             root_handle: "root".into(),
@@ -84,8 +82,8 @@ async fn mcp_answers_over_the_unix_socket() {
         .expect("bootstrap");
     let token = format!("root-token-{}", Uuid::new_v4());
     {
-        let mut conn = store.conn().await.unwrap();
-        hive_store::ensure_bootstrap_credential(&mut conn, res.root_actor_id, &token)
+        let conn = store.conn().await.unwrap();
+        hive_store::ensure_bootstrap_credential(&conn, res.root_actor_id, &token)
             .await
             .expect("bootstrap credential");
     }

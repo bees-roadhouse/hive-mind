@@ -13,7 +13,7 @@ workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
-sqlx.workspace = true
+hive-db = { path = "../hive-db" }
 uuid.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
@@ -21,7 +21,6 @@ thiserror.workspace = true
 tracing.workspace = true
 axum.workspace = true
 http.workspace = true
-rand.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
 hive-identity = { path = "../hive-identity" }

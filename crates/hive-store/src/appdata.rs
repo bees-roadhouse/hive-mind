@@ -2,7 +2,7 @@
 //!
 //! Guests never see SQL, so this is where "may this actor touch this row" is
 //! actually decided, and it decides it exactly one way: through the guard,
-//! which runs `access_decision()`. No query here composes its own filter.
+//! which runs the predicate. No query here composes its own filter.
 //!
 //! One call is one transaction, which is what lets a write fan out into the
 //! document, its entity row and its event without a window where an event names
@@ -30,17 +30,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hive_blob::{Catalog, Hash, RefSpec, SourceKind};
+use hive_db::{Connection, Row, Transaction, query};
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_trust::Level;
 use hive_wasmhost::{HostError, Request, Response, Storage};
 use serde::{Deserialize, Serialize};
-use sqlx::{Executor, PgConnection, Postgres, Row};
 use uuid::Uuid;
 
-use crate::appschema::{check_ident, quote_ident};
+use crate::appschema::{check_ident, table_name};
 use crate::docblobs::descriptors_in;
 use crate::events::{Event, append_events};
 use crate::grants::{Access, ActingInstall, Reason, Subject};
+use crate::predicate::{self, Args};
 use crate::{Result, Store, StoreError};
 
 /// The host-mediated data layer over a store and a blob catalog.
@@ -66,7 +67,7 @@ struct DocRequest {
     r#ref: String,
     kind: String,
     doc: Option<serde_json::Value>,
-    /// A JSONB containment filter: `{"status":"open"}` finds documents whose
+    /// A JSON containment filter: `{"status":"open"}` finds documents whose
     /// doc contains that. Containment rather than an expression language on
     /// purpose ... an expression a guest composes is both an injection surface
     /// and a place for a second access policy to grow.
@@ -110,19 +111,14 @@ pub struct InstallInfo {
 /// check exists at all: promoting a build is a distinct human act, and a staged
 /// install already has a row, a schema name and real tables. An unpromoted build
 /// that reached a guest invocation would simply run.
-pub async fn resolve_active_install<'e, E>(db: E, install_id: Uuid) -> Result<InstallInfo>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let row = sqlx::query(
+pub async fn resolve_active_install(db: &Connection, install_id: Uuid) -> Result<InstallInfo> {
+    let row = query(
         "SELECT i.id, i.slug, i.schema_name, i.owner_kind, i.owner_id, i.state,
-                coalesce(
-                    (SELECT array_agg(c->>'name')
-                       FROM jsonb_array_elements(b.manifest->'storage'->'collections') AS c),
-                    ARRAY[]::text[]) AS collections
+                (SELECT json_group_array(json_extract(c.value, '$.name'))
+                   FROM json_each(b.manifest, '$.storage.collections') AS c) AS collections
            FROM installs i
            JOIN app_builds b ON b.id = i.build_id
-          WHERE i.id = $1",
+          WHERE i.id = ?1",
     )
     .bind(install_id)
     .fetch_optional(db)
@@ -140,6 +136,15 @@ where
         ))));
     }
     let owner_kind: String = row.get("owner_kind");
+    let collections: serde_json::Value = row.get("collections");
+    let collections = collections
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(InstallInfo {
         id: row.get("id"),
         slug: row.get("slug"),
@@ -149,7 +154,7 @@ where
                 .ok_or_else(|| StoreError::Other(format!("owner kind {owner_kind:?}")))?,
             row.get("owner_id"),
         ),
-        collections: row.get::<Vec<String>, _>("collections"),
+        collections,
     })
 }
 
@@ -231,7 +236,7 @@ impl<'a> QualifiedName<'a> {
             Some((app, collection)) => (Some(app), collection),
         };
         if let Some(app) = app {
-            // The qualifier reaches DDL as a schema lookup, never as SQL, but
+            // The qualifier reaches DDL as a table lookup, never as SQL, but
             // it is held to the same identifier rule as everything else so
             // there is one answer to "what may a name contain".
             check_ident(app).map_err(|_| invalid("app qualifier"))?;
@@ -277,10 +282,6 @@ impl DocRequest {
     }
 }
 
-fn table(schema: &str, collection: &str) -> String {
-    format!("{}.{}", quote_ident(schema), quote_ident(collection))
-}
-
 /// The trust a write lands as, and it only ever moves one way.
 ///
 /// The invocation's taint is one floor: a write made after an untrusted read is
@@ -296,11 +297,8 @@ fn nullable(s: &str) -> Option<&str> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-async fn resolve(
-    conn: &mut PgConnection,
-    install_id: Uuid,
-) -> Result<(InstallInfo, HashSet<String>)> {
-    let info = resolve_active_install(&mut *conn, install_id).await?;
+async fn resolve(conn: &Connection, install_id: Uuid) -> Result<(InstallInfo, HashSet<String>)> {
+    let info = resolve_active_install(conn, install_id).await?;
     let declared: HashSet<String> = info.collections.iter().cloned().collect();
     Ok((info, declared))
 }
@@ -315,10 +313,10 @@ async fn resolve(
 /// but because the syntax has nowhere to put it (invariant 11).
 ///
 /// The install is looked up by `(slug, owner)`, both dimensions, because a slug
-/// alone is not a key: two people can install the same app and the schema is a
-/// property of the install (invariant 14, the fifth instance).
+/// alone is not a key: two people can install the same app and the tables are
+/// a property of the install (invariant 14, the fifth instance).
 async fn resolve_target(
-    conn: &mut PgConnection,
+    conn: &Connection,
     caller: &InstallInfo,
     cred: &Credential,
     raw: &str,
@@ -334,24 +332,24 @@ async fn resolve_target(
 
     let owner = cred.owner_of();
     let slug = if app == CORE_APP { CORE_APP } else { app };
-    let row: Option<(Uuid,)> = sqlx::query_as(
+    let target_id: Option<Uuid> = query(
         "SELECT id FROM installs
-          WHERE slug = $1 AND owner_kind = $2 AND owner_id = $3 AND state = 'active'",
+          WHERE slug = ?1 AND owner_kind = ?2 AND owner_id = ?3 AND state = 'active'",
     )
     .bind(slug)
     .bind(owner.kind.as_str())
     .bind(owner.id)
-    .fetch_optional(&mut *conn)
+    .fetch_scalar_optional(conn)
     .await
     .map_err(|e| StoreError::db("resolve target install", e))?;
 
     // Not-there and not-yours are one answer. A guest that could tell them
     // apart could enumerate which apps a principal has installed.
-    let (target_id,) = row.ok_or_else(|| {
+    let target_id = target_id.ok_or_else(|| {
         StoreError::Host(HostError::not_found(format!("no active app {app:?} here")))
     })?;
 
-    let info = resolve_active_install(&mut *conn, target_id).await?;
+    let info = resolve_active_install(conn, target_id).await?;
     // A qualified name that resolves back to the caller's own install is not
     // cross-install ... `journal/entries` written by the journal is the same
     // thing as `entries`, and must not need a grant to itself.
@@ -379,7 +377,7 @@ impl Target {
     }
 
     fn table(&self) -> String {
-        table(&self.info.schema, &self.collection)
+        table_name(&self.info.schema, &self.collection)
     }
 
     /// D33's dimension. Not an `Option`, and that is the point rather than an
@@ -392,6 +390,36 @@ impl Target {
     }
 }
 
+/// JSON containment, the rule Postgres's `@>` applied and the one the guest
+/// API promises: every key of `needle` is present in `hay` with a value that
+/// itself contains the needle's; an array contains another when every element
+/// of the needle is contained by some element of the hay; scalars match by
+/// equality. Decided in the host because the engine has no containment
+/// operator, and decided exactly, because a filter a guest cannot predict is
+/// a filter a guest works around.
+fn contains(hay: &serde_json::Value, needle: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (hay, needle) {
+        (Value::Object(h), Value::Object(n)) => n
+            .iter()
+            .all(|(k, nv)| h.get(k).is_some_and(|hv| contains(hv, nv))),
+        (Value::Array(h), Value::Array(n)) => {
+            n.iter().all(|nv| h.iter().any(|hv| contains(hv, nv)))
+        }
+        // Postgres also lets a scalar needle match an array containing it.
+        (Value::Array(h), scalar) if !scalar.is_object() && !scalar.is_array() => {
+            h.iter().any(|hv| hv == scalar)
+        }
+        (a, b) => a == b,
+    }
+}
+
+/// How many rows one page of the query path reads before filtering. The
+/// containment filter runs in the host, so a page is read a batch at a time
+/// until `limit` matches are found; the batch is sized so a filter that
+/// matches most rows costs one read and one that matches few costs a few.
+const QUERY_BATCH: i64 = 200;
+
 impl AppData {
     /// Wires the data layer over a store and a catalog.
     pub fn new(store: Store, blobs: Arc<Catalog>) -> AppData {
@@ -399,10 +427,10 @@ impl AppData {
     }
 
     async fn insert_inner(&self, req: &Request) -> Result<Response> {
-        let mut tx = self.store.begin().await?;
-        let (info, _) = resolve(&mut tx, req.caller.install_id).await?;
+        let tx = self.store.begin().await?;
+        let (info, _) = resolve(&tx, req.caller.install_id).await?;
         let d = parse(req)?;
-        let target = resolve_target(&mut tx, &info, &req.caller.cred, &d.collection).await?;
+        let target = resolve_target(&tx, &info, &req.caller.cred, &d.collection).await?;
         target.declared()?;
 
         // Writing into a collection is a write on the collection, and the
@@ -412,7 +440,7 @@ impl AppData {
         let guard = self.store.guard();
         guard
             .authorize_collection(
-                &mut tx,
+                &tx,
                 &req.caller.cred,
                 &Subject::collection(target.info.id, &target.collection),
                 // The invocation IS an install, always: this signature has no
@@ -440,15 +468,18 @@ impl AppData {
         // right.
         let level = write_trust(Level::Trusted, req.trust);
         let owner = req.caller.cred.owner_of();
+        let id = Uuid::new_v4();
+        let created = hive_db::now();
 
-        let row = sqlx::query(
-            "INSERT INTO entities (kind, install_id, collection, ref,
-                                   owner_kind, owner_id, author_actor, trust, tainted_by)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-             RETURNING id, created_at",
+        query(
+            "INSERT INTO entities (id, kind, install_id, collection, ref,
+                                   owner_kind, owner_id, author_actor, trust, tainted_by,
+                                   created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
         )
+        .bind(id)
         .bind(&kind)
-        // The entity row belongs to the install whose schema holds the
+        // The entity row belongs to the install whose tables hold the
         // document, or the UNIQUE (install_id, collection, ref) that keeps refs
         // distinct would be keyed on the wrong install and read_doc's join
         // would miss (invariant 14).
@@ -460,14 +491,13 @@ impl AppData {
         .bind(req.caller.cred.actor_id)
         .bind(level.as_str())
         .bind(nullable(&req.tainted_by))
-        .fetch_one(&mut *tx)
+        .bind(created)
+        .execute(&tx)
         .await
         .map_err(|e| StoreError::db("insert entity", e))?;
-        let id: Uuid = row.get("id");
-        let created: DateTime<Utc> = row.get("created_at");
 
-        sqlx::query(&format!(
-            "INSERT INTO {} (id, doc, trust, tainted_by, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$5)",
+        query(&format!(
+            "INSERT INTO {} (id, doc, trust, tainted_by, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?5)",
             target.table()
         ))
         .bind(id)
@@ -475,7 +505,7 @@ impl AppData {
         .bind(level.as_str())
         .bind(nullable(&req.tainted_by))
         .bind(created)
-        .execute(&mut *tx)
+        .execute(&tx)
         .await
         .map_err(|e| StoreError::db("insert document", e))?;
 
@@ -484,10 +514,9 @@ impl AppData {
         // where a sweep can collect the bytes it points at.
         let doc_bytes = serde_json::to_vec(&doc).unwrap_or_default();
         let named = descriptors_in(&doc_bytes)?;
-        self.link_descriptors(&mut tx, req, id, &named, level)
-            .await?;
+        self.link_descriptors(&tx, req, id, &named, level).await?;
         self.emit(
-            &mut tx,
+            &tx,
             req,
             &target.info,
             &target.collection,
@@ -498,9 +527,7 @@ impl AppData {
         )
         .await?;
 
-        tx.commit()
-            .await
-            .map_err(|e| StoreError::db("commit insert", e))?;
+        crate::commit(tx, "insert").await?;
         // The RESULT is host-generated, so it is trusted whatever the document
         // is. The document's own trust is on its row and comes back on a read.
         Ok(Response::trusted(serde_json::to_vec(&serde_json::json!({
@@ -509,10 +536,10 @@ impl AppData {
     }
 
     async fn get_inner(&self, req: &Request) -> Result<Response> {
-        let mut conn = self.store.conn().await?;
-        let (info, _) = resolve(&mut conn, req.caller.install_id).await?;
+        let conn = self.store.conn().await?;
+        let (info, _) = resolve(&conn, req.caller.install_id).await?;
         let d = parse(req)?;
-        let target = resolve_target(&mut conn, &info, &req.caller.cred, &d.collection).await?;
+        let target = resolve_target(&conn, &info, &req.caller.cred, &d.collection).await?;
         target.declared()?;
 
         // D33, and ONLY when the collection belongs to another install. It is
@@ -529,7 +556,7 @@ impl AppData {
             self.store
                 .guard()
                 .authorize_collection(
-                    &mut conn,
+                    &conn,
                     &req.caller.cred,
                     &Subject::collection(target.info.id, &target.collection),
                     Target::acting(&info),
@@ -543,13 +570,13 @@ impl AppData {
         let id = if !d.id.is_empty() {
             d.doc_id()?
         } else if !d.r#ref.is_empty() {
-            let id: Option<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM entities WHERE install_id = $1 AND collection = $2 AND ref = $3 AND deleted_at IS NULL",
+            let id: Option<Uuid> = query(
+                "SELECT id FROM entities WHERE install_id = ?1 AND collection = ?2 AND ref = ?3 AND deleted_at IS NULL",
             )
             .bind(target.info.id)
             .bind(&target.collection)
             .bind(&d.r#ref)
-            .fetch_optional(&mut *conn)
+            .fetch_scalar_optional(&conn)
             .await
             .map_err(|e| StoreError::db("resolve ref", e))?;
             // Same status as "you may not see it": telling them apart is an
@@ -564,7 +591,7 @@ impl AppData {
         self.store
             .guard()
             .authorize(
-                &mut conn,
+                &conn,
                 &req.caller.cred,
                 &Subject::entity(id),
                 Access::Read,
@@ -574,7 +601,7 @@ impl AppData {
             .map_err(|e| StoreError::Host(host_error(e, true)))?;
 
         let row = self
-            .read_doc(&mut conn, &target.info, &target.collection, id)
+            .read_doc(&conn, &target.info, &target.collection, id)
             .await?;
         // The response's trust is the ROW's, never the request's. "The caller
         // asked for trusted data, so return Trusted" reads as reasonable and is
@@ -584,20 +611,20 @@ impl AppData {
 
     async fn read_doc(
         &self,
-        conn: &mut PgConnection,
+        conn: &Connection,
         info: &InstallInfo,
         collection: &str,
         id: Uuid,
     ) -> Result<DocRow> {
-        let row = sqlx::query(&format!(
+        let row = query(&format!(
             "SELECT t.id, e.ref, e.kind, t.doc, t.trust, t.tainted_by, t.created_at, t.updated_at
                FROM {} t
                JOIN entities e ON e.id = t.id
-              WHERE t.id = $1 AND e.deleted_at IS NULL",
-            table(&info.schema, collection)
+              WHERE t.id = ?1 AND e.deleted_at IS NULL",
+            table_name(&info.schema, collection)
         ))
         .bind(id)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn)
         .await
         .map_err(|e| StoreError::db("read document", e))?
         .ok_or_else(|| StoreError::Host(HostError::not_found("no such document")))?;
@@ -605,10 +632,10 @@ impl AppData {
     }
 
     async fn update_inner(&self, req: &Request) -> Result<Response> {
-        let mut tx = self.store.begin().await?;
-        let (info, _) = resolve(&mut tx, req.caller.install_id).await?;
+        let tx = self.store.begin().await?;
+        let (info, _) = resolve(&tx, req.caller.install_id).await?;
         let d = parse(req)?;
-        let target = resolve_target(&mut tx, &info, &req.caller.cred, &d.collection).await?;
+        let target = resolve_target(&tx, &info, &req.caller.cred, &d.collection).await?;
         target.declared()?;
         let id = d.doc_id()?;
 
@@ -619,7 +646,7 @@ impl AppData {
             self.store
                 .guard()
                 .authorize_collection(
-                    &mut tx,
+                    &tx,
                     &req.caller.cred,
                     &Subject::collection(target.info.id, &target.collection),
                     Target::acting(&info),
@@ -633,7 +660,7 @@ impl AppData {
         self.store
             .guard()
             .authorize(
-                &mut tx,
+                &tx,
                 &req.caller.cred,
                 &Subject::entity(id),
                 Access::Write,
@@ -643,21 +670,22 @@ impl AppData {
             .map_err(|e| StoreError::Host(host_error(e, true)))?;
 
         let existing: Option<String> =
-            sqlx::query_scalar("SELECT trust FROM entities WHERE id = $1 AND deleted_at IS NULL")
+            query("SELECT trust FROM entities WHERE id = ?1 AND deleted_at IS NULL")
                 .bind(id)
-                .fetch_optional(&mut *tx)
+                .fetch_scalar_optional(&tx)
                 .await
                 .map_err(|e| StoreError::db("read existing trust", e))?;
         let existing =
             existing.ok_or_else(|| StoreError::Host(HostError::not_found("no such document")))?;
         let level = write_trust(Level::from_db(&existing), req.trust);
         let doc = d.doc_or_empty();
+        let updated = hive_db::now();
 
-        // updated_at is also maintained by a BEFORE UPDATE trigger in the app's
-        // own schema, so setting it here is belt to that brace.
-        let updated: Option<DateTime<Utc>> = sqlx::query_scalar(&format!(
-            "UPDATE {} SET doc = $2, trust = $3, tainted_by = coalesce($4, tainted_by), updated_at = now()
-              WHERE id = $1
+        // updated_at is also maintained by an AFTER UPDATE trigger on the
+        // collection table, so setting it here is belt to that brace.
+        let touched: Option<DateTime<Utc>> = query(&format!(
+            "UPDATE {} SET doc = ?2, trust = ?3, tainted_by = coalesce(?4, tainted_by), updated_at = ?5
+              WHERE id = ?1
               RETURNING updated_at",
             target.table()
         ))
@@ -665,27 +693,29 @@ impl AppData {
         .bind(&doc)
         .bind(level.as_str())
         .bind(nullable(&req.tainted_by))
-        .fetch_optional(&mut *tx)
+        .bind(updated)
+        .fetch_scalar_optional(&tx)
         .await
         .map_err(|e| StoreError::db("update document", e))?;
         let updated =
-            updated.ok_or_else(|| StoreError::Host(HostError::not_found("no such document")))?;
-        sqlx::query(
-            "UPDATE entities SET trust = $2, tainted_by = coalesce($3, tainted_by), updated_at = now() WHERE id = $1",
+            touched.ok_or_else(|| StoreError::Host(HostError::not_found("no such document")))?;
+        query(
+            "UPDATE entities SET trust = ?2, tainted_by = coalesce(?3, tainted_by), updated_at = ?4 WHERE id = ?1",
         )
         .bind(id)
         .bind(level.as_str())
         .bind(nullable(&req.tainted_by))
-        .execute(&mut *tx)
+        .bind(updated)
+        .execute(&tx)
         .await
         .map_err(|e| StoreError::db("update entity", e))?;
 
         let doc_bytes = serde_json::to_vec(&doc).unwrap_or_default();
-        self.relink_descriptors(&mut tx, req, id, &doc_bytes, level)
+        self.relink_descriptors(&tx, req, id, &doc_bytes, level)
             .await?;
         let owner = req.caller.cred.owner_of();
         self.emit(
-            &mut tx,
+            &tx,
             req,
             &target.info,
             &target.collection,
@@ -695,9 +725,7 @@ impl AppData {
             "updated",
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|e| StoreError::db("commit update", e))?;
+        crate::commit(tx, "update").await?;
         Ok(Response::trusted(serde_json::to_vec(&serde_json::json!({
             "id": id, "updated_at": updated, "trust": level,
         }))?))
@@ -708,10 +736,10 @@ impl AppData {
     /// else's memory is not sharing. An override cannot reach this either,
     /// because override grants are read-only by CHECK.
     async fn delete_inner(&self, req: &Request) -> Result<Response> {
-        let mut tx = self.store.begin().await?;
-        let (info, _) = resolve(&mut tx, req.caller.install_id).await?;
+        let tx = self.store.begin().await?;
+        let (info, _) = resolve(&tx, req.caller.install_id).await?;
         let d = parse(req)?;
-        let target = resolve_target(&mut tx, &info, &req.caller.cred, &d.collection).await?;
+        let target = resolve_target(&tx, &info, &req.caller.cred, &d.collection).await?;
         target.declared()?;
         let id = d.doc_id()?;
 
@@ -719,7 +747,7 @@ impl AppData {
             self.store
                 .guard()
                 .authorize_collection(
-                    &mut tx,
+                    &tx,
                     &req.caller.cred,
                     &Subject::collection(target.info.id, &target.collection),
                     Target::acting(&info),
@@ -734,7 +762,7 @@ impl AppData {
             .store
             .guard()
             .authorize(
-                &mut tx,
+                &tx,
                 &req.caller.cred,
                 &Subject::entity(id),
                 Access::Write,
@@ -748,17 +776,17 @@ impl AppData {
             ))));
         }
 
-        sqlx::query(&format!("DELETE FROM {} WHERE id = $1", target.table()))
+        query(&format!("DELETE FROM {} WHERE id = ?1", target.table()))
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&tx)
             .await
             .map_err(|e| StoreError::db("delete document", e))?;
-        let res = sqlx::query("DELETE FROM entities WHERE id = $1")
+        let n = query("DELETE FROM entities WHERE id = ?1")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&tx)
             .await
             .map_err(|e| StoreError::db("delete entity", e))?;
-        if res.rows_affected() == 0 {
+        if n == 0 {
             return Err(StoreError::Host(HostError::not_found("no such document")));
         }
 
@@ -769,7 +797,7 @@ impl AppData {
         // is a reference nobody can release.
         self.blobs
             .release_by_source(
-                &mut *tx,
+                &tx,
                 &req.caller.cred,
                 SourceKind::Collection,
                 &id.to_string(),
@@ -778,7 +806,7 @@ impl AppData {
 
         let owner = req.caller.cred.owner_of();
         self.emit(
-            &mut tx,
+            &tx,
             req,
             &target.info,
             &target.collection,
@@ -788,9 +816,7 @@ impl AppData {
             "deleted",
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|e| StoreError::db("commit delete", e))?;
+        crate::commit(tx, "delete").await?;
         Ok(Response::trusted(serde_json::to_vec(&serde_json::json!({
             "id": id, "deleted": true,
         }))?))
@@ -798,15 +824,21 @@ impl AppData {
 
     /// Lists the documents in a collection this caller may see.
     ///
-    /// The filter is `access_reason()` and nothing else. The document table
+    /// The filter is the predicate and nothing else. The document table
     /// carries no owner columns to be tempted by ... ownership lives on the
     /// entities row this joins to, so there is no cheaper copy for a later
     /// query to filter on by mistake.
+    ///
+    /// Containment is decided in the host (see `contains`), so the page is read
+    /// in batches past the cursor until `limit` matching rows are found, and
+    /// the cursor handed back is the last row RETURNED, never the last row
+    /// read ... a cursor that skipped over filtered rows would be a position
+    /// that lies about progress.
     async fn query_inner(&self, req: &Request) -> Result<Response> {
-        let mut conn = self.store.conn().await?;
-        let (info, _) = resolve(&mut conn, req.caller.install_id).await?;
+        let conn = self.store.conn().await?;
+        let (info, _) = resolve(&conn, req.caller.install_id).await?;
         let d = parse(req)?;
-        let target = resolve_target(&mut conn, &info, &req.caller.cred, &d.collection).await?;
+        let target = resolve_target(&conn, &info, &req.caller.cred, &d.collection).await?;
         target.declared()?;
 
         // D33, and ONLY when the collection belongs to another install. It is
@@ -823,7 +855,7 @@ impl AppData {
             self.store
                 .guard()
                 .authorize_collection(
-                    &mut conn,
+                    &conn,
                     &req.caller.cred,
                     &Subject::collection(target.info.id, &target.collection),
                     Target::acting(&info),
@@ -840,7 +872,7 @@ impl AppData {
             d.limit
         };
         let r#match = d.r#match.clone().unwrap_or_else(|| serde_json::json!({}));
-        let after: Option<Uuid> = if d.after.is_empty() {
+        let mut after: Option<Uuid> = if d.after.is_empty() {
             None
         } else {
             Some(Uuid::parse_str(&d.after).map_err(|_| {
@@ -851,42 +883,70 @@ impl AppData {
             })?)
         };
 
-        let rows = sqlx::query(&format!(
+        let reason = predicate::reason(&Args {
+            subject_kind: "'entity'",
+            subject_id: "e.id",
+            subject_name: "NULL",
+            principal_kind: "?3",
+            principal_id: "?4",
+            actor_id: "?5",
+            access: "'read'",
+            now: "?6",
+            acting_install: "NULL",
+        });
+        let sql = format!(
             "SELECT t.id, e.ref, e.kind, t.doc, t.trust, t.tainted_by, t.created_at, t.updated_at
                FROM {} t
                JOIN entities e ON e.id = t.id
               WHERE e.deleted_at IS NULL
-                AND ($1 = '' OR e.kind = $1)
-                AND t.doc @> $2::jsonb
-                AND ($3::uuid IS NULL OR t.created_at < (SELECT created_at FROM entities WHERE id = $3))
-                AND access_reason('entity', e.id, NULL, $4, $5, $6, 'read', now()) IS NOT NULL
+                AND (?1 = '' OR e.kind = ?1)
+                AND (?2 IS NULL OR (t.created_at, t.id) < (
+                        (SELECT created_at FROM entities WHERE id = ?2), ?2))
+                AND {reason} IS NOT NULL
               ORDER BY t.created_at DESC, t.id DESC
-              LIMIT $7",
+              LIMIT ?7",
             target.table()
-        ))
-        .bind(&d.kind)
-        .bind(&r#match)
-        .bind(after)
-        .bind(req.caller.cred.principal_kind.as_str())
-        .bind(req.caller.cred.principal_id)
-        .bind(req.caller.cred.actor_id)
-        .bind(limit)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(|e| StoreError::db("query documents", e))?;
+        );
 
         // A batch containing untrusted content taints the invocation that read
         // it. Anything weaker would let a guest launder by reading in bulk.
         let mut level = Level::Trusted;
-        let out: Vec<DocRow> = rows
-            .iter()
-            .map(|r| {
+        let mut out: Vec<DocRow> = Vec::new();
+        // `next` is a cursor only when the page filled; a short last batch
+        // means the collection is exhausted.
+        let mut exhausted = false;
+        while (out.len() as i64) < limit && !exhausted {
+            let rows = query(&sql)
+                .bind(&d.kind)
+                .bind(after)
+                .bind(req.caller.cred.principal_kind.as_str())
+                .bind(req.caller.cred.principal_id)
+                .bind(req.caller.cred.actor_id)
+                .bind(hive_db::now())
+                .bind(QUERY_BATCH)
+                .fetch_all(&conn)
+                .await
+                .map_err(|e| StoreError::db("query documents", e))?;
+            exhausted = (rows.len() as i64) < QUERY_BATCH;
+            for r in &rows {
                 let row = scan_doc(r);
+                after = Some(row.id);
+                if !contains(&row.doc, &r#match) {
+                    continue;
+                }
                 level = write_trust(level, row.trust);
-                row
-            })
-            .collect();
-        let next = if out.len() as i64 == limit {
+                out.push(row);
+                if out.len() as i64 == limit {
+                    break;
+                }
+            }
+        }
+        let next = if out.len() as i64 == limit && !exhausted {
+            out.last().map(|r| r.id)
+        } else if out.len() as i64 == limit {
+            // The page filled on the last batch; whether more match is
+            // unknown without another read, and a cursor costs the caller one
+            // empty page at most. Postgres behaved the same way.
             out.last().map(|r| r.id)
         } else {
             None
@@ -908,7 +968,7 @@ impl AppData {
     /// alternative is a stored document naming bytes nothing holds down.
     async fn link_descriptors(
         &self,
-        tx: &mut sqlx::Transaction<'_, Postgres>,
+        tx: &Transaction,
         req: &Request,
         id: Uuid,
         hashes: &[Hash],
@@ -945,7 +1005,7 @@ impl AppData {
     /// That is the conservative direction, and it follows from invariant 3.
     async fn relink_descriptors(
         &self,
-        tx: &mut sqlx::Transaction<'_, Postgres>,
+        tx: &Transaction,
         req: &Request,
         id: Uuid,
         doc: &[u8],
@@ -955,7 +1015,7 @@ impl AppData {
         let held = self
             .blobs
             .held_by_source(
-                &mut **tx,
+                tx,
                 &req.caller.cred,
                 SourceKind::Collection,
                 &id.to_string(),
@@ -978,7 +1038,7 @@ impl AppData {
             }
             self.blobs
                 .release(
-                    &mut **tx,
+                    tx,
                     &req.caller.cred,
                     h,
                     SourceKind::Collection,
@@ -1014,7 +1074,7 @@ impl AppData {
     /// Writes the event announcing a write, in the same transaction as the
     /// write itself (D14.2: with no second writer, every write produces an
     /// event, so mentions fire by construction).
-    #[allow(clippy::too_many_arguments)]
+    ///
     /// The event names the install that OWNS the collection, not the one that
     /// did the writing.
     ///
@@ -1027,9 +1087,10 @@ impl AppData {
     /// Who did it is not lost by leaving them out of the kind. The event
     /// carries the credential, which pins author and principal separately
     /// (invariant 2), and that is where "which app wrote this" belongs.
+    #[allow(clippy::too_many_arguments)]
     async fn emit(
         &self,
-        tx: &mut PgConnection,
+        tx: &Connection,
         req: &Request,
         info: &InstallInfo,
         collection: &str,
@@ -1050,7 +1111,7 @@ impl AppData {
     }
 }
 
-fn scan_doc(r: &sqlx::postgres::PgRow) -> DocRow {
+fn scan_doc(r: &Row) -> DocRow {
     let trust: String = r.get("trust");
     DocRow {
         id: r.get("id"),
@@ -1058,7 +1119,7 @@ fn scan_doc(r: &sqlx::postgres::PgRow) -> DocRow {
         kind: r.get("kind"),
         doc: r.get("doc"),
         trust: Level::from_db(&trust),
-        tainted_by: r.get::<Option<String>, _>("tainted_by").unwrap_or_default(),
+        tainted_by: r.get::<Option<String>>("tainted_by").unwrap_or_default(),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     }
@@ -1084,5 +1145,30 @@ impl Storage for AppData {
     }
     async fn query(&self, req: Request) -> std::result::Result<Response, HostError> {
         self.query_inner(&req).await.map_err(|e| to_host(e, false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains;
+    use serde_json::json;
+
+    /// The rule a guest can predict: Postgres's `@>`, decided in the host.
+    #[test]
+    fn containment_is_the_postgres_rule() {
+        let doc = json!({"status": "open", "tags": ["a", "b"], "meta": {"x": 1, "y": 2}});
+        assert!(contains(&doc, &json!({})));
+        assert!(contains(&doc, &json!({"status": "open"})));
+        assert!(!contains(&doc, &json!({"status": "closed"})));
+        assert!(!contains(&doc, &json!({"missing": null})));
+        assert!(contains(&doc, &json!({"tags": ["b"]})));
+        assert!(contains(&doc, &json!({"tags": ["b", "a"]})));
+        assert!(!contains(&doc, &json!({"tags": ["c"]})));
+        assert!(contains(&doc, &json!({"meta": {"x": 1}})));
+        assert!(!contains(&doc, &json!({"meta": {"x": 2}})));
+        assert!(
+            contains(&doc, &json!({"tags": "a"})),
+            "a scalar matches inside an array"
+        );
     }
 }

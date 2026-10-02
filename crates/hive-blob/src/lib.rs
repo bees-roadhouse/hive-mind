@@ -127,7 +127,7 @@ pub enum BlobError {
     Io(String, #[source] std::io::Error),
 
     #[error("blob: {0}: {1}")]
-    Db(String, #[source] sqlx::Error),
+    Db(String, #[source] hive_db::Error),
 
     #[error("blob: {0}")]
     Backend(String),
@@ -142,7 +142,7 @@ impl BlobError {
         BlobError::Io(what.into(), e)
     }
 
-    pub(crate) fn db(what: impl Into<String>, e: sqlx::Error) -> Self {
+    pub(crate) fn db(what: impl Into<String>, e: hive_db::Error) -> Self {
         BlobError::Db(what.into(), e)
     }
 }

@@ -3,89 +3,78 @@
 //! The split is deliberate. The manifest crate derives a `SchemaPlan`, which is
 //! data: printable, diffable, and testable without a database. This module is
 //! the only thing that turns that data into statements, because the store is the
-//! one crate in the platform that talks to Postgres.
+//! one crate in the platform that talks to the database.
 //!
 //! That is not tidiness. The grant predicate lives here, and a second crate
-//! holding a pool would be a second crate reaching the database without any
-//! reason to know about grants ... which is precisely how the first hole gets
-//! made (invariant 1, and D21's shape).
+//! holding a file handle would be a second crate reaching the database without
+//! any reason to know about grants ... which is precisely how the first hole
+//! gets made (invariant 1, and D21's shape).
+//!
+//! An install's collections are tables named `<schema>__<collection>` in the
+//! one file (D38 phase 1). The schema name is the install's, derived from the
+//! app and the owner, so two installs of one app are two sets of tables
+//! (invariant 14). Phase 2 moves them to the owner's file; the naming is what
+//! stays.
 //!
 //! Nothing in here interpolates a string that came from a manifest without
 //! having been through `parse_index` or the identifier check below. A manifest
 //! is a file an AI writes; DDL built from one is the obvious injection surface,
 //! and quoting at this end is the last line rather than the only one.
 
+use hive_db::{Connection, query, quote_ident, quote_literal};
 use hive_manifest::{CollectionPlan, Index, IndexMethod, SchemaPlan};
-use sqlx::PgConnection;
 
 use crate::{Result, StoreError};
 
-/// Postgres's limit, and the reason `derived_ident` exists.
+/// The bound a derived name must fit in. The engine has no limit of its own;
+/// the manifest bounds its identifiers at this and a name derived from one is
+/// held to the same number, so a change in the bound is one edit.
 const MAX_IDENTIFIER: usize = 63;
 
-/// Provisions an app's schema, its collection tables and its indexes. It is
-/// idempotent: re-applying the same plan is how a manifest diff becomes a
-/// migration (D3.3), so every statement is IF NOT EXISTS.
+/// Provisions an app's collection tables and their indexes. It is idempotent:
+/// re-applying the same plan is how a manifest diff becomes a migration
+/// (D3.3), so every statement is IF NOT EXISTS.
 ///
 /// It runs inside the caller's transaction, so a failed install leaves nothing
 /// behind, and it never commits ... registering an install and provisioning its
-/// storage are one unit of work or they are a schema nobody owns.
-pub async fn apply_schema_plan(tx: &mut PgConnection, plan: &SchemaPlan) -> Result<()> {
+/// storage are one unit of work or they are tables nobody owns.
+pub async fn apply_schema_plan(tx: &Connection, plan: &SchemaPlan) -> Result<()> {
     check_ident(&plan.schema)?;
-    let schema = quote_ident(&plan.schema);
-    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| StoreError::db(format!("create schema {}", plan.schema), e))?;
-    if !plan.collections.is_empty() {
-        apply_touch_function(tx, &schema).await?;
-    }
     for c in &plan.collections {
         apply_collection(tx, &plan.schema, c).await?;
     }
     Ok(())
 }
 
-/// Uninstall. One statement, because per-app schemas exist so that the blast
-/// radius of a bad app is exactly this (D3.2).
-pub async fn drop_schema_plan(tx: &mut PgConnection, plan: &SchemaPlan) -> Result<()> {
+/// Uninstall. Every table under the install's prefix goes, found in the
+/// catalogue rather than taken from the plan, so a collection a later manifest
+/// dropped is removed too. Per-install prefixes exist so that the blast radius
+/// of a bad app is exactly this (D3.2).
+pub async fn drop_schema_plan(tx: &Connection, plan: &SchemaPlan) -> Result<()> {
     check_ident(&plan.schema)?;
-    sqlx::query(&format!(
-        "DROP SCHEMA IF EXISTS {} CASCADE",
-        quote_ident(&plan.schema)
-    ))
-    .execute(&mut *tx)
+    let prefix = format!("{}__", plan.schema);
+    let tables: Vec<String> = query(
+        "SELECT name FROM sqlite_master
+          WHERE type = 'table' AND substr(name, 1, length(?1)) = ?1",
+    )
+    .bind(&prefix)
+    .fetch_scalars(tx)
     .await
-    .map_err(|e| StoreError::db(format!("drop schema {}", plan.schema), e))?;
-    Ok(())
-}
-
-/// Installs the updated_at trigger function into the app's own schema.
-///
-/// Per-app rather than platform-wide so that DROP SCHEMA CASCADE remains the
-/// whole of uninstall (D3.2). A shared function would make every app's triggers
-/// depend on an object outside their blast radius.
-async fn apply_touch_function(tx: &mut PgConnection, quoted_schema: &str) -> Result<()> {
-    sqlx::query(&format!(
-        "CREATE OR REPLACE FUNCTION {quoted_schema}.set_updated_at()
-         RETURNS trigger LANGUAGE plpgsql AS $$
-         BEGIN
-             NEW.updated_at = now();
-             RETURN NEW;
-         END;
-         $$"
-    ))
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| StoreError::db(format!("create set_updated_at in {quoted_schema}"), e))?;
+    .map_err(|e| StoreError::db(format!("list tables of {}", plan.schema), e))?;
+    for t in tables {
+        query(&format!("DROP TABLE IF EXISTS {}", quote_ident(&t)))
+            .execute(tx)
+            .await
+            .map_err(|e| StoreError::db(format!("drop table {t}"), e))?;
+    }
     Ok(())
 }
 
 /// Creates one collection's table, its updated_at trigger and its indexes. The
 /// table shape is the same for every collection and is not the app's to choose.
-async fn apply_collection(tx: &mut PgConnection, schema: &str, c: &CollectionPlan) -> Result<()> {
+async fn apply_collection(tx: &Connection, schema: &str, c: &CollectionPlan) -> Result<()> {
     check_ident(&c.name)?;
-    let table = format!("{}.{}", quote_ident(schema), quote_ident(&c.name));
+    let table = table_name(schema, &c.name);
 
     // There is deliberately no owner pair and no author here.
     //
@@ -96,45 +85,53 @@ async fn apply_collection(tx: &mut PgConnection, schema: &str, c: &CollectionPla
     // comment ... which is attention rather than intent.
     //
     // The id IS the entity's id, and there is deliberately no foreign key
-    // saying so either: an app schema has to be provisionable without the
-    // platform's tables in the same search path. What keeps the two rows
-    // together is that one transaction writes both and one removes both.
+    // saying so either: an app's tables have to be provisionable without the
+    // platform's in reach (phase 2 puts them in another file). What keeps the
+    // two rows together is that one transaction writes both and one removes
+    // both.
     //
     // trust IS duplicated from `entities`, and that is not the same case: it
     // travels with the row (invariant 3), it is read by the layer serving the
     // document, and nothing authorizes on it.
-    sqlx::query(&format!(
+    query(&format!(
         "CREATE TABLE IF NOT EXISTS {table} (
-            id          uuid PRIMARY KEY,
-            doc         jsonb NOT NULL DEFAULT '{{}}',
-            trust       text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
-            tainted_by  text,
-            created_at  timestamptz NOT NULL DEFAULT now(),
-            updated_at  timestamptz NOT NULL DEFAULT now()
-        )"
+            id          TEXT PRIMARY KEY,
+            doc         TEXT NOT NULL DEFAULT '{{}}' CHECK (json_valid(doc)),
+            trust       TEXT NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
+            tainted_by  TEXT,
+            created_at  INTEGER NOT NULL DEFAULT {now},
+            updated_at  INTEGER NOT NULL DEFAULT {now}
+        )",
+        now = hive_db::NOW_SQL
     ))
-    .execute(&mut *tx)
+    .execute(tx)
     .await
-    .map_err(|e| StoreError::db(format!("create table {schema}.{}", c.name), e))?;
+    .map_err(|e| StoreError::db(format!("create table {schema}__{}", c.name), e))?;
 
     // updated_at IS maintained by a trigger, and this is the one place the
     // project's usual "no triggers" instinct does not apply. That instinct
     // comes from D21: a trigger cannot enforce what the writer supplies, because
     // a trigger has no credential in scope. Entirely correct, and it says
-    // nothing about this column, because `now()` is not a fact the writer
-    // supplies ... it is a clock read, identical whoever is asking.
-    let trigger = derived_ident(&c.name, "_touch")?;
-    sqlx::query(&format!("DROP TRIGGER IF EXISTS {trigger} ON {table}"))
-        .execute(&mut *tx)
+    // nothing about this column, because the clock is not a fact the writer
+    // supplies ... it is a clock read, identical whoever is asking. SQLite
+    // cannot rewrite NEW in a BEFORE trigger, so this fires AFTER and only when
+    // the writer left the column alone.
+    let trigger = derived_ident(&format!("{schema}__{}", c.name), "_touch")?;
+    query(&format!("DROP TRIGGER IF EXISTS {trigger}"))
+        .execute(tx)
         .await
-        .map_err(|e| StoreError::db(format!("drop touch trigger on {schema}.{}", c.name), e))?;
-    sqlx::query(&format!(
-        "CREATE TRIGGER {trigger} BEFORE UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION {}.set_updated_at()",
-        quote_ident(schema)
+        .map_err(|e| StoreError::db(format!("drop touch trigger on {schema}__{}", c.name), e))?;
+    query(&format!(
+        "CREATE TRIGGER {trigger} AFTER UPDATE OF doc, trust, tainted_by ON {table}
+         WHEN NEW.updated_at IS OLD.updated_at
+         BEGIN
+             UPDATE {table} SET updated_at = {now} WHERE id = NEW.id;
+         END",
+        now = hive_db::NOW_SQL
     ))
-    .execute(&mut *tx)
+    .execute(tx)
     .await
-    .map_err(|e| StoreError::db(format!("create touch trigger on {schema}.{}", c.name), e))?;
+    .map_err(|e| StoreError::db(format!("create touch trigger on {schema}__{}", c.name), e))?;
 
     for (i, idx) in c.indexes.iter().enumerate() {
         apply_index(tx, schema, &c.name, &table, i, idx).await?;
@@ -143,7 +140,7 @@ async fn apply_collection(tx: &mut PgConnection, schema: &str, c: &CollectionPla
 }
 
 async fn apply_index(
-    tx: &mut PgConnection,
+    tx: &Connection,
     schema: &str,
     collection: &str,
     table: &str,
@@ -154,33 +151,37 @@ async fn apply_index(
     // The index name is derived rather than taken from the manifest, so two
     // apps cannot argue about it and an app cannot name one after something
     // that already exists.
-    let name = derived_ident(collection, &format!("_{}_{ordinal}_idx", idx.method))?;
+    let name = derived_ident(
+        &format!("{schema}__{collection}"),
+        &format!("_{}_{ordinal}_idx", idx.method),
+    )?;
     let stmt = match idx.method {
-        IndexMethod::BTree => format!("CREATE INDEX IF NOT EXISTS {name} ON {table} (({expr}))"),
-        IndexMethod::Gin => {
-            format!("CREATE INDEX IF NOT EXISTS {name} ON {table} USING gin (({expr}))")
-        }
-        // to_tsvector needs a regconfig and a text argument. The config is a
-        // constant here rather than an app's choice: a manifest that could pick
-        // one could pick anything, and per-language configuration is a real
-        // decision that has not been made yet.
-        IndexMethod::Fts => format!(
-            "CREATE INDEX IF NOT EXISTS {name} ON {table} USING gin (to_tsvector('english', {expr}))"
-        ),
-        // Vector wants a typed column rather than a jsonb expression. Refused
-        // loudly rather than half-built: a silently skipped index is a query
-        // plan that quietly falls back to a sequential scan over someone's
-        // whole memory, discovered months later as "search got slow". The
-        // provisional pick is hnsw, on the access pattern: ivfflat needs
-        // training data and degrades as the corpus outgrows it, which is
-        // exactly the shape of a journal that starts empty and grows forever.
+        // An expression index over the JSON path: what an equality or a range
+        // on that path uses.
+        IndexMethod::BTree => format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({expr})"),
+        // There is no inverted index in the engine. A gin index asked for
+        // containment on an array; the query path decides containment in the
+        // host (see `appdata`), so what is indexed here is the array's text,
+        // which serves equality and nothing more. Honest, and named as such.
+        IndexMethod::Gin => format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({expr})"),
+        // Full text proper is an FTS5 virtual table kept in step with the
+        // document, and that shape (tokenizer, which paths, how a write
+        // updates it) is phase-2 work nobody has chosen yet. Until then the
+        // path is indexed as text, which serves equality and prefix lookups
+        // and is declared here as exactly that rather than as search: nothing
+        // in the platform queries full text yet, so there is no query path to
+        // quietly fall back to a scan.
+        IndexMethod::Fts => format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({expr})"),
+        // Vector wants a typed F32_BLOB column with a dimension, and the
+        // manifest has no way to declare one (D38 open items). Refused for the
+        // same reason as full text.
         IndexMethod::Vector => {
             return Err(StoreError::NotImplemented(format!(
-                "vector indexes need a typed column and an index method nobody has chosen yet ({schema}.{collection}: {idx})"
+                "vector indexes need a typed column with a declared dimension ({schema}.{collection}: {idx})"
             )));
         }
     };
-    sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
+    query(&stmt).execute(tx).await.map_err(|e| {
         StoreError::db(
             format!("create {} index on {schema}.{collection}", idx.method),
             e,
@@ -189,7 +190,15 @@ async fn apply_index(
     Ok(())
 }
 
-/// Builds the jsonb accessor for an index path.
+/// The quoted table name for a collection: `"<schema>__<collection>"`.
+pub(crate) fn table_name(schema: &str, collection: &str) -> String {
+    quote_ident(&format!("{schema}__{collection}"))
+}
+
+/// Builds the JSON accessor for an index path. The `->` and `->>` operators
+/// are the engine's own (SQLite 3.38 onward), with the same meaning they had
+/// on Postgres: `->` keeps JSON along the way, `->>` yields the SQL value at
+/// the last hop.
 ///
 /// Each segment is a literal inside the expression, so each one is quoted as a
 /// string literal rather than concatenated raw. `parse_index` has already
@@ -202,8 +211,8 @@ fn doc_path(idx: &Index) -> Result<String> {
     for seg in &idx.path {
         check_ident(seg)?;
     }
-    // ->> yields text at the last hop, -> yields jsonb along the way. btree and
-    // fts want text; gin over a tag array wants the jsonb.
+    // ->> yields the value at the last hop, -> yields JSON along the way.
+    // btree and fts want the value; gin over a tag array wants the JSON.
     let mut expr = String::from("doc");
     let last = idx.path.len() - 1;
     for (i, seg) in idx.path.iter().enumerate() {
@@ -235,34 +244,23 @@ pub(crate) fn check_ident(s: &str) -> Result<()> {
 }
 
 /// Builds an identifier the platform derives from a manifest name, and REFUSES
-/// one that would not fit rather than letting Postgres truncate it.
+/// one that would not fit the bound rather than letting it grow without one.
 ///
-/// Truncation is the dangerous half. An over-long index name collapses onto the
-/// collection name, which the table already occupies in pg_class, and the IF
-/// NOT EXISTS that makes re-apply idempotent turns that collision into a
-/// NOTICE. The driver does not surface NOTICEs, so the statement reports success
-/// and the index does not exist.
+/// The bound is kept from the Postgres port on purpose. There, truncation was
+/// the dangerous half: an over-long index name collapsed onto the collection
+/// name and IF NOT EXISTS turned the collision into a NOTICE nobody saw. The
+/// engine here does not truncate, and the bound stays because a name nobody
+/// can read in a catalogue listing is its own hazard and the manifest already
+/// holds its names to it.
 fn derived_ident(base: &str, suffix: &str) -> Result<String> {
-    check_ident(base)?;
     let name = format!("{base}{suffix}");
-    if name.len() > MAX_IDENTIFIER {
+    if name.len() > MAX_IDENTIFIER * 2 + 2 {
         return Err(StoreError::UnsafeIdentifier(format!(
-            "{name:?} is {} characters and Postgres truncates at {MAX_IDENTIFIER}, which would silently collide with an existing object",
+            "{name:?} is {} characters, past the bound derived names are held to",
             name.len()
         )));
     }
     Ok(quote_ident(&name))
-}
-
-/// Double-quotes an identifier. Everything reaching it has already passed
-/// `check_ident`, so the doubling is belt on brace.
-pub(crate) fn quote_ident(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
-}
-
-/// Single-quotes a string literal for embedding in an expression.
-fn quote_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -281,9 +279,12 @@ mod tests {
     }
 
     #[test]
-    fn derived_names_refuse_to_truncate() {
-        assert!(derived_ident(&"c".repeat(63), "_touch").is_err());
+    fn derived_names_refuse_to_grow_past_the_bound() {
+        // A schema and a collection at the bound each, joined, plus a suffix.
+        let base = format!("{}__{}", "s".repeat(63), "c".repeat(63));
+        assert!(derived_ident(&base, "_touch").is_err());
         assert_eq!(derived_ident("c", "_touch").unwrap(), "\"c_touch\"");
+        assert_eq!(table_name("app_1", "entries"), "\"app_1__entries\"");
     }
 
     #[test]

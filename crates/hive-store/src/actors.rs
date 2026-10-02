@@ -1,5 +1,5 @@
+use hive_db::{Connection, query};
 use hive_identity::PrincipalKind;
-use sqlx::{Executor, Postgres, Row};
 use uuid::Uuid;
 
 use crate::{Result, StoreError};
@@ -27,14 +27,11 @@ pub struct Actor {
 /// absent from. Everything beyond identity (entities, installs, events) goes
 /// through the guard, whose absence-of-scope-is-deny funnel this deliberately
 /// does not join.
-pub async fn actor_by_id<'e, E>(db: E, id: Uuid) -> Result<Actor>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let row = sqlx::query(
+pub async fn actor_by_id(db: &Connection, id: Uuid) -> Result<Actor> {
+    let row = query(
         "SELECT id, kind, handle, display_name, persona, principal_kind, principal_id
            FROM actors
-          WHERE id = $1",
+          WHERE id = ?1",
     )
     .bind(id)
     .fetch_optional(db)
@@ -47,7 +44,7 @@ where
         kind: row.get("kind"),
         handle: row.get("handle"),
         display_name: row.get("display_name"),
-        persona: row.get::<Option<String>, _>("persona").unwrap_or_default(),
+        persona: row.get::<Option<String>>("persona").unwrap_or_default(),
         principal_kind: PrincipalKind::parse(&kind)
             .ok_or_else(|| StoreError::Other(format!("actor {id} has principal kind {kind:?}")))?,
         principal_id: row.get("principal_id"),

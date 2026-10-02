@@ -1,0 +1,22 @@
+[package]
+name = "hive-db"
+description = "The one way the host opens a database file: SQLite behind a thin query API, a bounded pool, typed binds and reads, and the clock the schema shares (D38)"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

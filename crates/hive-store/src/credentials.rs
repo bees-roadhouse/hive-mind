@@ -1,9 +1,9 @@
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use hive_db::{Connection, query};
 use hive_identity::{Credential, Owner, PrincipalKind};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use sqlx::{Executor, PgConnection, Postgres, Row};
 use uuid::Uuid;
 
 use crate::{Result, StoreError};
@@ -29,24 +29,23 @@ pub fn new_token() -> (String, String) {
 /// Who may issue is enforced by the `credentials_issue_check` trigger, not here
 /// (D19.3). An AI never issues credentials, and this function has no way to
 /// talk the database out of that.
-pub async fn issue_credential<'e, E>(
-    db: E,
+pub async fn issue_credential(
+    db: &Connection,
     for_actor: Uuid,
     principal: Owner,
     by: &Credential,
     label: &str,
     expires: Option<DateTime<Utc>>,
-) -> Result<(String, Uuid)>
-where
-    E: Executor<'e, Database = Postgres>,
-{
+) -> Result<(String, Uuid)> {
     let (token, hash) = new_token();
-    let id: Uuid = sqlx::query_scalar(
-        "INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256, label,
-                                  issued_by_actor, issued_by_principal_kind, issued_by_principal_id, expires_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    let id: Uuid = query(
+        "INSERT INTO credentials (id, actor_id, principal_kind, principal_id, token_sha256, label,
+                                  issued_by_actor, issued_by_principal_kind, issued_by_principal_id,
+                                  expires_at, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
          RETURNING id",
     )
+    .bind(Uuid::new_v4())
     .bind(for_actor)
     .bind(principal.kind.as_str())
     .bind(principal.id)
@@ -56,7 +55,8 @@ where
     .bind(by.principal_kind.as_str())
     .bind(by.principal_id)
     .bind(expires)
-    .fetch_one(db)
+    .bind(hive_db::now())
+    .fetch_scalar(db)
     .await
     .map_err(|e| StoreError::db("issue credential", e))?;
     Ok((token, id))
@@ -72,22 +72,17 @@ where
 /// never from a handler.
 ///
 /// Idempotent, and it refuses to point an existing token at a different actor.
-pub async fn ensure_bootstrap_credential(
-    conn: &mut PgConnection,
-    root: Uuid,
-    token: &str,
-) -> Result<()> {
+pub async fn ensure_bootstrap_credential(conn: &Connection, root: Uuid, token: &str) -> Result<()> {
     if token.is_empty() {
         return Err(StoreError::Other(
             "bootstrap credential needs a token".into(),
         ));
     }
-    let existing: Option<Uuid> =
-        sqlx::query_scalar("SELECT actor_id FROM credentials WHERE token_sha256 = $1")
-            .bind(hash_token(token))
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| StoreError::db("look up bootstrap credential", e))?;
+    let existing: Option<Uuid> = query("SELECT actor_id FROM credentials WHERE token_sha256 = ?1")
+        .bind(hash_token(token))
+        .fetch_scalar_optional(conn)
+        .await
+        .map_err(|e| StoreError::db("look up bootstrap credential", e))?;
     if let Some(existing) = existing {
         if existing != root {
             return Err(StoreError::Other(format!(
@@ -96,14 +91,15 @@ pub async fn ensure_bootstrap_credential(
         }
         return Ok(());
     }
-    sqlx::query(
-        "INSERT INTO credentials (actor_id, principal_kind, principal_id, token_sha256, label,
+    query(
+        "INSERT INTO credentials (id, actor_id, principal_kind, principal_id, token_sha256, label,
                                   issued_by_actor, issued_by_principal_kind, issued_by_principal_id)
-         VALUES ($1, 'user', $1, $2, 'bootstrap', $1, 'user', $1)",
+         VALUES (?1, ?2, 'user', ?2, ?3, 'bootstrap', ?2, 'user', ?2)",
     )
+    .bind(Uuid::new_v4())
     .bind(root)
     .bind(hash_token(token))
-    .execute(&mut *conn)
+    .execute(conn)
     .await
     .map_err(|e| StoreError::db("create bootstrap credential", e))?;
     Ok(())
@@ -115,21 +111,23 @@ pub async fn ensure_bootstrap_credential(
 /// It returns `NoCredential` for an unknown, revoked, expired or disabled
 /// credential, and for a disabled actor. Absence of scope is deny, and that
 /// starts at the edge.
-pub async fn resolve_credential(conn: &mut PgConnection, token: &str) -> Result<Credential> {
+pub async fn resolve_credential(conn: &Connection, token: &str) -> Result<Credential> {
     if token.is_empty() {
         return Err(StoreError::NoCredential);
     }
     let hash = hash_token(token);
-    let row = sqlx::query(
+    let now = hive_db::now();
+    let row = query(
         "SELECT c.actor_id, c.principal_kind, c.principal_id
            FROM credentials c
            JOIN actors a ON a.id = c.actor_id AND a.disabled_at IS NULL
-          WHERE c.token_sha256 = $1
+          WHERE c.token_sha256 = ?1
             AND c.revoked_at IS NULL
-            AND (c.expires_at IS NULL OR c.expires_at > now())",
+            AND (c.expires_at IS NULL OR c.expires_at > ?2)",
     )
     .bind(&hash)
-    .fetch_optional(&mut *conn)
+    .bind(now)
+    .fetch_optional(conn)
     .await
     .map_err(|e| StoreError::db("resolve credential", e))?
     .ok_or(StoreError::NoCredential)?;
@@ -142,9 +140,10 @@ pub async fn resolve_credential(conn: &mut PgConnection, token: &str) -> Result<
     // Best effort: a failed bookkeeping write must not fail an authorised
     // request. Kept on the caller's connection rather than spawned, because
     // it may be a transaction and outliving it would be a use-after-commit.
-    let _ = sqlx::query("UPDATE credentials SET last_used_at = now() WHERE token_sha256 = $1")
+    let _ = query("UPDATE credentials SET last_used_at = ?2 WHERE token_sha256 = ?1")
         .bind(&hash)
-        .execute(&mut *conn)
+        .bind(now)
+        .execute(conn)
         .await;
     Ok(cred)
 }
@@ -170,23 +169,21 @@ pub struct CredentialDetail {
 /// interval and compares results with `==`; widening what IT returns would make
 /// stream teardown depend on bookkeeping fields that move underneath a healthy
 /// session. Only /whoami pays for the wider query.
-pub async fn credential_detail_by_token<'e, E>(db: E, token: &str) -> Result<CredentialDetail>
-where
-    E: Executor<'e, Database = Postgres>,
-{
+pub async fn credential_detail_by_token(db: &Connection, token: &str) -> Result<CredentialDetail> {
     if token.is_empty() {
         return Err(StoreError::NoCredential);
     }
-    let row = sqlx::query(
+    let row = query(
         "SELECT c.id, c.actor_id, c.principal_kind, c.principal_id,
                 c.label, c.created_at, c.last_used_at
            FROM credentials c
            JOIN actors a ON a.id = c.actor_id AND a.disabled_at IS NULL
-          WHERE c.token_sha256 = $1
+          WHERE c.token_sha256 = ?1
             AND c.revoked_at IS NULL
-            AND (c.expires_at IS NULL OR c.expires_at > now())",
+            AND (c.expires_at IS NULL OR c.expires_at > ?2)",
     )
     .bind(hash_token(token))
+    .bind(hive_db::now())
     .fetch_optional(db)
     .await
     .map_err(|e| StoreError::db("read credential detail", e))?

@@ -26,13 +26,10 @@ pub(crate) async fn start(State(s): State<AppState>, headers: HeaderMap) -> Resp
     let Some(token) = token else {
         return hive_httpauth::unauthorized();
     };
-    let Ok(mut conn) = s.store().conn().await else {
+    let Ok(conn) = s.store().conn().await else {
         return hive_httpauth::unauthorized();
     };
-    if hive_store::resolve_credential(&mut conn, token)
-        .await
-        .is_err()
-    {
+    if hive_store::resolve_credential(&conn, token).await.is_err() {
         // One 401 for every reason, as everywhere else.
         return hive_httpauth::unauthorized();
     }

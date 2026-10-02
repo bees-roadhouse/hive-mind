@@ -41,7 +41,11 @@ impl Bus {
         // own cursor, so there is nothing to gain from pushing the whole log
         // through the hub at boot.
         let head = loop {
-            match hive_store::head(&self.inner.pool).await {
+            let read = match self.inner.conn().await {
+                Ok(c) => hive_store::head(&c).await,
+                Err(e) => Err(e),
+            };
+            match read {
                 Ok(h) => break h,
                 Err(e) => {
                     tracing::warn!(err = %e, "bus: read head");
@@ -88,8 +92,8 @@ impl Bus {
 impl Tailer {
     async fn cycle(&mut self) -> Result<(), hive_store::StoreError> {
         let cfg = self.bus.inner.cfg.clone();
-        let pool = self.bus.inner.pool.clone();
-        let pool = &pool;
+        let conn = self.bus.inner.conn().await?;
+        let pool = &*conn;
         // One clock read per cycle rather than per iteration.
         let db_now = hive_store::now(pool).await?;
 
@@ -105,9 +109,9 @@ impl Tailer {
         }
 
         // 2. Sweep the window behind the cursor for anything that committed
-        //    late. bigserial ids are assigned before commit, so a transaction
-        //    that took its id early and committed just now sits BELOW the
-        //    cursor and step 1 will never return it.
+        //    late. Ids and timestamps are assigned before commit, so a
+        //    transaction that took its id early and committed just now sits
+        //    BELOW the cursor and step 1 will never return it.
         if !self.cursor.is_zero()
             && let Some(at) = self.cursor.at
         {

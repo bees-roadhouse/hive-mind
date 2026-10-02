@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 tokio.workspace = true
-sqlx.workspace = true
+hive-db = { path = "../hive-db" }
 uuid.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

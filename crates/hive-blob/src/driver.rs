@@ -1,6 +1,6 @@
 //! Where bytes physically live. Disk today, S3-compatible beside it.
 //!
-//! The split that makes crashes recoverable: **Postgres is the authority on
+//! The split that makes crashes recoverable: **the catalog is the authority on
 //! what exists; the driver is the authority on what the bytes are.** Neither is
 //! asked the other's question. A driver never consults a database and never
 //! decides who may read anything; it stores, returns and deletes bytes at a

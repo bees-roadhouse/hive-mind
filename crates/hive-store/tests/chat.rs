@@ -5,6 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{World, cred, user};
+use hive_db::query;
 use hive_harness::{Event, EventStream, Limits, NetworkMode, RunRecord, RunStore, Runtime};
 use hive_identity::{Credential, PrincipalKind};
 use hive_store::{
@@ -65,9 +66,7 @@ fn denied(e: &StoreError) -> bool {
 /// Ported from `TestPostMessageOpensATurnOnlyForUserMessages`.
 #[tokio::test]
 async fn post_message_opens_a_turn_only_for_user_messages() {
-    let Some(w) = World::new("post_message_opens_turn").await else {
-        return;
-    };
+    let w = World::new("post_message_opens_turn").await;
     let chat = Chat::new(w.store.clone());
     let c = owner_cred(&w);
     let conv = chat
@@ -94,9 +93,7 @@ async fn post_message_opens_a_turn_only_for_user_messages() {
 /// Ported from `TestMessageSequencesAreDense`.
 #[tokio::test]
 async fn message_sequences_are_dense() {
-    let Some(w) = World::new("message_sequences_dense").await else {
-        return;
-    };
+    let w = World::new("message_sequences_dense").await;
     let chat = Chat::new(w.store.clone());
     let c = owner_cred(&w);
     let conv = chat
@@ -121,9 +118,7 @@ async fn message_sequences_are_dense() {
 /// Ported from `TestMessageTrustIsRecordedVerbatim` (invariant 9).
 #[tokio::test]
 async fn message_trust_is_recorded_verbatim() {
-    let Some(w) = World::new("message_trust_verbatim").await else {
-        return;
-    };
+    let w = World::new("message_trust_verbatim").await;
     let chat = Chat::new(w.store.clone());
     let c = owner_cred(&w);
     let conv = chat
@@ -147,9 +142,7 @@ async fn message_trust_is_recorded_verbatim() {
 /// Ported from `TestStrangerCanNeitherReadNorPost`.
 #[tokio::test]
 async fn stranger_can_neither_read_nor_post() {
-    let Some(w) = World::new("stranger_neither_reads_nor_posts").await else {
-        return;
-    };
+    let w = World::new("stranger_neither_reads_nor_posts").await;
     let chat = Chat::new(w.store.clone());
     let c = owner_cred(&w);
     let conv = chat
@@ -173,9 +166,7 @@ async fn stranger_can_neither_read_nor_post() {
 /// Ported from `TestRecordSessionIgnoresAnEmptyID`.
 #[tokio::test]
 async fn record_session_ignores_an_empty_id() {
-    let Some(w) = World::new("record_session_ignores_empty").await else {
-        return;
-    };
+    let w = World::new("record_session_ignores_empty").await;
     let chat = Chat::new(w.store.clone());
     let c = owner_cred(&w);
     let conv = chat
@@ -195,9 +186,7 @@ async fn record_session_ignores_an_empty_id() {
 /// Ported from `TestSessionsAreKeyedOnTheConversation`.
 #[tokio::test]
 async fn sessions_are_keyed_on_the_conversation() {
-    let Some(w) = World::new("sessions_keyed_on_conversation").await else {
-        return;
-    };
+    let w = World::new("sessions_keyed_on_conversation").await;
     let chat = Chat::new(w.store.clone());
     let c = owner_cred(&w);
     let a = chat
@@ -219,9 +208,7 @@ async fn sessions_are_keyed_on_the_conversation() {
 /// Ported from `TestConversationsListGoesThroughThePredicate`.
 #[tokio::test]
 async fn conversations_list_goes_through_the_predicate() {
-    let Some(w) = World::new("conversations_list_predicate").await else {
-        return;
-    };
+    let w = World::new("conversations_list_predicate").await;
     let chat = Chat::new(w.store.clone());
     let owner = owner_cred(&w);
     let first = chat
@@ -236,9 +223,10 @@ async fn conversations_list_goes_through_the_predicate() {
         .create_conversation(&owner, "claude", "", "archived")
         .await
         .expect("create archived");
-    sqlx::query("UPDATE conversations SET archived_at = now() WHERE id = $1")
+    query("UPDATE conversations SET archived_at = ?2 WHERE id = ?1")
         .bind(archived.id)
-        .execute(w.pool())
+        .bind(common::now())
+        .execute(&*w.conn().await)
         .await
         .unwrap();
 
@@ -262,7 +250,7 @@ async fn conversations_list_goes_through_the_predicate() {
     );
 
     write_grant(
-        w.pool(),
+        &*w.conn().await,
         &GrantSpec {
             reason: "test".into(),
             ..GrantSpec::direct(
@@ -296,9 +284,7 @@ async fn conversations_list_goes_through_the_predicate() {
 /// Ported from `TestArchivedConversationReadsAsDenied`.
 #[tokio::test]
 async fn archived_conversation_reads_as_denied() {
-    let Some(w) = World::new("archived_conversation_denied").await else {
-        return;
-    };
+    let w = World::new("archived_conversation_denied").await;
     let chat = Chat::new(w.store.clone());
     let owner = owner_cred(&w);
     let conv = chat
@@ -312,9 +298,10 @@ async fn archived_conversation_reads_as_denied() {
             .id,
         conv.id
     );
-    sqlx::query("UPDATE conversations SET archived_at = now() WHERE id = $1")
+    query("UPDATE conversations SET archived_at = ?2 WHERE id = ?1")
         .bind(conv.id)
-        .execute(w.pool())
+        .bind(common::now())
+        .execute(&*w.conn().await)
         .await
         .unwrap();
     assert!(denied(
@@ -334,9 +321,7 @@ async fn archived_conversation_reads_as_denied() {
 /// Ported from `TestClaimTurnRunsOneTurnPerConversation`.
 #[tokio::test]
 async fn claim_turn_runs_one_turn_per_conversation() {
-    let Some(w) = World::new("claim_turn_one_per_conversation").await else {
-        return;
-    };
+    let w = World::new("claim_turn_one_per_conversation").await;
     let chat = Chat::new(w.store.clone());
     let owner = owner_cred(&w);
     let conv = chat
@@ -403,9 +388,7 @@ async fn claim_turn_runs_one_turn_per_conversation() {
 /// Ported from `TestOpenTurnsTrackTheClaim`.
 #[tokio::test]
 async fn open_turns_track_the_claim() {
-    let Some(w) = World::new("open_turns_track_claim").await else {
-        return;
-    };
+    let w = World::new("open_turns_track_claim").await;
     let chat = Chat::new(w.store.clone());
     let owner = owner_cred(&w);
     let conv = chat
@@ -450,9 +433,7 @@ async fn open_turns_track_the_claim() {
 /// Ported from `TestReclaimFailsALapsedTurnAndFencesTheWorker`.
 #[tokio::test]
 async fn reclaim_fails_a_lapsed_turn_and_fences_the_worker() {
-    let Some(w) = World::new("reclaim_fails_lapsed_turn").await else {
-        return;
-    };
+    let w = World::new("reclaim_fails_lapsed_turn").await;
     let chat = Chat::new(w.store.clone());
     let owner = owner_cred(&w);
     let conv = chat
@@ -477,13 +458,12 @@ async fn reclaim_fails_a_lapsed_turn_and_fences_the_worker() {
         &format!("chat-{}", claim.turn_id),
     )
     .await;
-    sqlx::query(
-        "UPDATE chat_turns SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
-    )
-    .bind(claim.turn_id)
-    .execute(w.pool())
-    .await
-    .unwrap();
+    query("UPDATE chat_turns SET lease_expires_at = ?2 WHERE id = ?1")
+        .bind(claim.turn_id)
+        .bind(common::now() - chrono::Duration::seconds(1))
+        .execute(&*w.conn().await)
+        .await
+        .unwrap();
 
     let reclaimed = chat.reclaim_lapsed_turns().await.expect("reclaim");
     assert_eq!(reclaimed.len(), 1);
@@ -502,14 +482,14 @@ async fn reclaim_fails_a_lapsed_turn_and_fences_the_worker() {
         "the heartbeat extended a lease the reclaimer had already taken"
     );
 
-    let turn_state: String = sqlx::query_scalar("SELECT state FROM chat_turns WHERE id = $1")
+    let turn_state: String = query("SELECT state FROM chat_turns WHERE id = ?1")
         .bind(claim.turn_id)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
-    let run_state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE turn_id = $1")
+    let run_state: String = query("SELECT state FROM agent_runs WHERE turn_id = ?1")
         .bind(claim.turn_id)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
     assert_eq!(
@@ -521,9 +501,9 @@ async fn reclaim_fails_a_lapsed_turn_and_fences_the_worker() {
     chat.close_turn(claim.turn_id, TURN_DONE)
         .await
         .expect("late close");
-    let turn_state: String = sqlx::query_scalar("SELECT state FROM chat_turns WHERE id = $1")
+    let turn_state: String = query("SELECT state FROM chat_turns WHERE id = ?1")
         .bind(claim.turn_id)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
     assert_eq!(
@@ -537,9 +517,7 @@ async fn reclaim_fails_a_lapsed_turn_and_fences_the_worker() {
 /// Ported from `TestTurnEventsReplayAcrossTurns`.
 #[tokio::test]
 async fn turn_events_replay_across_turns() {
-    let Some(w) = World::new("turn_events_replay").await else {
-        return;
-    };
+    let w = World::new("turn_events_replay").await;
     let chat = Chat::new(w.store.clone());
     let owner = owner_cred(&w);
     let conv = chat

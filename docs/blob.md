@@ -41,8 +41,8 @@ So: **global bytes, per-reference everything else.**
 
 ## The split that makes crashes recoverable
 
-**Postgres is the authority on what exists. The driver is the authority on what
-the bytes are.** Neither is asked the other's question.
+**The store is the authority on what exists. The driver is the authority on
+what the bytes are.** Neither is asked the other's question.
 
 A driver never consults a database and never decides who may read anything. It
 stores, returns and deletes bytes at a content address. That is what lets the

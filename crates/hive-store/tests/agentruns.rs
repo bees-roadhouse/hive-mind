@@ -5,6 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::{World, cred};
+use hive_db::query;
 use hive_harness::{
     Event, EventStream, Limits, NetworkMode, RunRecord, RunResult, RunStore, Runtime, TerminalState,
 };
@@ -56,9 +57,7 @@ fn root_cred(w: &World) -> Credential {
 /// Ported from `TestAgentRunStoreRoundTrip`.
 #[tokio::test]
 async fn agent_run_store_round_trip() {
-    let Some(w) = World::new("agent_run_round_trip").await else {
-        return;
-    };
+    let w = World::new("agent_run_round_trip").await;
     let rs = AgentRunStore::new(w.store.clone(), writer(root_cred(&w), Level::Trusted))
         .expect("new store");
     let rec = record("run-roundtrip-1");
@@ -90,15 +89,17 @@ async fn agent_run_store_round_trip() {
     .await
     .expect("finish");
 
-    let (state, session, events): (String, String, i64) = sqlx::query_as(
-        "SELECT r.state, r.session_id, count(e.seq)
+    let row = query(
+        "SELECT r.state, r.session_id, count(e.seq) AS events
            FROM agent_runs r LEFT JOIN agent_run_events e ON e.run_id = r.id
-          WHERE r.run_key = $1 GROUP BY r.state, r.session_id",
+          WHERE r.run_key = ?1 GROUP BY r.state, r.session_id",
     )
     .bind(&rec.run_id)
-    .fetch_one(w.pool())
+    .fetch_one(&*w.conn().await)
     .await
     .expect("read back");
+    let (state, session, events): (String, String, i64) =
+        (row.get("state"), row.get("session_id"), row.get("events"));
     assert_eq!(state, "succeeded");
     assert_eq!(events, 3);
     // The session id arrives with the result rather than the record.
@@ -108,20 +109,24 @@ async fn agent_run_store_round_trip() {
 /// Ported from `TestAgentRunPinsAuthorAndOwnerFromTheCredential` (invariant 2).
 #[tokio::test]
 async fn agent_run_pins_author_and_owner_from_the_credential() {
-    let Some(w) = World::new("agent_run_pins_author_owner").await else {
-        return;
-    };
+    let w = World::new("agent_run_pins_author_owner").await;
     let c = root_cred(&w);
     let rs = AgentRunStore::new(w.store.clone(), writer(c, Level::Untrusted)).expect("new store");
     let rec = record("run-identity-1");
     rs.create_run(rec.clone()).await.expect("create");
-    let (author, owner_kind, owner_id, recorded): (Uuid, String, Uuid, String) = sqlx::query_as(
-        "SELECT author_actor, owner_kind, owner_id, trust FROM agent_runs WHERE run_key = $1",
+    let row = query(
+        "SELECT author_actor, owner_kind, owner_id, trust FROM agent_runs WHERE run_key = ?1",
     )
     .bind(&rec.run_id)
-    .fetch_one(w.pool())
+    .fetch_one(&*w.conn().await)
     .await
     .unwrap();
+    let (author, owner_kind, owner_id, recorded): (Uuid, String, Uuid, String) = (
+        row.get("author_actor"),
+        row.get("owner_kind"),
+        row.get("owner_id"),
+        row.get("trust"),
+    );
     assert_eq!(author, c.actor_id);
     assert_eq!((owner_kind.as_str(), owner_id), ("user", c.principal_id));
     // Trust comes from the writer, not from anything the run said about itself.
@@ -131,9 +136,7 @@ async fn agent_run_pins_author_and_owner_from_the_credential() {
 /// Ported from `TestFinishDoesNotOverwriteATerminalState` (invariant 10).
 #[tokio::test]
 async fn finish_does_not_overwrite_a_terminal_state() {
-    let Some(w) = World::new("finish_does_not_overwrite").await else {
-        return;
-    };
+    let w = World::new("finish_does_not_overwrite").await;
     let rs = AgentRunStore::new(w.store.clone(), writer(root_cred(&w), Level::Trusted)).unwrap();
     let rec = record("run-terminal-1");
     rs.create_run(rec.clone()).await.expect("create");
@@ -146,9 +149,9 @@ async fn finish_does_not_overwrite_a_terminal_state() {
     rs.finish_run(&rec.run_id, result(TerminalState::Succeeded, 0, &rec))
         .await
         .expect("second finish should be a no-op");
-    let state: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE run_key = $1")
+    let state: String = query("SELECT state FROM agent_runs WHERE run_key = ?1")
         .bind(&rec.run_id)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
     assert_eq!(
@@ -161,9 +164,7 @@ async fn finish_does_not_overwrite_a_terminal_state() {
 /// container name, not a capability.
 #[tokio::test]
 async fn append_cannot_reach_another_owners_run() {
-    let Some(w) = World::new("append_cannot_reach_other_run").await else {
-        return;
-    };
+    let w = World::new("append_cannot_reach_other_run").await;
     let c = root_cred(&w);
     let mine = AgentRunStore::new(w.store.clone(), writer(c, Level::Trusted)).unwrap();
     let rec = record("run-owned-1");
@@ -189,11 +190,11 @@ async fn append_cannot_reach_another_owners_run() {
             .is_err(),
         "appended to another owner's run"
     );
-    let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM agent_run_events e JOIN agent_runs r ON r.id = e.run_id WHERE r.run_key = $1",
+    let count: i64 = query(
+        "SELECT count(*) FROM agent_run_events e JOIN agent_runs r ON r.id = e.run_id WHERE r.run_key = ?1",
     )
     .bind(&rec.run_id)
-    .fetch_one(w.pool())
+    .fetch_scalar(&*w.conn().await)
     .await
     .unwrap();
     assert_eq!(count, 0);
@@ -202,9 +203,7 @@ async fn append_cannot_reach_another_owners_run() {
 /// Ported from `TestAgentRunStoreRefusesAnIncompleteCredential`.
 #[tokio::test]
 async fn agent_run_store_refuses_an_incomplete_credential() {
-    let Some(w) = World::new("agent_run_store_incomplete_cred").await else {
-        return;
-    };
+    let w = World::new("agent_run_store_incomplete_cred").await;
     let empty = Credential::new(Uuid::nil(), PrincipalKind::User, Uuid::nil());
     assert!(
         AgentRunStore::new(w.store.clone(), RunWriter::new(empty)).is_err(),
@@ -216,9 +215,7 @@ async fn agent_run_store_refuses_an_incomplete_credential() {
 /// CHECK that omitted 'proxied', and the tests only ever passed Daemon.
 #[tokio::test]
 async fn agent_run_store_accepts_every_network_mode() {
-    let Some(w) = World::new("agent_run_every_network_mode").await else {
-        return;
-    };
+    let w = World::new("agent_run_every_network_mode").await;
     let rs = AgentRunStore::new(w.store.clone(), writer(root_cred(&w), Level::Trusted)).unwrap();
     for (i, mode) in [NetworkMode::None, NetworkMode::Daemon, NetworkMode::Proxied]
         .into_iter()
@@ -238,9 +235,7 @@ async fn agent_run_store_accepts_every_network_mode() {
 /// omitted 'deadline_exceeded', which the ordinary long-answer path returns.
 #[tokio::test]
 async fn agent_run_store_accepts_every_terminal_state() {
-    let Some(w) = World::new("agent_run_every_terminal_state").await else {
-        return;
-    };
+    let w = World::new("agent_run_every_terminal_state").await;
     let rs = AgentRunStore::new(w.store.clone(), writer(root_cred(&w), Level::Trusted)).unwrap();
     let states = [
         TerminalState::Succeeded,
@@ -255,9 +250,9 @@ async fn agent_run_store_accepts_every_terminal_state() {
         rs.finish_run(&rec.run_id, result(state, -1, &rec))
             .await
             .unwrap_or_else(|e| panic!("finish_run with state {state:?}: {e}"));
-        let got: String = sqlx::query_scalar("SELECT state FROM agent_runs WHERE run_key = $1")
+        let got: String = query("SELECT state FROM agent_runs WHERE run_key = ?1")
             .bind(&rec.run_id)
-            .fetch_one(w.pool())
+            .fetch_scalar(&*w.conn().await)
             .await
             .unwrap();
         assert_eq!(got, state.as_str());
@@ -267,9 +262,7 @@ async fn agent_run_store_accepts_every_terminal_state() {
 /// Ported from `TestUntrustedRunCannotHaveEgress` (D17.3).
 #[tokio::test]
 async fn untrusted_run_cannot_have_egress() {
-    let Some(w) = World::new("untrusted_run_cannot_have_egress").await else {
-        return;
-    };
+    let w = World::new("untrusted_run_cannot_have_egress").await;
     let c = root_cred(&w);
     let tainted = AgentRunStore::new(w.store.clone(), writer(c, Level::Untrusted)).unwrap();
     assert!(

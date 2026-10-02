@@ -8,10 +8,10 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
+use hive_db::{Conn, Connection, Db, Transaction, query};
 use hive_identity::{Credential, Owner};
 use hive_trust::Level;
 use serde::{Deserialize, Serialize};
-use sqlx::{Executor, PgConnection, PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::driver::{CreateUpload, Driver, Range, Sealed, Upload};
@@ -245,22 +245,29 @@ fn not_found(h: Hash) -> BlobError {
 
 /// The reference layer over the blobs and blob_refs rows and a driver.
 pub struct Catalog {
-    pool: PgPool,
+    db: Db,
     driver: Box<dyn Driver>,
 }
 
 impl Catalog {
-    /// Binds a catalog to a pool and a driver.
-    pub fn new(pool: PgPool, driver: Box<dyn Driver>) -> Catalog {
-        Catalog { pool, driver }
+    /// Binds a catalog to a database file and a driver.
+    pub fn new(db: Db, driver: Box<dyn Driver>) -> Catalog {
+        Catalog { db, driver }
     }
 
     pub fn driver(&self) -> &dyn Driver {
         self.driver.as_ref()
     }
 
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
+    async fn conn(&self) -> Result<Conn> {
+        self.db
+            .conn()
+            .await
+            .map_err(|e| BlobError::db("connect", e))
     }
 
     /// Records the intent to store bytes, before they exist.
@@ -282,9 +289,10 @@ impl Catalog {
         }
         let class = prov.validate()?;
         let mime = if mime.is_empty() { DEFAULT_MIME } else { mime };
-        let row = sqlx::query(
-            "INSERT INTO blobs (sha256, size, mime, driver, state, class, source_hash, recipe)
-             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7)
+        let c = self.conn().await?;
+        let state: String = query(
+            "INSERT INTO blobs (sha256, size, mime, driver, state, class, source_hash, recipe, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8)
              ON CONFLICT (sha256) DO UPDATE
                  -- Touch nothing on conflict. A live row's provenance was captured
                  -- at ingest and a second producer does not revise it; a pending
@@ -298,28 +306,35 @@ impl Catalog {
         .bind(self.driver.name())
         .bind(class.as_str())
         .bind(prov.source_hash_text())
-        .bind(&prov.recipe)
-        .fetch_one(&self.pool)
+        .bind(prov.recipe.as_ref())
+        .bind(hive_db::now())
+        .fetch_scalar(&c)
         .await
         .map_err(|e| BlobError::db(format!("reserve {h}"), e))?;
-        let state: String = row.get(0);
         State::parse(&state)
             .ok_or_else(|| BlobError::Backend(format!("unknown blob state {state:?}")))
     }
 
     /// Flips a blob live and writes its reference in one transaction.
     ///
-    /// It takes a transaction rather than a pool on purpose. "No blob exists
-    /// without a ref" (invariant 8) is only true if the two writes cannot be
-    /// separated, and a signature accepting a pool would let a caller separate
-    /// them by accident. The type is the enforcement.
+    /// It takes a transaction rather than a connection on purpose. "No blob
+    /// exists without a ref" (invariant 8) is only true if the two writes
+    /// cannot be separated, and a signature accepting a bare connection would
+    /// let a caller separate them by accident. The type is the enforcement.
     ///
     /// The bytes have already been sealed through the driver; this is the
     /// metadata half. Publishing bytes that are already live is a dedup hit: the
     /// row stays as it was and only the new reference is written.
+    ///
+    /// The order inside the transaction is load-bearing and is the one the
+    /// schema's trigger checks: the row exists (pending if it did not), the
+    /// reference is written, THEN the state flips to live. SQLite's triggers
+    /// are immediate, so a flip before the reference is refused by the
+    /// database, which is the invariant holding for every writer and not only
+    /// this one.
     pub async fn publish(
         &self,
-        tx: &mut Transaction<'_, Postgres>,
+        tx: &Transaction,
         sealed: Sealed,
         mime: &str,
         prov: &Provenance,
@@ -332,39 +347,59 @@ impl Catalog {
         let class = prov.validate()?;
         spec.validate()?;
         let mime = if mime.is_empty() { DEFAULT_MIME } else { mime };
+        let now = hive_db::now();
 
-        // driver_ref is the key the bytes actually live at, recorded so a later
-        // config change can still find them.
-        let res = sqlx::query(
-            "INSERT INTO blobs (sha256, size, mime, driver, driver_ref, state, class, source_hash, recipe, live_at)
-             VALUES ($1, $2, $3, $4, $5, 'live', $6, $7, $8, now())
-             ON CONFLICT (sha256) DO UPDATE
-                 SET state      = 'live',
-                     driver_ref = EXCLUDED.driver_ref,
-                     live_at    = COALESCE(blobs.live_at, now())
-                 -- Only a row that is not already trashed may be flipped.
-                 -- Re-publishing over an evicted row is how regenerable bytes come
-                 -- back; over a trashed one it would resurrect something deleted.
-                 WHERE blobs.state IN ('pending', 'live', 'evicted')",
-        )
-        .bind(h.to_string())
-        .bind(sealed.size() as i64)
-        .bind(mime)
-        .bind(self.driver.name())
-        .bind(h.key())
-        .bind(class.as_str())
-        .bind(prov.source_hash_text())
-        .bind(&prov.recipe)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| BlobError::db(format!("publish {h}"), e))?;
-        if res.rows_affected() == 0 {
+        // Only a row that is not already trashed may be flipped. Re-publishing
+        // over an evicted row is how regenerable bytes come back; over a
+        // trashed one it would resurrect something deleted.
+        let existing: Option<String> = query("SELECT state FROM blobs WHERE sha256 = ?1")
+            .bind(h.to_string())
+            .fetch_scalar_optional(tx)
+            .await
+            .map_err(|e| BlobError::db(format!("publish {h}"), e))?;
+        if existing.as_deref() == Some("trashed") {
             return Err(BlobError::Invalid(format!(
                 "refusing to publish over a trashed blob {h}"
             )));
         }
+        if existing.is_none() {
+            query(
+                "INSERT INTO blobs (sha256, size, mime, driver, state, class, source_hash, recipe, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8)",
+            )
+            .bind(h.to_string())
+            .bind(sealed.size() as i64)
+            .bind(mime)
+            .bind(self.driver.name())
+            .bind(class.as_str())
+            .bind(prov.source_hash_text())
+            .bind(prov.recipe.as_ref())
+            .bind(now)
+            .execute(tx)
+            .await
+            .map_err(|e| BlobError::db(format!("publish {h}"), e))?;
+        }
 
         let r = insert_ref(tx, h, spec, spec.trust).await?;
+
+        // driver_ref is the key the bytes actually live at, recorded so a later
+        // config change can still find them.
+        let n = query(
+            "UPDATE blobs
+                SET state = 'live', driver_ref = ?2, live_at = coalesce(live_at, ?3)
+              WHERE sha256 = ?1 AND state IN ('pending', 'live', 'evicted')",
+        )
+        .bind(h.to_string())
+        .bind(h.key())
+        .bind(now)
+        .execute(tx)
+        .await
+        .map_err(|e| BlobError::db(format!("publish {h}"), e))?;
+        if n == 0 {
+            return Err(BlobError::Invalid(format!(
+                "refusing to publish over a trashed blob {h}"
+            )));
+        }
         Ok((
             Descriptor {
                 hash: h,
@@ -404,12 +439,7 @@ impl Catalog {
     /// that and a `Hash` is not, and in Rust the difference is the type: there
     /// is no literal a caller can write. To reference bytes already held without
     /// re-sealing them, use [`Catalog::link_ref`].
-    pub async fn add_ref(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        sealed: Sealed,
-        spec: &RefSpec,
-    ) -> Result<Ref> {
+    pub async fn add_ref(&self, tx: &Transaction, sealed: Sealed, spec: &RefSpec) -> Result<Ref> {
         spec.validate()?;
         let h = sealed.hash();
         if h.is_zero() {
@@ -432,7 +462,7 @@ impl Catalog {
     /// through a second source kind.
     pub async fn link_ref(
         &self,
-        tx: &mut Transaction<'_, Postgres>,
+        tx: &Transaction,
         cred: &Credential,
         h: Hash,
         spec: &RefSpec,
@@ -448,7 +478,7 @@ impl Catalog {
                 "link_ref cannot write a reference owned by another principal".into(),
             ));
         }
-        let (_, held) = resolve_with(&mut **tx, cred, h).await?;
+        let (_, held) = resolve_with(tx, cred, h).await?;
         require_referenceable(tx, h).await?;
         // Weakest of what they asked for and what they already have.
         insert_ref(tx, h, spec, Level::weaker(spec.trust, held)).await
@@ -467,7 +497,8 @@ impl Catalog {
     /// references may honestly disagree, and the safe direction to resolve a
     /// disagreement about provenance is downward.
     pub async fn resolve(&self, cred: &Credential, h: Hash) -> Result<(Descriptor, Level)> {
-        resolve_with(&self.pool, cred, h).await
+        let c = self.conn().await?;
+        resolve_with(&c, cred, h).await
     }
 
     /// Resolves through the caller's references and only then reads bytes.
@@ -488,30 +519,27 @@ impl Catalog {
 
     /// Drops one reference. The bytes stay until nothing references them.
     ///
-    /// It takes any executor rather than a transaction, unlike the write paths,
-    /// and the asymmetry is deliberate. `publish` must be transactional because
-    /// a live blob with no reference is the dangerous direction. A release that
-    /// does not happen leaves a reference alive, which only keeps bytes that
-    /// could have gone ... conservative, not corrupting.
-    pub async fn release<'e, E>(
+    /// It takes any connection rather than a transaction, unlike the write
+    /// paths, and the asymmetry is deliberate. `publish` must be transactional
+    /// because a live blob with no reference is the dangerous direction. A
+    /// release that does not happen leaves a reference alive, which only keeps
+    /// bytes that could have gone ... conservative, not corrupting.
+    pub async fn release(
         &self,
-        db: E,
+        db: &Connection,
         cred: &Credential,
         h: Hash,
         kind: SourceKind,
         source_id: &str,
-    ) -> Result<()>
-    where
-        E: Executor<'e, Database = Postgres>,
-    {
+    ) -> Result<()> {
         cred.validate()
             .map_err(|e| BlobError::Invalid(e.to_string()))?;
         let owner = cred.owner_of();
-        let res = sqlx::query(
+        let n = query(
             "UPDATE blob_refs
-             SET released_at = now()
-             WHERE sha256 = $1 AND owner_kind = $2 AND owner_id = $3
-               AND source_kind = $4 AND source_id = $5
+             SET released_at = ?6
+             WHERE sha256 = ?1 AND owner_kind = ?2 AND owner_id = ?3
+               AND source_kind = ?4 AND source_id = ?5
                AND released_at IS NULL",
         )
         .bind(h.to_string())
@@ -519,10 +547,11 @@ impl Catalog {
         .bind(owner.id)
         .bind(kind.as_str())
         .bind(source_id)
+        .bind(hive_db::now())
         .execute(db)
         .await
         .map_err(|e| BlobError::db(format!("release ref for {h}"), e))?;
-        if res.rows_affected() == 0 {
+        if n == 0 {
             return Err(BlobError::NotFound(format!("no live reference to {h}")));
         }
         Ok(())
@@ -533,16 +562,13 @@ impl Catalog {
     /// This is the delete path: a document going away releases everything it
     /// held, in the caller's transaction, without the caller having to remember
     /// which descriptors were in it. Releasing nothing is not an error.
-    pub async fn release_by_source<'e, E>(
+    pub async fn release_by_source(
         &self,
-        db: E,
+        db: &Connection,
         cred: &Credential,
         kind: SourceKind,
         source_id: &str,
-    ) -> Result<u64>
-    where
-        E: Executor<'e, Database = Postgres>,
-    {
+    ) -> Result<u64> {
         cred.validate()
             .map_err(|e| BlobError::Invalid(e.to_string()))?;
         if source_id.is_empty() {
@@ -551,21 +577,21 @@ impl Catalog {
             ));
         }
         let owner = cred.owner_of();
-        let res = sqlx::query(
+        query(
             "UPDATE blob_refs
-             SET released_at = now()
-             WHERE owner_kind = $1 AND owner_id = $2
-               AND source_kind = $3 AND source_id = $4
+             SET released_at = ?5
+             WHERE owner_kind = ?1 AND owner_id = ?2
+               AND source_kind = ?3 AND source_id = ?4
                AND released_at IS NULL",
         )
         .bind(owner.kind.as_str())
         .bind(owner.id)
         .bind(kind.as_str())
         .bind(source_id)
+        .bind(hive_db::now())
         .execute(db)
         .await
-        .map_err(|e| BlobError::db(format!("release refs for {kind}/{source_id}"), e))?;
-        Ok(res.rows_affected())
+        .map_err(|e| BlobError::db(format!("release refs for {kind}/{source_id}"), e))
     }
 
     /// Lists the bytes one producer currently references.
@@ -574,35 +600,31 @@ impl Catalog {
     /// release that reference in the same transaction, and the only way to know
     /// which ones went is to compare what is held against what the new document
     /// names.
-    pub async fn held_by_source<'e, E>(
+    pub async fn held_by_source(
         &self,
-        db: E,
+        db: &Connection,
         cred: &Credential,
         kind: SourceKind,
         source_id: &str,
-    ) -> Result<Vec<Hash>>
-    where
-        E: Executor<'e, Database = Postgres>,
-    {
+    ) -> Result<Vec<Hash>> {
         cred.validate()
             .map_err(|e| BlobError::Invalid(e.to_string()))?;
         let owner = cred.owner_of();
-        let rows = sqlx::query(
+        let rows: Vec<String> = query(
             "SELECT sha256 FROM blob_refs
-             WHERE owner_kind = $1 AND owner_id = $2
-               AND source_kind = $3 AND source_id = $4
-               AND released_at IS NULL",
+             WHERE owner_kind = ?1 AND owner_id = ?2
+               AND source_kind = ?3 AND source_id = ?4
+               AND released_at IS NULL
+             ORDER BY created_at, id",
         )
         .bind(owner.kind.as_str())
         .bind(owner.id)
         .bind(kind.as_str())
         .bind(source_id)
-        .fetch_all(db)
+        .fetch_scalars(db)
         .await
         .map_err(|e| BlobError::db(format!("list refs for {kind}/{source_id}"), e))?;
-        rows.iter()
-            .map(|r| Hash::parse(r.get::<String, _>(0).as_str()))
-            .collect()
+        rows.iter().map(|s| Hash::parse(s)).collect()
     }
 
     /// Counts references keeping bytes alive, across every owner.
@@ -610,42 +632,40 @@ impl Catalog {
     /// **Across every owner is the point.** Scoping this per tenant is exactly
     /// what would let one owner's last release unlink bytes another still holds.
     pub async fn live_ref_count(&self, h: Hash) -> Result<i64> {
-        let row =
-            sqlx::query("SELECT count(*) FROM blob_refs WHERE sha256 = $1 AND released_at IS NULL")
-                .bind(h.to_string())
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| BlobError::db(format!("count refs for {h}"), e))?;
-        Ok(row.get::<i64, _>(0))
+        let c = self.conn().await?;
+        query("SELECT count(*) FROM blob_refs WHERE sha256 = ?1 AND released_at IS NULL")
+            .bind(h.to_string())
+            .fetch_scalar(&c)
+            .await
+            .map_err(|e| BlobError::db(format!("count refs for {h}"), e))
     }
 
     /// Lists live blobs nothing references any more: sweep candidates.
     ///
     /// Being a candidate is not permission to delete. `trash` is what deletes,
-    /// and it re-checks under the row lock, because a reference can be written
-    /// between the two calls.
+    /// and it re-checks under the write lock, because a reference can be
+    /// written between the two calls.
     pub async fn unreferenced(&self, older_than: DateTime<Utc>, limit: i64) -> Result<Vec<Hash>> {
         let limit = if limit <= 0 { 100 } else { limit };
-        let rows = sqlx::query(
+        let c = self.conn().await?;
+        let rows: Vec<String> = query(
             "SELECT b.sha256
              FROM blobs b
              WHERE b.state = 'live'
-               AND b.created_at < $1
+               AND b.created_at < ?1
                AND NOT EXISTS (
                    SELECT 1 FROM blob_refs r
                    WHERE r.sha256 = b.sha256 AND r.released_at IS NULL
                )
              ORDER BY b.created_at
-             LIMIT $2",
+             LIMIT ?2",
         )
         .bind(older_than)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_scalars(&c)
         .await
         .map_err(|e| BlobError::db("list unreferenced", e))?;
-        rows.iter()
-            .map(|r| Hash::parse(r.get::<String, _>(0).as_str()))
-            .collect()
+        rows.iter().map(|s| Hash::parse(s)).collect()
     }
 
     /// Marks a blob deleted, but only while nothing references it.
@@ -658,11 +678,11 @@ impl Catalog {
     ///
     /// Returns false when a reference appeared between the sweep and now, which
     /// is the race this re-check exists for.
-    pub async fn trash(&self, tx: &mut Transaction<'_, Postgres>, h: Hash) -> Result<bool> {
-        let res = sqlx::query(
+    pub async fn trash(&self, tx: &Transaction, h: Hash) -> Result<bool> {
+        let n = query(
             "UPDATE blobs
-             SET state = 'trashed', trashed_at = now()
-             WHERE sha256 = $1
+             SET state = 'trashed', trashed_at = ?2
+             WHERE sha256 = ?1
                AND state IN ('live', 'evicted')
                AND NOT EXISTS (
                    SELECT 1 FROM blob_refs r
@@ -670,10 +690,11 @@ impl Catalog {
                )",
         )
         .bind(h.to_string())
-        .execute(&mut **tx)
+        .bind(hive_db::now())
+        .execute(tx)
         .await
         .map_err(|e| BlobError::db(format!("trash {h}"), e))?;
-        Ok(res.rows_affected() == 1)
+        Ok(n == 1)
     }
 
     /// Removes the bytes of a row already marked trashed. Safe to re-run: the
@@ -682,15 +703,13 @@ impl Catalog {
     /// It refuses any other state, which is what stops a caller reaching past
     /// the reference check by calling the driver's delete directly.
     pub async fn delete_trashed_bytes(&self, h: Hash) -> Result<()> {
-        let row = sqlx::query("SELECT state FROM blobs WHERE sha256 = $1")
+        let c = self.conn().await?;
+        let state: Option<String> = query("SELECT state FROM blobs WHERE sha256 = ?1")
             .bind(h.to_string())
-            .fetch_optional(&self.pool)
+            .fetch_scalar_optional(&c)
             .await
             .map_err(|e| BlobError::db(format!("look up {h}"), e))?;
-        let state: String = match row {
-            Some(r) => r.get(0),
-            None => return Err(not_found(h)),
-        };
+        let state = state.ok_or_else(|| not_found(h))?;
         if state != "trashed" {
             return Err(BlobError::Invalid(format!(
                 "refusing to delete bytes of a {state} blob"
@@ -701,29 +720,27 @@ impl Catalog {
 }
 
 /// Rejects bytes that are absent or deliberately deleted.
-async fn require_referenceable(conn: &mut PgConnection, h: Hash) -> Result<()> {
-    let row = sqlx::query("SELECT state FROM blobs WHERE sha256 = $1")
+async fn require_referenceable(conn: &Connection, h: Hash) -> Result<()> {
+    let state: Option<String> = query("SELECT state FROM blobs WHERE sha256 = ?1")
         .bind(h.to_string())
-        .fetch_optional(&mut *conn)
+        .fetch_scalar_optional(conn)
         .await
         .map_err(|e| BlobError::db(format!("look up {h}"), e))?;
-    match row {
+    match state.as_deref() {
         None => Err(not_found(h)),
-        Some(r) if r.get::<String, _>(0) == "trashed" => {
-            Err(BlobError::NotFound(format!("{h} is trashed")))
-        }
+        Some("trashed") => Err(BlobError::NotFound(format!("{h} is trashed"))),
         Some(_) => Ok(()),
     }
 }
 
-async fn insert_ref(conn: &mut PgConnection, h: Hash, spec: &RefSpec, level: Level) -> Result<Ref> {
+async fn insert_ref(conn: &Connection, h: Hash, spec: &RefSpec, level: Level) -> Result<Ref> {
     let owner = spec.cred.owner_of();
     // One reference per (bytes, owner, producer, id). A producer re-running is
     // the same reference, not a second one, or a retry inflates the refcount
     // and the bytes are never collectable.
-    let row = sqlx::query(
-        "INSERT INTO blob_refs (sha256, owner_kind, owner_id, author_actor, source_kind, source_id, trust)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+    let row = query(
+        "INSERT INTO blob_refs (id, sha256, owner_kind, owner_id, author_actor, source_kind, source_id, trust, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (sha256, owner_kind, owner_id, source_kind, source_id) DO UPDATE
              -- Revive rather than leave a tombstone that makes live bytes look
              -- collectable.
@@ -733,15 +750,16 @@ async fn insert_ref(conn: &mut PgConnection, h: Hash, spec: &RefSpec, level: Lev
                  -- one that is still live is not, so the original author keeps
                  -- it. Invariant 2 says who did this must be answerable.
                  author_actor = CASE
-                     WHEN blob_refs.released_at IS NOT NULL THEN EXCLUDED.author_actor
+                     WHEN blob_refs.released_at IS NOT NULL THEN excluded.author_actor
                      ELSE blob_refs.author_actor END,
                  -- Never upward. Re-referencing must not launder untrusted bytes
                  -- into trusted ones (D17.1, invariant 9).
                  trust = CASE
-                     WHEN blob_refs.trust = 'untrusted' OR EXCLUDED.trust = 'untrusted'
+                     WHEN blob_refs.trust = 'untrusted' OR excluded.trust = 'untrusted'
                      THEN 'untrusted' ELSE 'trusted' END
          RETURNING id, trust, author_actor, created_at, released_at",
     )
+    .bind(Uuid::new_v4())
     .bind(h.to_string())
     .bind(owner.kind.as_str())
     .bind(owner.id)
@@ -749,7 +767,8 @@ async fn insert_ref(conn: &mut PgConnection, h: Hash, spec: &RefSpec, level: Lev
     .bind(spec.source_kind.as_str())
     .bind(&spec.source_id)
     .bind(level.as_str())
-    .fetch_one(&mut *conn)
+    .bind(hive_db::now())
+    .fetch_one(conn)
     .await
     .map_err(|e| BlobError::db(format!("write ref for {h}"), e))?;
     Ok(Ref {
@@ -759,29 +778,26 @@ async fn insert_ref(conn: &mut PgConnection, h: Hash, spec: &RefSpec, level: Lev
         author_actor: row.get("author_actor"),
         source_kind: spec.source_kind,
         source_id: spec.source_id.clone(),
-        trust: Level::from_db(row.get::<String, _>("trust").as_str()),
+        trust: Level::from_db(row.get::<String>("trust").as_str()),
         created_at: row.get("created_at"),
         released_at: row.get("released_at"),
     })
 }
 
-async fn resolve_with<'e, E>(db: E, cred: &Credential, h: Hash) -> Result<(Descriptor, Level)>
-where
-    E: Executor<'e, Database = Postgres>,
-{
+async fn resolve_with(db: &Connection, cred: &Credential, h: Hash) -> Result<(Descriptor, Level)> {
     cred.validate()
         .map_err(|e| BlobError::Invalid(e.to_string()))?;
     if h.is_zero() {
         return Err(BlobError::MalformedHash("zero hash".into()));
     }
     let owner = cred.owner_of();
-    let row = sqlx::query(
-        "SELECT b.size, b.mime, bool_or(r.trust = 'untrusted')
+    let row = query(
+        "SELECT b.size, b.mime, max(CASE WHEN r.trust = 'untrusted' THEN 1 ELSE 0 END) AS untrusted_any
          FROM blob_refs r
          JOIN blobs b ON b.sha256 = r.sha256
-         WHERE r.sha256 = $1
-           AND r.owner_kind = $2
-           AND r.owner_id = $3
+         WHERE r.sha256 = ?1
+           AND r.owner_kind = ?2
+           AND r.owner_id = ?3
            AND r.released_at IS NULL
            AND b.state = 'live'
          GROUP BY b.size, b.mime",
@@ -794,9 +810,9 @@ where
     .map_err(|e| BlobError::db(format!("resolve {h}"), e))?;
     // Not "forbidden". Not found.
     let row = row.ok_or_else(|| not_found(h))?;
-    let size: i64 = row.get(0);
-    let mime: String = row.get(1);
-    let untrusted_any: Option<bool> = row.get(2);
+    let size: i64 = row.get("size");
+    let mime: String = row.get("mime");
+    let untrusted_any: Option<bool> = row.get("untrusted_any");
     let level = if untrusted_any.unwrap_or(false) {
         Level::Untrusted
     } else {

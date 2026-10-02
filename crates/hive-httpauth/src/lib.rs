@@ -145,8 +145,8 @@ impl Auth {
         let Some(t) = token(headers, query) else {
             return Err(StoreError::NoCredential);
         };
-        let mut conn = self.store.conn().await?;
-        hive_store::resolve_credential(&mut conn, &t).await
+        let conn = self.store.conn().await?;
+        hive_store::resolve_credential(&conn, &t).await
     }
 }
 

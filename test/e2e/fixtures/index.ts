@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { test as base } from '@playwright/test';
 
 import { type Daemon, startDaemon } from './daemon';
-import { createSchema, EventWriter, type Schema } from './db';
+import { createStore, EventWriter, type Store } from './db';
 
 export {
   collectSSE,
@@ -18,11 +18,11 @@ export { EventWriter } from './db';
 
 interface WorkerFixtures {
   /**
-   * A Postgres schema of this worker's own. The daemon migrates into it, so
+   * A store directory of this worker's own. The daemon migrates into it, so
    * workers never see each other's events ... which matters because these specs
    * assert on what a stream did NOT deliver.
    */
-  schema: Schema;
+  store: Store;
 
   /**
    * A running daemon on an ephemeral port, one per worker, torn down when the
@@ -35,9 +35,9 @@ interface WorkerFixtures {
 
 interface TestFixtures {
   /**
-   * Appends events straight to Postgres, the way any other writer would. The
-   * daemon is the thing under test, so the events it streams should not come
-   * from the daemon.
+   * Appends events straight to the store file, the way any other writer
+   * would. The daemon is the thing under test, so the events it streams
+   * should not come from the daemon.
    */
   events: EventWriter;
   /** Auto-used: attaches the daemon's own log to any test that failed. */
@@ -45,22 +45,22 @@ interface TestFixtures {
 }
 
 export const test = base.extend<TestFixtures, WorkerFixtures>({
-  schema: [
+  store: [
     async ({}, use) => {
-      const schema = await createSchema();
+      const store = await createStore();
       try {
-        await use(schema);
+        await use(store);
       } finally {
-        await schema.drop();
+        await store.drop();
       }
     },
     { scope: 'worker' },
   ],
 
   daemon: [
-    async ({ schema }, use) => {
+    async ({ store }, use) => {
       const daemon = await startDaemon({
-        databaseURL: schema.url,
+        dataDir: store.dir,
         token: `e2e-${randomBytes(16).toString('hex')}`,
       });
       try {
@@ -72,10 +72,10 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
     { scope: 'worker' },
   ],
 
-  events: async ({ schema, daemon }, use) => {
+  events: async ({ store, daemon }, use) => {
     // Depends on daemon so the root actor exists: the daemon bootstraps it.
     void daemon;
-    const writer = await EventWriter.connect(schema);
+    const writer = await EventWriter.connect(store);
     try {
       await use(writer);
     } finally {

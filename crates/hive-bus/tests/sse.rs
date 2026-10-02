@@ -6,6 +6,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::routing::get;
 use hive_bus::{Bus, Config, SseOptions};
+use hive_db::query;
 use hive_httpauth::Auth;
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_store::{BootstrapConfig, Event, Store, append_events, issue_credential};
@@ -24,15 +25,9 @@ struct Harness {
 }
 
 impl Harness {
-    async fn new(test: &str) -> Option<Harness> {
-        let db = TestDb::new(test).await?;
-        hive_store::migrate(db.pool()).await.expect("migrate");
-        let mut conn = db.pool().acquire().await.unwrap();
-        hive_store::ensure_event_partitions(&mut conn, 1)
-            .await
-            .expect("partitions");
-        drop(conn);
-        let store = Store::from_pool(db.pool().clone());
+    async fn new(test: &str) -> Harness {
+        let db = TestDb::new(test).await;
+        let store = Store::from_dbs(db.db().clone(), db.audit().clone());
         let res = store
             .bootstrap_in_tx(&BootstrapConfig {
                 root_handle: "alice".into(),
@@ -42,18 +37,22 @@ impl Harness {
             .await
             .expect("bootstrap");
         let alice = res.root_actor_id;
-        Some(Harness {
+        Harness {
             db,
             store,
             alice,
             cred: Credential::new(alice, PrincipalKind::User, alice),
             cancel: CancellationToken::new(),
             runs: Vec::new(),
-        })
+        }
+    }
+
+    async fn conn(&self) -> hive_db::Conn {
+        self.store.conn().await.expect("checkout")
     }
 
     async fn run(&mut self, cfg: Config) -> Bus {
-        let b = Bus::new(self.db.pool().clone(), cfg);
+        let b = Bus::new(self.db.db().clone(), cfg);
         let bus = b.clone();
         let cancel = self.cancel.clone();
         self.runs
@@ -77,14 +76,14 @@ impl Harness {
 
     async fn human(&self, handle: &str) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', $2, $2, 'user', $1, $3)",
+             VALUES (?1, 'human', ?2, ?2, 'user', ?1, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(self.alice)
-        .execute(self.db.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap();
         id
@@ -97,8 +96,7 @@ impl Harness {
             format!("{{\"kind\":{kind:?}}}").into_bytes(),
         );
         ev.owner = owner;
-        let mut conn = self.db.pool().acquire().await.unwrap();
-        append_events(&mut conn, std::slice::from_mut(&mut ev))
+        append_events(&*self.conn().await, std::slice::from_mut(&mut ev))
             .await
             .expect("append");
         ev
@@ -107,7 +105,7 @@ impl Harness {
     async fn token_for(&self, actor: Uuid) -> String {
         let cred = Credential::new(actor, PrincipalKind::User, actor);
         issue_credential(
-            self.db.pool(),
+            &*self.conn().await,
             actor,
             Owner::user(actor),
             &cred,
@@ -136,16 +134,13 @@ impl Harness {
 
     /// Invalidates a token the way "log out everywhere" would.
     async fn revoke(&self, token: &str) {
-        let res = sqlx::query("UPDATE credentials SET revoked_at = now() WHERE token_sha256 = $1")
+        let rows = query("UPDATE credentials SET revoked_at = ?2 WHERE token_sha256 = ?1")
             .bind(hive_store::hash_token(token))
-            .execute(self.db.pool())
+            .bind(hive_db::now())
+            .execute(&*self.conn().await)
             .await
             .unwrap();
-        assert_eq!(
-            res.rows_affected(),
-            1,
-            "the test is not revoking what it thinks it is"
-        );
+        assert_eq!(rows, 1, "the test is not revoking what it thinks it is");
     }
 }
 
@@ -357,9 +352,7 @@ fn fast(poll_ms: u64, overlap_ms: u64) -> Config {
 /// Ported from `TestSSERequiresACredential`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sse_requires_a_credential() {
-    let Some(mut h) = Harness::new("sse_requires_credential").await else {
-        return;
-    };
+    let mut h = Harness::new("sse_requires_credential").await;
     let b = h.run(fast(200, 1000)).await;
     let (url, token) = h.sse_server(&b, SseOptions::default()).await;
     for (name, u) in [
@@ -385,9 +378,7 @@ async fn sse_requires_a_credential() {
 /// can still commit behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sse_checkpoints_only_settled_events() {
-    let Some(mut h) = Harness::new("sse_checkpoints_settled").await else {
-        return;
-    };
+    let mut h = Harness::new("sse_checkpoints_settled").await;
     let overlap = Duration::from_secs(2);
     let b = h.run(fast(100, 2000)).await;
     let (url, token) = h
@@ -437,9 +428,7 @@ async fn sse_checkpoints_only_settled_events() {
 /// Ported from `TestSSEResumesFromLastEventID`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sse_resumes_from_last_event_id() {
-    let Some(mut h) = Harness::new("sse_resumes").await else {
-        return;
-    };
+    let mut h = Harness::new("sse_resumes").await;
     let b = h.run(fast(100, 500)).await;
     let (url, token) = h
         .sse_server(
@@ -463,9 +452,7 @@ async fn sse_resumes_from_last_event_id() {
 /// Ported from `TestSSEAcceptsABareIDCursor`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sse_accepts_a_bare_id_cursor() {
-    let Some(mut h) = Harness::new("sse_bare_id").await else {
-        return;
-    };
+    let mut h = Harness::new("sse_bare_id").await;
     let b = h.run(fast(100, 500)).await;
     let (url, token) = h
         .sse_server(
@@ -489,9 +476,7 @@ async fn sse_accepts_a_bare_id_cursor() {
 /// Ported from `TestSSEStreamIsPerActorFiltered`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sse_stream_is_per_actor_filtered() {
-    let Some(mut h) = Harness::new("sse_per_actor").await else {
-        return;
-    };
+    let mut h = Harness::new("sse_per_actor").await;
     let bob = h.human("bob").await;
     let b = h.run(fast(100, 500)).await;
     let (url, _) = h
@@ -521,9 +506,7 @@ async fn sse_stream_is_per_actor_filtered() {
 /// settled watermark, never the head.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sse_resyncs_rather_than_truncating() {
-    let Some(mut h) = Harness::new("sse_resync").await else {
-        return;
-    };
+    let mut h = Harness::new("sse_resync").await;
     let b = h.run(fast(100, 500)).await;
     let (url, token) = h
         .sse_server(
@@ -565,9 +548,7 @@ async fn sse_resyncs_rather_than_truncating() {
 /// auth_recheck.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sse_stops_delivering_when_the_credential_is_revoked() {
-    let Some(mut h) = Harness::new("sse_revoked_stops").await else {
-        return;
-    };
+    let mut h = Harness::new("sse_revoked_stops").await;
     let b = h.run(fast(100, 500)).await;
     // keep_alive an hour so the recheck cannot happen on the keepalive tick:
     // this test is about the batch path.
@@ -600,9 +581,7 @@ async fn sse_stops_delivering_when_the_credential_is_revoked() {
 /// Ported from `TestSSEIdleStreamNoticesRevocation`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sse_idle_stream_notices_revocation() {
-    let Some(mut h) = Harness::new("sse_idle_revocation").await else {
-        return;
-    };
+    let mut h = Harness::new("sse_idle_revocation").await;
     let b = h.run(fast(100, 500)).await;
     let (url, token) = h
         .sse_server(
@@ -624,17 +603,15 @@ async fn sse_idle_stream_notices_revocation() {
 }
 
 /// Ported from `TestResyncNeverHandsOutAnEmptyRestartPoint`: the race removed
-/// rather than reversed. A channel nobody notifies plus a poll interval longer
+/// rather than reversed. A bell nobody listens to plus a poll interval longer
 /// than the test means the tailer CANNOT have read anything by the time the
 /// stream connects, on any machine at any speed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resync_never_hands_out_an_empty_restart_point() {
-    let Some(mut h) = Harness::new("sse_resync_never_empty").await else {
-        return;
-    };
+    let mut h = Harness::new("sse_resync_never_empty").await;
     let b = h
         .run(Config {
-            channel: "a_channel_nobody_notifies".into(),
+            listen: false,
             poll_interval: Duration::from_secs(3600),
             overlap: Duration::from_millis(500),
             ..Config::default()

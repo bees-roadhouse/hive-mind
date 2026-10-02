@@ -236,14 +236,14 @@ impl StreamCtx {
             Ok(fresh) if fresh == self.cred => {}
             _ => return false,
         }
-        let Ok(mut conn) = self.store.conn().await else {
+        let Ok(conn) = self.store.conn().await else {
             return false;
         };
         if self
             .store
             .guard()
             .authorize(
-                &mut conn,
+                &conn,
                 &self.cred,
                 &Subject::conversation(self.id),
                 Access::Read,

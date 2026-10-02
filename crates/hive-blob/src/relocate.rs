@@ -12,14 +12,14 @@
 //! row already records the driver that holds it, so old objects stay findable
 //! and stay exactly where they were. Nothing moves until something moves it.
 
-use sqlx::{PgPool, Row};
+use hive_db::{Db, query};
 use tokio::io::AsyncReadExt;
 
 use crate::driver::{CreateUpload, Driver, Range};
 use crate::{BlobError, Hash, Result};
 
 pub struct Relocator {
-    pool: PgPool,
+    db: Db,
     src: Box<dyn Driver>,
     dst: Box<dyn Driver>,
 }
@@ -28,14 +28,14 @@ impl Relocator {
     /// Builds a mover between two live drivers. Two drivers with the same name
     /// are refused: relocating a driver onto itself would delete the source copy
     /// the row still points at.
-    pub fn new(pool: PgPool, src: Box<dyn Driver>, dst: Box<dyn Driver>) -> Result<Relocator> {
+    pub fn new(db: Db, src: Box<dyn Driver>, dst: Box<dyn Driver>) -> Result<Relocator> {
         if src.name() == dst.name() {
             return Err(BlobError::Invalid(format!(
                 "source and destination are the same driver ({})",
                 src.name()
             )));
         }
-        Ok(Relocator { pool, src, dst })
+        Ok(Relocator { db, src, dst })
     }
 
     /// Lists live blobs still held by the source driver, oldest first.
@@ -44,20 +44,23 @@ impl Relocator {
     /// read, and so re-running after an interruption picks up where it stopped.
     pub async fn pending(&self, limit: i64) -> Result<Vec<Hash>> {
         let limit = if limit <= 0 { 100 } else { limit };
-        let rows = sqlx::query(
+        let c = self
+            .db
+            .conn()
+            .await
+            .map_err(|e| BlobError::db("connect", e))?;
+        let rows: Vec<String> = query(
             "SELECT sha256 FROM blobs
-             WHERE driver = $1 AND state = 'live'
+             WHERE driver = ?1 AND state = 'live'
              ORDER BY created_at
-             LIMIT $2",
+             LIMIT ?2",
         )
         .bind(self.src.name())
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_scalars(&c)
         .await
         .map_err(|e| BlobError::db("list pending", e))?;
-        rows.iter()
-            .map(|r| Hash::parse(r.get::<String, _>(0).as_str()))
-            .collect()
+        rows.iter().map(|s| Hash::parse(s)).collect()
     }
 
     /// Moves a single blob's bytes and repoints its row.
@@ -140,18 +143,23 @@ impl Relocator {
         // cannot both claim it ... the second updates zero rows and skips the
         // delete, which leaves the source copy alone rather than deleting
         // bytes the row no longer points at.
-        let res = sqlx::query(
-            "UPDATE blobs SET driver = $1, driver_ref = $2
-             WHERE sha256 = $3 AND driver = $4 AND state = 'live'",
+        let c = self
+            .db
+            .conn()
+            .await
+            .map_err(|e| BlobError::db("connect", e))?;
+        let n = query(
+            "UPDATE blobs SET driver = ?1, driver_ref = ?2
+             WHERE sha256 = ?3 AND driver = ?4 AND state = 'live'",
         )
         .bind(self.dst.name())
         .bind(sealed.hash().key())
         .bind(h.to_string())
         .bind(self.src.name())
-        .execute(&self.pool)
+        .execute(&c)
         .await
         .map_err(|e| BlobError::db(format!("repoint {h}"), e))?;
-        if res.rows_affected() == 0 {
+        if n == 0 {
             // Someone else moved it, or it stopped being live. The copy we
             // just made is unreferenced and the sweeper will collect it.
             tracing::info!(blob = %h, "blob already moved by another worker");

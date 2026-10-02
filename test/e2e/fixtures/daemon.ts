@@ -19,8 +19,8 @@ export interface Daemon {
 }
 
 export interface DaemonOptions {
-  /** Connection string, already pinned to this worker's schema. */
-  databaseURL: string;
+  /** This worker's own store directory (HIVE_SANDBOX_DATA_DIR). */
+  dataDir: string;
   /** Handed to the daemon as HIVE_SANDBOX_BOOTSTRAP_TOKEN. */
   token: string;
 }
@@ -81,7 +81,7 @@ export async function startDaemon(options: DaemonOptions): Promise<RunningDaemon
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
-      HIVE_SANDBOX_DATABASE_URL: options.databaseURL,
+      HIVE_SANDBOX_DATA_DIR: options.dataDir,
       HIVE_SANDBOX_BLOB_ROOT: path.join(scratch, 'blobs'),
       // D19.1: the root actor and its first credential arrive out of band.
       // There is no API path that could create either.

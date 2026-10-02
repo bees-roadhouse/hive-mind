@@ -20,7 +20,7 @@ thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-sqlx.workspace = true
+hive-db = { path = "../hive-db" }
 mime.workspace = true
 futures.workspace = true
 async-trait.workspace = true

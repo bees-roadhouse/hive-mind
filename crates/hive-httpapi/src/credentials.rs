@@ -56,8 +56,10 @@ pub(crate) async fn whoami(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    let pool = s.store().pool();
-    let actor = match hive_store::actor_by_id(pool, cred.actor_id).await {
+    let Ok(conn) = s.store().conn().await else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+    };
+    let actor = match hive_store::actor_by_id(&conn, cred.actor_id).await {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(err = %e, actor = %cred.actor_id, "whoami actor read");
@@ -65,7 +67,7 @@ pub(crate) async fn whoami(
         }
     };
     let token = hive_httpauth::token(&headers, uri.query()).unwrap_or_default();
-    let detail = match hive_store::credential_detail_by_token(pool, &token).await {
+    let detail = match hive_store::credential_detail_by_token(&conn, &token).await {
         Ok(d) => d,
         // Resolved at the edge, gone by the re-read: revoked mid-request.
         Err(StoreError::NoCredential) => return hive_httpauth::unauthorized(),
@@ -139,16 +141,10 @@ pub(crate) async fn enroll(
         return fail(StatusCode::BAD_REQUEST, "bad_request");
     }
     let principal = Owner::user(cred.actor_id);
-    match hive_store::issue_credential(
-        s.store().pool(),
-        cred.actor_id,
-        principal,
-        &cred,
-        label,
-        None,
-    )
-    .await
-    {
+    let Ok(conn) = s.store().conn().await else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+    };
+    match hive_store::issue_credential(&conn, cred.actor_id, principal, &cred, label, None).await {
         Ok((token, id)) => json(
             StatusCode::CREATED,
             &EnrollResponse {
@@ -170,15 +166,15 @@ pub(crate) async fn enroll(
     }
 }
 
-/// The trigger speaks in server-side codes: P0001 is its RAISE, the 23xxx
-/// class is a constraint it steered a row into. Both are POLICY ANSWERS and get
-/// the generic forbidden; anything else is infrastructure and gets the generic
-/// internal. The pg error text never reaches a response ... it embeds uuids.
+/// The trigger speaks in engine codes: its RAISE(ABORT) and a constraint it
+/// steered a row into both come back as a constraint failure. Both are POLICY
+/// ANSWERS and get the generic forbidden; anything else is infrastructure and
+/// gets the generic internal. The engine's error text never reaches a
+/// response ... it embeds uuids.
 fn issue_failure(e: &StoreError) -> (StatusCode, &'static str) {
-    match e.pg_code() {
-        Some(code) if code == "P0001" || code.starts_with("23") => {
-            (StatusCode::FORBIDDEN, "forbidden")
-        }
-        _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+    if e.is_constraint() {
+        (StatusCode::FORBIDDEN, "forbidden")
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal")
     }
 }

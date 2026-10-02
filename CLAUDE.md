@@ -6,8 +6,8 @@ compose them. It replaces `bees-roadhouse/hive`.
 
 **The repository is `bees-roadhouse/hive-mind`; the identifiers are still
 `hive-sandbox`** ... the crate and binary `hive-sandbox`, the `hive-*` crate
-names, the `HIVE_SANDBOX_*` environment variables, the podman test database
-`hive-sandbox-pg-rust`. That split is deliberate and D34 says why: a repository
+names, the `HIVE_SANDBOX_*` environment variables, the `hive-sandbox-tests`
+directory the test fixture writes under. That split is deliberate and D34 says why: a repository
 name is prose and an identifier has blast radius, out through brh-infra's
 stacks, both Containerfiles, the harness pins and every import. If you are here
 because the two disagree, they are meant to. D24 and D31 both left "whether
@@ -15,7 +15,9 @@ because the two disagree, they are meant to. D24 and D31 both left "whether
 
 **The daemon is Rust** (D24, decided 2026-09-02; the Go tree it replaced was
 removed 2026-09-05, D31). A Cargo workspace at `crates/*`, wasmtime for the
-guests, axum for the HTTP surface, sqlx for Postgres. The browser client is a
+guests, axum for the HTTP surface, SQLite through `rusqlite` for the store
+(D38, decided 2026-10-02: one file per daemon now, one per owner next; the
+libSQL fork was the first pick and was measured out). The browser client is a
 server-rendered by the daemon and swapped by htmx (D32); its static assets are
 embedded by `crates/hive-webui`, and apps contribute UI as HTML fragments. The guest SDK and the reference guest
 are Rust too, built for `wasm32-wasip1`. The reasons and the picks are in
@@ -60,7 +62,11 @@ even if the tests pass.
 4. **The events table is the transport; NOTIFY is only a wakeup bell carrying an
    id.** Every consumer must stay correct if every notification is dropped. Never
    tail with a naive `WHERE id > last` ... ids are assigned before commit, so use
-   an overlap window and dedupe by id.
+   an overlap window and dedupe by id. The bell is in-process since D38
+   (`hive_store::event_wake()`, rung once per append): a writer in another
+   process rings nothing, and the backstop poll is the only thing that
+   delivers its rows. One writer at a time means a lower id cannot commit
+   late today; the window stays because phase 2 brings a second writer.
 5. **Guests hold no sockets, no files, no ambient state.** Anything long-lived is
    a host service declared as a capability.
 6. **The workflow step log is a checkpoint journal, never a replay tape.**
@@ -159,8 +165,7 @@ born-green. Born-green is a claim about what you knew before you pushed, and
 "I ran nothing and hoped" is not. `docs/development.md` has the box rules.
 
 ```bash
-export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
-./scripts/gate-rust.sh    # web build + diff, cargo fmt --check, clippy -D warnings, build, test; names every skip
+./scripts/gate-rust.sh    # cargo fmt --check, clippy -D warnings, build --all-targets, test; names every skip
 ```
 
 No local toolchain needed: `./scripts/gate-container.sh` runs this same gate
@@ -168,13 +173,17 @@ inside a Podman-built toolchain image ... Rust, clippy, rustfmt, the wasm target
 and node live in the image, Podman is the only thing the host needs, and
 anything after `--` runs there in place of the gate.
 
-**The database line is not optional and the gate refuses without it.** It
-used to be a suggestion, and the result was shape 2 from the list below at full
-scale: without that variable **every Postgres-backed test in the repo skipped
-itself** ... the whole grant predicate suite included ... and the gate still
-printed `GATE GREEN` in about the same wall time, because skipping is fast. A
-fix to a live cross-principal leak was reported as gate-green over a
-reproduction that had never executed.
+**Nothing has to be running first.** The store is SQLite (D38) and every
+database test makes its own files under the temp directory, so the database
+precondition is gone and so are the skips it caused. The lesson it taught
+stays, because it was shape 2 from the list below at full scale: when the
+tests needed a database URL and the gate merely suggested it, **every
+database-backed test in the repo skipped itself** ... the whole grant
+predicate suite included ... and the gate still printed `GATE GREEN` in about
+the same wall time, because skipping is fast. A fix to a live cross-principal
+leak was reported as gate-green over a reproduction that had never executed.
+The tiers that still need a backend (Podman, Garage, chromium) are the ones
+that rule now guards.
 
 The gate also NAMES every test that skipped, every run. A skip is a test saying
 out loud that it is not answering the question, and that only helps if somebody
@@ -182,14 +191,14 @@ hears it. In Rust a skip is a test that prints `SKIPPED: <name> <why>` and
 returns; the gate greps for that line, so a silent early return is invisible
 to it and is a bug.
 
-CI runs the same script as the `gate` job, against a Postgres service
-container, so a change is gated in both places. The toolchain is pinned in
-`rust-toolchain.toml`; CI installs that version.
+CI runs the same script as the `gate` job, so a change is gated in both
+places. The toolchain is pinned in `rust-toolchain.toml`; CI installs that
+version.
 
 ## Running things
 
 ```bash
-cargo run -p hive-sandbox -- --database-url "$HIVE_SANDBOX_TEST_DATABASE_URL" --plain-http   # every role, :7979
+cargo run -p hive-sandbox -- --data-dir ./data --plain-http   # every role, :7979; creates data/hive.db
 curl localhost:7979/healthz
 
 cargo test -p hive-store --test grants -- --nocapture       # one suite
@@ -197,18 +206,17 @@ cargo test -p hive-store -- absence_is_deny --nocapture      # one test
 cargo test --workspace -- --nocapture                       # everything; skips print SKIPPED:
 ```
 
-A single test needs `HIVE_SANDBOX_TEST_DATABASE_URL` exactly as much as the gate
-does, and skips itself without it ... a filter narrows what executes, it does
-not change what a skip means. `hive_testdb::TestDb` hands every test a private
-schema and drops it on the way out, so there is no shared mutable fixture and no
-ordering between tests: run one, run them in parallel, run them in any order.
+A single test needs nothing running. `hive_testdb::TestDb` hands every test a
+private store (two files under the temp directory) and deletes them on the
+way out, so there is no shared mutable fixture and no ordering between tests:
+run one, run them in parallel, run them in any order.
 
 There are four test tiers and three of them are invisible to `cargo test` on
 a bare machine:
 
 | tier | needs | brought up by |
 |---|---|---|
-| unit + integration | Postgres | `./scripts/db-up.sh` |
+| unit + integration | nothing | `cargo test` |
 | container (harness, egress) | Podman, both images | `./scripts/harness-build.sh`, `./scripts/egress-build.sh` |
 | blob store (S3 driver) | Garage, four `HIVE_SANDBOX_TEST_S3_*` | `./scripts/garage-up.sh` |
 | end-to-end | a daemon and chromium | `cd test/e2e && npm install && npm run browsers && npm test` |
@@ -263,22 +271,25 @@ crates/hive-sandbox/   the daemon binary. Roles are flags, one process serves al
                        defaults on except the proxy, so a single-role image turns the others off
                        by name. --addr defaults to :7979. Also the unix socket (invariant 13)
                        and the blob driver chosen from config
-crates/hive-schema/    the forward-only migrations, embedded, with the advisory lock and the
-                       checksum that refuses a file applied differently. migrations/ is here
-crates/hive-store/     Postgres: the data layer, the grant predicate, credentials, installs,
+crates/hive-db/        the store's engine behind one seam: open, pool, BEGIN IMMEDIATE
+                       transactions, bind and read types. Nothing above it names rusqlite
+crates/hive-schema/    the forward-only migrations, embedded, applied in one write transaction,
+                       with the checksum that refuses a file applied differently. migrations/
+                       is the store's; migrations-audit/ is the override audit file's (D38)
+crates/hive-store/     SQLite: the data layer, the grant predicate, credentials, installs,
                        builds, events, chat, the guest-facing Storage/Blob/Events. The single
                        enforcement point; nothing outside it touches grants. lib.rs carries
                        the table of where each of the fourteen invariants lives
 crates/hive-manifest/  the app declaration and everything derived from it. Deliberately pure ...
                        it parses, validates and derives, opens no connections and runs no
                        guests, so everything with I/O consumes its output
-crates/hive-registry/  manifest + module + Postgres = an installed app. Where a claim meets its
+crates/hive-registry/  manifest + module + the store = an installed app. Where a claim meets its
                        evidence. Everything decidable at install is decided at install
 crates/hive-wasmhost/  wasmtime runtime, compiled-module cache, instance pool, the ABI, the
                        capability host modules, taint. The guest contract is in its lib.rs doc
 crates/hive-blob/      the driver seam: disk and S3-compatible (Garage) drivers, chosen at config
                        time (D11), and the catalog where refs, ownership and trust live
-crates/hive-bus/       events table + LISTEN/NOTIFY + SSE fan-out
+crates/hive-bus/       events table + the in-process bell + the backstop poll + SSE fan-out
 crates/hive-harness/   hosted agent runs (claude / codex / opencode), rootless Podman, the
                        supervisor that drains, deadlines and terminates
 crates/hive-egress/    the allowlisting proxy a harness run reaches the internet through
@@ -296,7 +307,7 @@ crates/hive-webui/     the browser client's static assets under /assets/, embedd
                        CSP every HTML response also carries; the pages themselves are hive-httpapi's
 crates/hive-identity/  the credential every layer passes around. Types and validation only
 crates/hive-trust/     provenance carried across every layer (invariants 3 and 12)
-crates/hive-testdb/    schema-per-test Postgres for the integration tests
+crates/hive-testdb/    a private store per test for the integration tests
 crates/hive-repodocs/  no code. The gate's assertions about this repo's own documentation
 guest/                 the SDK a WASM guest links against, and the root of the guest workspace
                        (wasm32-wasip1 only; the release profile every guest builds with is here)
@@ -317,10 +328,12 @@ and has tests.
 - **Rust, 1.98**, pinned in `rust-toolchain.toml` with clippy and rustfmt;
   edition 2024; `unsafe_code = "forbid"` at the workspace, which is the no-CGo
   rule in the new language ... a host with no `unsafe` cannot smuggle a native
-  library in. `sqlx` 0.8 with runtime queries and rustls, because the gate
-  builds on a machine with no database in reach and no system TLS library;
-  `axum` 0.8; `wasmtime`, WASI preview 1 only; `tokio`. The reason behind
-  each pick is in D24 and outlives the pick.
+  library in. `rusqlite` with the bundled engine (D38): the store is a file,
+  so the gate builds and tests on a machine with nothing running, and the
+  engine is the one native library the host is built around rather than one
+  smuggled past the rule; `axum` 0.8; `wasmtime`, WASI preview 1 only;
+  `tokio`. The reason behind each pick is in D24 and D38 and outlives the
+  pick.
 - **`unsafe` is allowed in `guest/` and `apps/*` and nowhere else.** The SDK
   calls the host's imports, which are `extern "C"`. That is why the guests are
   their own workspace rather than members with an allow attribute. ONE
@@ -336,18 +349,22 @@ and has tests.
   away from. Every setting in a guest's release profile is load-bearing;
   `scripts/guest-build.md` says why. Built `.wasm` files are checked in; CI
   rebuilds them from source and reruns the tests against the fresh bytes.
-- Postgres via sqlx. **Never `LISTEN` on a pooled connection** ... a dedicated
-  `PgListener` per process, reconnect in seconds, and the tailer stays correct
-  when every notification is dropped.
-- Claim work with `FOR UPDATE SKIP LOCKED` plus a lease expiry and a heartbeat.
+- SQLite via `hive-db`, never `rusqlite` directly. **Every write transaction
+  is `BEGIN IMMEDIATE`**, so two writers queue in the engine rather than one
+  failing mid-transaction with BUSY; a connection left mid-transaction is
+  closed, never returned to the pool. The bell is in-process and the tailer
+  stays correct when every ring is dropped.
+- Claim work with `UPDATE ... RETURNING` under `BEGIN IMMEDIATE` plus a lease
+  expiry and a heartbeat.
 - **A skip is a printed line, never a silent return.** `SKIPPED: <test> <why>`
   and return, and only for a precondition the environment can honestly lack
   (no database, no Podman, no image). The gate greps for it.
 - **Await a store or migration future on the calling task; do not spawn it.**
-  rustc cannot prove some sqlx-heavy futures `Send` (rust-lang/rust#100013,
-  "implementation of `Send` is not general enough"), and `tokio::spawn` needs
-  it. The chat worker's test runner runs each test with `block_on` for this
-  reason, and `hive_schema::migrate` documents it on the function.
+  The rule came from sqlx (rustc could not prove some of its futures `Send`,
+  rust-lang/rust#100013) and the port removed the cause, not the rule: a
+  store call blocks the thread it runs on for the engine's duration, so
+  spawning it buys nothing, and the chat worker's test runner still runs each
+  test with `block_on` so a panic inside one surfaces as that test's failure.
 - Comments explain WHY when it is non-obvious. Not what the code already says.
 - Simple over clever. Three similar lines beat a premature abstraction.
 - **When a review reproduces a defect, land the reproduction as a failing test
@@ -398,7 +415,7 @@ and has tests.
     A test that passed three times on Windows failed deterministically on Linux,
     because the tailer's watermark is empty until its first cycle *reads a row*
     and a faster machine loses that race every time. This repo's gate sees one
-    OS, one Postgres, one scheduler. CI is the only thing that can see the rest.
+    OS, one engine build, one scheduler. CI is the only thing that can see the rest.
   - **Check that the package built.** A count of what was *skipped* cannot see
     what was never *built*. A test crate that does not compile has zero tests
     rather than skipped ones, so "0 skipped" reads identically for "everything

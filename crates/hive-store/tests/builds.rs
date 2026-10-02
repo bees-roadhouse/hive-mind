@@ -1,9 +1,10 @@
-//! Registering builds, the promotion view and provisioning app schemas. Ported
+//! Registering builds, the promotion view and provisioning app tables. Ported
 //! from builds_test.go, promotion_test.go and appschema_test.go.
 
 mod common;
 
 use common::{World, cred, next_hash, user};
+use hive_db::query;
 use hive_identity::{Owner, PrincipalKind};
 use hive_manifest::{
     Collection, CollectionPlan, Index, IndexMethod, Kind, Manifest, SchemaPlan, Storage,
@@ -50,8 +51,8 @@ async fn register_in(
     spec: &BuildSpec,
     by: &hive_identity::Credential,
 ) -> Result<hive_store::RegisteredBuild, StoreError> {
-    let mut tx = w.store.begin().await.expect("begin");
-    match register_build(&mut tx, spec, by).await {
+    let tx = w.store.begin().await.expect("begin");
+    match register_build(&tx, spec, by).await {
         Ok(o) => {
             tx.commit().await.expect("commit");
             Ok(o)
@@ -60,39 +61,41 @@ async fn register_in(
     }
 }
 
+/// Whether any table under the install's prefix exists: the engine has no
+/// schemas, so "the schema exists" means "its tables do".
 async fn schema_exists(w: &World, schema: &str) -> bool {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = $1)",
+    let n: i64 = query(
+        "SELECT count(*) FROM sqlite_master
+          WHERE type = 'table' AND substr(name, 1, length(?1)) = ?1",
     )
-    .bind(schema)
-    .fetch_one(w.pool())
+    .bind(format!("{schema}__"))
+    .fetch_scalar(&*w.conn().await)
     .await
-    .unwrap()
+    .unwrap();
+    n > 0
 }
 
 async fn table_exists(w: &World, schema: &str, table: &str) -> bool {
-    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2)")
-        .bind(schema)
-        .bind(table)
-        .fetch_one(w.pool())
+    let n: i64 = query("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+        .bind(format!("{schema}__{table}"))
+        .fetch_scalar(&*w.conn().await)
         .await
-        .unwrap()
+        .unwrap();
+    n > 0
 }
 
-/// Drops an app schema, which lives OUTSIDE the test's private schema and so
-/// outlives the test unless something removes it.
+/// Drops the collection tables a test provisioned. The file goes with the
+/// test anyway; this keeps the uninstall path exercised.
 async fn drop_plan(w: &World, plan: &SchemaPlan) {
-    let mut tx = w.store.begin().await.unwrap();
-    drop_schema_plan(&mut tx, plan).await.unwrap();
+    let tx = w.store.begin().await.unwrap();
+    drop_schema_plan(&tx, plan).await.unwrap();
     tx.commit().await.unwrap();
 }
 
 /// Ported from `TestRegisterBuildWritesTheRowAndProvisionsTheSchema`.
 #[tokio::test]
 async fn register_build_writes_the_row_and_provisions_the_schema() {
-    let Some(w) = World::new("register_build_writes_row").await else {
-        return;
-    };
+    let w = World::new("register_build_writes_row").await;
     let alice = w.human("alice").await;
     let spec = prepared_for(&short_slug(), user(alice));
     let plan = spec.schema.clone();
@@ -111,12 +114,13 @@ async fn register_build_writes_the_row_and_provisions_the_schema() {
         "{}.links was not provisioned",
         out.schema_name
     );
+    let row = query("SELECT surface_hash, derive_version FROM app_builds WHERE id = ?1")
+        .bind(out.build_id)
+        .fetch_one(&*w.conn().await)
+        .await
+        .unwrap();
     let (surface_hash, derive_version): (Option<String>, Option<i32>) =
-        sqlx::query_as("SELECT surface_hash, derive_version FROM app_builds WHERE id = $1")
-            .bind(out.build_id)
-            .fetch_one(w.pool())
-            .await
-            .unwrap();
+        (row.get("surface_hash"), row.get("derive_version"));
     assert_eq!(surface_hash.as_deref(), Some(spec.surface_hash.as_str()));
     assert_eq!(derive_version, Some(hive_manifest::DERIVE_VERSION));
     drop_plan(&w, &plan).await;
@@ -125,9 +129,7 @@ async fn register_build_writes_the_row_and_provisions_the_schema() {
 /// Ported from `TestRegisterBuildCreatesNoInstall` (D19.4).
 #[tokio::test]
 async fn register_build_creates_no_install() {
-    let Some(w) = World::new("register_build_no_install").await else {
-        return;
-    };
+    let w = World::new("register_build_no_install").await;
     let alice = w.human("alice").await;
     let slug = short_slug();
     let spec = prepared_for(&slug, user(alice));
@@ -139,9 +141,9 @@ async fn register_build_creates_no_install() {
     )
     .await
     .expect("register");
-    let installs: i64 = sqlx::query_scalar("SELECT count(*) FROM installs WHERE slug = $1")
+    let installs: i64 = query("SELECT count(*) FROM installs WHERE slug = ?1")
         .bind(&slug)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
     assert_eq!(installs, 0, "registering a build is not making it live");
@@ -152,9 +154,7 @@ async fn register_build_creates_no_install() {
 /// name per-install rather than per-app.
 #[tokio::test]
 async fn two_owners_get_separate_schemas() {
-    let Some(w) = World::new("two_owners_separate_schemas").await else {
-        return;
-    };
+    let w = World::new("two_owners_separate_schemas").await;
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let slug = short_slug();
@@ -190,9 +190,7 @@ async fn two_owners_get_separate_schemas() {
 /// Ported from `TestReRegisteringLandsOnTheSameSchema`.
 #[tokio::test]
 async fn re_registering_lands_on_the_same_schema() {
-    let Some(w) = World::new("re_registering_same_schema").await else {
-        return;
-    };
+    let w = World::new("re_registering_same_schema").await;
     let alice = w.human("alice").await;
     let slug = short_slug();
     let by = cred(alice, PrincipalKind::User, alice);
@@ -215,16 +213,14 @@ async fn re_registering_lands_on_the_same_schema() {
 /// Ported from `TestFailedRegistrationLeavesNothing`.
 #[tokio::test]
 async fn failed_registration_leaves_nothing() {
-    let Some(w) = World::new("failed_registration_leaves_nothing").await else {
-        return;
-    };
+    let w = World::new("failed_registration_leaves_nothing").await;
     let alice = w.human("alice").await;
     let slug = short_slug();
     let spec = prepared_for(&slug, user(alice));
     let schema = spec.schema.schema.clone();
-    let mut tx = w.store.begin().await.unwrap();
+    let tx = w.store.begin().await.unwrap();
     register_build(
-        &mut tx,
+        &tx,
         &build_spec(spec, user(alice)),
         &cred(alice, PrincipalKind::User, alice),
     )
@@ -235,9 +231,9 @@ async fn failed_registration_leaves_nothing() {
         !schema_exists(&w, &schema).await,
         "{schema} survived a failed registration"
     );
-    let builds: i64 = sqlx::query_scalar("SELECT count(*) FROM app_builds WHERE slug = $1")
+    let builds: i64 = query("SELECT count(*) FROM app_builds WHERE slug = ?1")
         .bind(&slug)
-        .fetch_one(w.pool())
+        .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
     assert_eq!(builds, 0);
@@ -246,9 +242,7 @@ async fn failed_registration_leaves_nothing() {
 /// Ported from `TestRegisterBuildRefusesAnIncompleteIdentity`.
 #[tokio::test]
 async fn register_build_refuses_an_incomplete_identity() {
-    let Some(w) = World::new("register_build_incomplete_identity").await else {
-        return;
-    };
+    let w = World::new("register_build_incomplete_identity").await;
     let alice = w.human("alice").await;
     let spec = prepared_for(&short_slug(), user(alice));
     let cases = [
@@ -268,9 +262,9 @@ async fn register_build_refuses_an_incomplete_identity() {
         ),
     ];
     for (name, build, by) in cases {
-        let mut tx = w.store.begin().await.unwrap();
+        let tx = w.store.begin().await.unwrap();
         assert!(
-            register_build(&mut tx, &build, &by).await.is_err(),
+            register_build(&tx, &build, &by).await.is_err(),
             "{name}: an incomplete identity was accepted"
         );
         tx.rollback().await.unwrap();
@@ -296,11 +290,11 @@ struct PromotionRow {
 
 async fn build_row(w: &World, slug: &str, owner: Owner, by: Uuid, spec: &BuildRow) -> Uuid {
     let manifest = serde_json::json!({"capabilities": spec.capabilities});
-    sqlx::query_scalar(
+    query(
         "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
                                  author_actor, owner_kind, owner_id, visibility, trust, status,
                                  surface_hash, derive_version)
-         VALUES ($1, 'app', 'host', $2, $3, $4, $5, $6, 'private', 'builtin', 'registered', $7, $8)
+         VALUES (?1, 'app', 'host', ?2, ?3, ?4, ?5, ?6, 'private', 'builtin', 'registered', ?7, ?8)
          RETURNING id",
     )
     .bind(slug)
@@ -311,15 +305,15 @@ async fn build_row(w: &World, slug: &str, owner: Owner, by: Uuid, spec: &BuildRo
     .bind(owner.id)
     .bind(spec.surface_hash)
     .bind(spec.surface_hash.and(spec.derive_version))
-    .fetch_one(w.pool())
+    .fetch_scalar(&*w.conn().await)
     .await
     .expect("create build")
 }
 
 async fn promote(w: &World, slug: &str, owner: Owner, by: Uuid, build_id: Uuid) {
-    sqlx::query(
+    query(
         "INSERT INTO installs (build_id, slug, owner_kind, owner_id, installed_by_actor, activated_by_actor, schema_name, state)
-         VALUES ($1, $2, $3, $4, $5, $5, $6, 'active')",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 'active')",
     )
     .bind(build_id)
     .bind(slug)
@@ -327,24 +321,29 @@ async fn promote(w: &World, slug: &str, owner: Owner, by: Uuid, build_id: Uuid) 
     .bind(owner.id)
     .bind(by)
     .bind(format!("app_{slug}_{}", &next_hash()[..8]))
-    .execute(w.pool())
+    .execute(&*w.conn().await)
     .await
     .expect("promote");
 }
 
 async fn promotion_row(w: &World, build_id: Uuid) -> PromotionRow {
+    let row = query(
+        "SELECT capability_change, coalesce(capabilities_gained, '[]') AS gained, surface_change
+           FROM builds_awaiting_promotion WHERE build_id = ?1",
+    )
+    .bind(build_id)
+    .fetch_one(&*w.conn().await)
+    .await
+    .expect("read view");
     let (capability_change, gained, surface_change): (
         Option<bool>,
         serde_json::Value,
         Option<bool>,
-    ) = sqlx::query_as(
-        "SELECT capability_change, coalesce(capabilities_gained, '[]'::jsonb), surface_change
-           FROM builds_awaiting_promotion WHERE build_id = $1",
-    )
-    .bind(build_id)
-    .fetch_one(w.pool())
-    .await
-    .expect("read view");
+    ) = (
+        row.get("capability_change"),
+        row.get("gained"),
+        row.get("surface_change"),
+    );
     PromotionRow {
         capability_change,
         capabilities_gained: serde_json::from_value(gained).unwrap(),
@@ -352,25 +351,21 @@ async fn promotion_row(w: &World, build_id: Uuid) -> PromotionRow {
     }
 }
 
-async fn two_builds(
-    test: &str,
-    live: BuildRow,
-    candidate: BuildRow,
-) -> Option<(World, PromotionRow)> {
-    let w = World::new(test).await?;
+async fn two_builds(test: &str, live: BuildRow, candidate: BuildRow) -> (World, PromotionRow) {
+    let w = World::new(test).await;
     let alice = w.human("alice").await;
     let slug = format!("app{}", &Uuid::new_v4().to_string()[..8]);
     let live_id = build_row(&w, &slug, user(alice), alice, &live).await;
     let cand_id = build_row(&w, &slug, user(alice), alice, &candidate).await;
     promote(&w, &slug, user(alice), alice, live_id).await;
     let row = promotion_row(&w, cand_id).await;
-    Some((w, row))
+    (w, row)
 }
 
 /// Ported from `TestPromotionViewFlagsACapabilityGain`.
 #[tokio::test]
 async fn promotion_view_flags_a_capability_gain() {
-    let Some((_w, row)) = two_builds(
+    let (_w, row) = two_builds(
         "promotion_flags_capability_gain",
         BuildRow {
             capabilities: vec!["log"],
@@ -383,10 +378,7 @@ async fn promotion_view_flags_a_capability_gain() {
             derive_version: Some(1),
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     assert_eq!(
         row.capability_change,
         Some(true),
@@ -398,7 +390,7 @@ async fn promotion_view_flags_a_capability_gain() {
 /// Ported from `TestPromotionViewIgnoresCapabilityOrder`.
 #[tokio::test]
 async fn promotion_view_ignores_capability_order() {
-    let Some((_w, row)) = two_builds(
+    let (_w, row) = two_builds(
         "promotion_ignores_order",
         BuildRow {
             capabilities: vec!["log", "storage", "kv"],
@@ -411,17 +403,14 @@ async fn promotion_view_ignores_capability_order() {
             derive_version: Some(1),
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     assert_eq!(row.capability_change, Some(false), "only the order changed");
 }
 
 /// Ported from `TestPromotionViewFlagsASurfaceChange`.
 #[tokio::test]
 async fn promotion_view_flags_a_surface_change() {
-    let Some((_w, row)) = two_builds(
+    let (_w, row) = two_builds(
         "promotion_flags_surface_change",
         BuildRow {
             capabilities: vec!["log"],
@@ -434,10 +423,7 @@ async fn promotion_view_flags_a_surface_change() {
             derive_version: Some(1),
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     assert_eq!(row.surface_change, Some(true));
 }
 
@@ -445,7 +431,7 @@ async fn promotion_view_flags_a_surface_change() {
 /// case, and the reason derive_version exists at all.
 #[tokio::test]
 async fn promotion_view_refuses_to_compare_across_derivers() {
-    let Some((_w, row)) = two_builds(
+    let (_w, row) = two_builds(
         "promotion_refuses_across_derivers",
         BuildRow {
             capabilities: vec!["log"],
@@ -458,10 +444,7 @@ async fn promotion_view_refuses_to_compare_across_derivers() {
             derive_version: Some(2),
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     assert_eq!(
         row.surface_change, None,
         "hashes from different derivers are not comparable"
@@ -475,7 +458,7 @@ async fn promotion_view_refuses_to_compare_across_derivers() {
 /// Ported from `TestPromotionViewIsNullWithoutARecordedSurface`.
 #[tokio::test]
 async fn promotion_view_is_null_without_a_recorded_surface() {
-    let Some((_w, row)) = two_builds(
+    let (_w, row) = two_builds(
         "promotion_null_without_surface",
         BuildRow {
             capabilities: vec!["log"],
@@ -488,19 +471,14 @@ async fn promotion_view_is_null_without_a_recorded_surface() {
             derive_version: None,
         },
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     assert_eq!(row.surface_change, None);
 }
 
 /// Ported from `TestPromotionViewIsNullForAFirstInstall`.
 #[tokio::test]
 async fn promotion_view_is_null_for_a_first_install() {
-    let Some(w) = World::new("promotion_null_first_install").await else {
-        return;
-    };
+    let w = World::new("promotion_null_first_install").await;
     let alice = w.human("alice").await;
     let slug = format!("app{}", &Uuid::new_v4().to_string()[..8]);
     let cand = build_row(
@@ -523,21 +501,19 @@ async fn promotion_view_is_null_for_a_first_install() {
 /// Ported from `TestSurfaceHashAndDeriverAreBothOrNeither`.
 #[tokio::test]
 async fn surface_hash_and_deriver_are_both_or_neither() {
-    let Some(w) = World::new("surface_hash_both_or_neither").await else {
-        return;
-    };
+    let w = World::new("surface_hash_both_or_neither").await;
     let alice = w.human("alice").await;
     assert!(
-        sqlx::query(
+        query(
             "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
                                      author_actor, owner_kind, owner_id, visibility, trust, status,
                                      surface_hash, derive_version)
-             VALUES ('halfrecorded', 'app', 'host', '{}', $1, $2, 'user', $2, 'private', 'builtin', 'registered', $3, NULL)",
+             VALUES ('halfrecorded', 'app', 'host', '{}', ?1, ?2, 'user', ?2, 'private', 'builtin', 'registered', ?3, NULL)",
         )
         .bind(next_hash())
         .bind(alice)
         .bind(HASH_A)
-        .execute(w.pool())
+        .execute(&*w.conn().await)
         .await
         .is_err(),
         "a surface hash with no deriver was accepted"
@@ -546,9 +522,8 @@ async fn surface_hash_and_deriver_are_both_or_neither() {
 
 // --- apply_schema_plan -------------------------------------------------------
 //
-// An app schema is a real, database-level schema, so it lands OUTSIDE the
-// private schema the fixture puts on the search path. Each test gets a unique
-// app name and drops its own schema.
+// An install's collections are tables under its prefix in the one file. Each
+// test gets a unique app name and drops its own tables.
 
 fn unique_app() -> String {
     format!("t_{}", &Uuid::new_v4().simple().to_string()[..12])
@@ -583,32 +558,37 @@ fn coll(name: &str, indexes: &[&str]) -> Collection {
 
 /// Applies in its own transaction and commits.
 async fn apply(w: &World, plan: &SchemaPlan) -> Result<(), StoreError> {
-    let mut tx = w.store.begin().await.unwrap();
-    apply_schema_plan(&mut tx, plan).await?;
+    let tx = w.store.begin().await.unwrap();
+    apply_schema_plan(&tx, plan).await?;
     tx.commit()
         .await
         .map_err(|e| StoreError::Other(e.to_string()))
 }
 
 async fn column_exists(w: &World, schema: &str, table: &str, col: &str) -> bool {
-    sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-                         WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)",
-    )
-    .bind(schema)
-    .bind(table)
-    .bind(col)
-    .fetch_one(w.pool())
-    .await
-    .unwrap()
+    let n: i64 = query("SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2")
+        .bind(format!("{schema}__{table}"))
+        .bind(col)
+        .fetch_scalar(&*w.conn().await)
+        .await
+        .unwrap();
+    n > 0
+}
+
+/// The names of every index on a collection table, the autoindex behind the
+/// primary key included.
+async fn index_names(w: &World, schema: &str, table: &str) -> Vec<String> {
+    query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 ORDER BY name")
+        .bind(format!("{schema}__{table}"))
+        .fetch_scalars(&*w.conn().await)
+        .await
+        .unwrap()
 }
 
 /// Ported from `TestApplySchemaPlanProvisionsCollections`.
 #[tokio::test]
 async fn apply_schema_plan_provisions_collections() {
-    let Some(w) = World::bare("apply_schema_plan_provisions").await else {
-        return;
-    };
+    let w = World::bare("apply_schema_plan_provisions").await;
     let plan = plan_for(
         &unique_app(),
         vec![
@@ -648,13 +628,7 @@ async fn apply_schema_plan_provisions_collections() {
             "entries carries {col}"
         );
     }
-    let indexes: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_indexes WHERE schemaname = $1 AND tablename = 'entries'",
-    )
-    .bind(&plan.schema)
-    .fetch_one(w.pool())
-    .await
-    .unwrap();
+    let indexes = index_names(&w, &plan.schema, "entries").await.len();
     assert!(
         indexes >= 4,
         "entries has {indexes} indexes, want at least 4"
@@ -662,25 +636,18 @@ async fn apply_schema_plan_provisions_collections() {
     drop_plan(&w, &plan).await;
 }
 
-/// Ported from `TestLongCollectionNameStillGetsItsIndexes`: Postgres truncates
+/// Ported from `TestLongCollectionNameStillGetsItsIndexes`: Postgres truncated
 /// an over-long identifier rather than rejecting it, and IF NOT EXISTS turned
-/// the resulting collision into a NOTICE nobody surfaced.
+/// the resulting collision into a NOTICE nobody surfaced. The engine here
+/// does not truncate; the test stays because the bound is still the
+/// manifest's and a name at it still has to get its index.
 #[tokio::test]
 async fn long_collection_name_still_gets_its_indexes() {
-    let Some(w) = World::bare("long_collection_name_indexes").await else {
-        return;
-    };
+    let w = World::bare("long_collection_name_indexes").await;
     let long = format!("c{}", "x".repeat(hive_manifest::MAX_COLLECTION_NAME - 1));
     let plan = plan_for(&unique_app(), vec![coll(&long, &["btree(entry_date)"])]);
     apply(&w, &plan).await.expect("apply");
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = $2",
-    )
-    .bind(&plan.schema)
-    .bind(&long)
-    .fetch_all(w.pool())
-    .await
-    .unwrap();
+    let names = index_names(&w, &plan.schema, &long).await;
     assert!(
         names.len() >= 2,
         "collection {long:?} has indexes {names:?}"
@@ -692,22 +659,23 @@ async fn long_collection_name_still_gets_its_indexes() {
     drop_plan(&w, &plan).await;
 }
 
-/// Ported from `TestDerivedIndexNameIsRefusedRatherThanTruncated`.
+/// Ported from `TestDerivedIndexNameIsRefusedRatherThanTruncated`. The engine
+/// does not truncate, so the hazard that test guarded is gone; what remains
+/// is the check at the point of use, that a name past the manifest's bound
+/// is refused here whatever an earlier layer did.
 #[tokio::test]
 async fn derived_index_name_is_refused_rather_than_truncated() {
-    let Some(w) = World::bare("derived_index_name_refused").await else {
-        return;
-    };
+    let w = World::bare("derived_index_name_refused").await;
     let plan = SchemaPlan {
         schema: format!("app_{}", unique_app()),
         collections: vec![CollectionPlan {
-            name: format!("c{}", "x".repeat(62)),
+            name: format!("c{}", "x".repeat(63)),
             crud: false,
             indexes: vec![],
         }],
     };
-    let mut tx = w.store.begin().await.unwrap();
-    let err = apply_schema_plan(&mut tx, &plan)
+    let tx = w.store.begin().await.unwrap();
+    let err = apply_schema_plan(&tx, &plan)
         .await
         .expect_err("a truncating name was accepted");
     assert!(matches!(err, StoreError::UnsafeIdentifier(_)), "{err}");
@@ -717,65 +685,84 @@ async fn derived_index_name_is_refused_rather_than_truncated() {
 /// Ported from `TestUpdatedAtIsMaintainedWithoutTheWriter`.
 #[tokio::test]
 async fn updated_at_is_maintained_without_the_writer() {
-    let Some(w) = World::bare("updated_at_maintained").await else {
-        return;
-    };
+    let w = World::bare("updated_at_maintained").await;
     let plan = plan_for(&unique_app(), vec![coll("entries", &[])]);
     apply(&w, &plan).await.expect("apply");
-    let table = format!("\"{}\".\"entries\"", plan.schema);
-    let (id, created, first): (Uuid, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) = sqlx::query_as(&format!(
-        "INSERT INTO {table} (id, doc) VALUES (gen_random_uuid(), '{{\"a\":1}}') RETURNING id, created_at, updated_at"
+    let table = format!("\"{}__entries\"", plan.schema);
+    let conn = w.conn().await;
+    let row = query(&format!(
+        "INSERT INTO {table} (id, doc) VALUES (?1, '{{\"a\":1}}') RETURNING id, created_at, updated_at"
     ))
-    .fetch_one(w.pool())
+    .bind(Uuid::new_v4())
+    .fetch_one(&conn)
     .await
     .unwrap();
-    let second: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(&format!(
-        "UPDATE {table} SET doc = '{{\"a\":2}}' WHERE id = $1 RETURNING updated_at"
+    let (id, created, first): (
+        Uuid,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ) = (row.get("id"), row.get("created_at"), row.get("updated_at"));
+    // The trigger reads a millisecond clock; give it a tick to move.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    query(&format!(
+        "UPDATE {table} SET doc = '{{\"a\":2}}' WHERE id = ?1"
     ))
     .bind(id)
-    .fetch_one(w.pool())
+    .execute(&conn)
     .await
     .unwrap();
+    let second: chrono::DateTime<chrono::Utc> =
+        query(&format!("SELECT updated_at FROM {table} WHERE id = ?1"))
+            .bind(id)
+            .fetch_scalar(&conn)
+            .await
+            .unwrap();
     assert!(
         second > first,
         "updated_at did not move on an update that ignored it: {first} -> {second}"
     );
     let after: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar(&format!("SELECT created_at FROM {table} WHERE id = $1"))
+        query(&format!("SELECT created_at FROM {table} WHERE id = ?1"))
             .bind(id)
-            .fetch_one(w.pool())
+            .fetch_scalar(&conn)
             .await
             .unwrap();
     assert_eq!(after, created, "created_at moved");
     drop_plan(&w, &plan).await;
 }
 
-/// Ported from `TestTouchFunctionLivesInTheAppSchema`.
+/// Ported from `TestTouchFunctionLivesInTheAppSchema`: the touch trigger is
+/// the collection table's own, so dropping the table takes it along and
+/// uninstall stays one statement per table (D3.2).
 #[tokio::test]
-async fn touch_function_lives_in_the_app_schema() {
-    let Some(w) = World::bare("touch_function_in_app_schema").await else {
-        return;
-    };
+async fn touch_trigger_lives_on_the_collection_table() {
+    let w = World::bare("touch_trigger_on_table").await;
     let plan = plan_for(&unique_app(), vec![coll("entries", &[])]);
     apply(&w, &plan).await.expect("apply");
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                         WHERE n.nspname = $1 AND p.proname = 'set_updated_at')",
-    )
-    .bind(&plan.schema)
-    .fetch_one(w.pool())
-    .await
-    .unwrap();
-    assert!(exists, "set_updated_at is not in {}", plan.schema);
+    let table = format!("{}__entries", plan.schema);
+    let triggers: Vec<String> =
+        query("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1")
+            .bind(&table)
+            .fetch_scalars(&*w.conn().await)
+            .await
+            .unwrap();
+    assert!(
+        triggers.iter().any(|t| t.ends_with("_touch")),
+        "no touch trigger on {table}: {triggers:?}"
+    );
     drop_plan(&w, &plan).await;
+    let left: i64 = query("SELECT count(*) FROM sqlite_master WHERE tbl_name = ?1")
+        .bind(&table)
+        .fetch_scalar(&*w.conn().await)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "dropping the table left {left} objects behind");
 }
 
 /// Ported from `TestApplySchemaPlanIsIdempotent` (D3.3).
 #[tokio::test]
 async fn apply_schema_plan_is_idempotent() {
-    let Some(w) = World::bare("apply_schema_plan_idempotent").await else {
-        return;
-    };
+    let w = World::bare("apply_schema_plan_idempotent").await;
     let plan = plan_for(&unique_app(), vec![coll("entries", &["btree(entry_date)"])]);
     apply(&w, &plan).await.expect("first apply");
     apply(&w, &plan).await.expect("second apply");
@@ -786,12 +773,10 @@ async fn apply_schema_plan_is_idempotent() {
 /// `TestApplySchemaPlanComposesWithOtherWork`: a failed install leaves nothing.
 #[tokio::test]
 async fn apply_schema_plan_rolls_back_wholly() {
-    let Some(w) = World::bare("apply_schema_plan_rolls_back").await else {
-        return;
-    };
+    let w = World::bare("apply_schema_plan_rolls_back").await;
     let plan = plan_for(&unique_app(), vec![coll("entries", &[])]);
-    let mut tx = w.store.begin().await.unwrap();
-    apply_schema_plan(&mut tx, &plan).await.expect("apply");
+    let tx = w.store.begin().await.unwrap();
+    apply_schema_plan(&tx, &plan).await.expect("apply");
     tx.rollback().await.unwrap(); // something else in the same unit of work fails
     assert!(
         !schema_exists(&w, &plan.schema).await,
@@ -803,9 +788,7 @@ async fn apply_schema_plan_rolls_back_wholly() {
 /// Ported from `TestDropSchemaPlanRemovesEverything` (D3.2).
 #[tokio::test]
 async fn drop_schema_plan_removes_everything() {
-    let Some(w) = World::bare("drop_schema_plan_removes").await else {
-        return;
-    };
+    let w = World::bare("drop_schema_plan_removes").await;
     let plan = plan_for(&unique_app(), vec![coll("entries", &[])]);
     apply(&w, &plan).await.expect("apply");
     drop_plan(&w, &plan).await;
@@ -819,15 +802,13 @@ async fn drop_schema_plan_removes_everything() {
 /// Ported from `TestVectorIndexIsRefusedRatherThanSkipped`.
 #[tokio::test]
 async fn vector_index_is_refused_rather_than_skipped() {
-    let Some(w) = World::bare("vector_index_refused").await else {
-        return;
-    };
+    let w = World::bare("vector_index_refused").await;
     let plan = plan_for(
         &unique_app(),
         vec![coll("entries", &["vector(embedding, 1536)"])],
     );
-    let mut tx = w.store.begin().await.unwrap();
-    let err = apply_schema_plan(&mut tx, &plan)
+    let tx = w.store.begin().await.unwrap();
+    let err = apply_schema_plan(&tx, &plan)
         .await
         .expect_err("a vector index was silently accepted");
     assert!(matches!(err, StoreError::NotImplemented(_)), "{err}");
@@ -842,9 +823,7 @@ async fn vector_index_is_refused_rather_than_skipped() {
 /// point of use.
 #[tokio::test]
 async fn apply_schema_plan_refuses_unsafe_identifiers() {
-    let Some(w) = World::bare("apply_schema_plan_unsafe_idents").await else {
-        return;
-    };
+    let w = World::bare("apply_schema_plan_unsafe_idents").await;
     let plans = [
         SchemaPlan {
             schema: "app_x\"; DROP SCHEMA public; --".into(),
@@ -868,8 +847,8 @@ async fn apply_schema_plan_refuses_unsafe_identifiers() {
         },
     ];
     for plan in plans {
-        let mut tx = w.store.begin().await.unwrap();
-        let err = apply_schema_plan(&mut tx, &plan)
+        let tx = w.store.begin().await.unwrap();
+        let err = apply_schema_plan(&tx, &plan)
             .await
             .err()
             .unwrap_or_else(|| panic!("plan {:?} accepted", plan.schema));
@@ -880,18 +859,21 @@ async fn apply_schema_plan_refuses_unsafe_identifiers() {
         );
         tx.rollback().await.unwrap();
     }
-    assert!(
-        schema_exists(&w, "public").await,
-        "a rejected identifier still executed; public is gone"
+    let actors: i64 =
+        query("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'actors'")
+            .fetch_scalar(&*w.conn().await)
+            .await
+            .unwrap();
+    assert_eq!(
+        actors, 1,
+        "a rejected identifier still executed; actors is gone"
     );
 }
 
 /// Ported from `TestIndexExpressionCannotBeEscaped`.
 #[tokio::test]
 async fn index_expression_cannot_be_escaped() {
-    let Some(w) = World::bare("index_expression_cannot_escape").await else {
-        return;
-    };
+    let w = World::bare("index_expression_cannot_escape").await;
     let plan = SchemaPlan {
         schema: format!("app_{}", unique_app()),
         collections: vec![CollectionPlan {
@@ -904,8 +886,8 @@ async fn index_expression_cannot_be_escaped() {
             }],
         }],
     };
-    let mut tx = w.store.begin().await.unwrap();
-    let err = apply_schema_plan(&mut tx, &plan)
+    let tx = w.store.begin().await.unwrap();
+    let err = apply_schema_plan(&tx, &plan)
         .await
         .expect_err("an escaping path was accepted");
     assert!(matches!(err, StoreError::UnsafeIdentifier(_)), "{err}");

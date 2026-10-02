@@ -6,11 +6,13 @@
 //! > The events table is the transport. NOTIFY is a wakeup bell carrying an
 //! > id. Every consumer stays correct if every notification is dropped.
 //!
-//! So the tailer never trusts a notification. It re-reads an overlap window on
-//! every cycle, dedupes by id, and polls unconditionally on a timer whether or
-//! not the listening connection is healthy. A missed notification is a latency
-//! event, never a correctness event ... and the tests prove that by running the
-//! whole suite with notifications disabled.
+//! The bell is now in-process (D38): `hive_store::event_wake()` rings once per
+//! appended batch, and the store is one file per daemon so every writer is in
+//! this process. The tailer still never trusts it. It re-reads an overlap
+//! window on every cycle, dedupes by id, and polls unconditionally on a timer
+//! whether or not anything rang. A missed ring is a latency event, never a
+//! correctness event ... and the tests prove that by running the whole suite
+//! with the bell disconnected.
 
 mod hub;
 mod sse;
@@ -21,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use sqlx::PgPool;
+use hive_db::Db;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -41,13 +43,10 @@ pub struct Config {
     pub poll_interval: Duration,
     /// Bounds one tail query. A full batch means "there is more".
     pub batch_limit: i64,
-    /// For the listening connection. Seconds, not the minute a library default
-    /// would make a brief database blip look like.
-    pub reconnect_delay: Duration,
-    /// The one coarse channel. Overriding it is how the test suite proves the
-    /// invariant: point a bus at a channel nobody notifies and every consumer
-    /// must still be correct on the backstop poll alone.
-    pub channel: String,
+    /// Whether to listen for the in-process bell at all. Turning it off is how
+    /// the test suite proves the invariant: a bus nobody wakes must still be
+    /// correct on the backstop poll alone.
+    pub listen: bool,
 }
 
 impl Default for Config {
@@ -56,8 +55,7 @@ impl Default for Config {
             overlap: Duration::ZERO,
             poll_interval: Duration::ZERO,
             batch_limit: 0,
-            reconnect_delay: Duration::ZERO,
-            channel: String::new(),
+            listen: true,
         }
     }
 }
@@ -73,18 +71,12 @@ impl Config {
         if self.batch_limit <= 0 {
             self.batch_limit = 500;
         }
-        if self.reconnect_delay.is_zero() {
-            self.reconnect_delay = Duration::from_millis(1500);
-        }
-        if self.channel.is_empty() {
-            self.channel = hive_store::NOTIFY_CHANNEL.to_string();
-        }
         self
     }
 }
 
 pub(crate) struct Inner {
-    pub(crate) pool: PgPool,
+    pub(crate) db: Db,
     pub(crate) cfg: Config,
     pub(crate) hub: hub::Hub,
     /// "Something may have happened." A notification is a hint, and a
@@ -100,19 +92,30 @@ pub(crate) struct Inner {
     ready_notify: Notify,
 }
 
-/// Owns one listening connection per host and fans out in memory to every
-/// subscriber on that host (D4.8). Cheap to clone; every clone is the same bus.
+impl Inner {
+    /// A checkout from the store's pool, with the store's error shape so the
+    /// tailer and the SSE handler report one kind of failure.
+    pub(crate) async fn conn(&self) -> Result<hive_db::Conn, hive_store::StoreError> {
+        self.db
+            .conn()
+            .await
+            .map_err(|e| hive_store::StoreError::db("connect", e))
+    }
+}
+
+/// Owns one tailer per host and fans out in memory to every subscriber on
+/// that host (D4.8). Cheap to clone; every clone is the same bus.
 #[derive(Clone)]
 pub struct Bus {
     pub(crate) inner: Arc<Inner>,
 }
 
 impl Bus {
-    /// Builds a bus over an existing pool. Nothing runs until `run` is called.
-    pub fn new(pool: PgPool, cfg: Config) -> Bus {
+    /// Builds a bus over an open store file. Nothing runs until `run` is called.
+    pub fn new(db: Db, cfg: Config) -> Bus {
         Bus {
             inner: Arc::new(Inner {
-                pool,
+                db,
                 cfg: cfg.defaults(),
                 hub: hub::Hub::new(),
                 wake: Notify::new(),
@@ -140,8 +143,8 @@ impl Bus {
         Utc.timestamp_micros(micros).single()
     }
 
-    /// How the tailer has been woken: (notifications, polls). A healthy system
-    /// polls occasionally and is notified often; a system with a dead listener
+    /// How the tailer has been woken: (rings, polls). A healthy system polls
+    /// occasionally and is rung often; a system with the bell disconnected
     /// polls only, stays correct, and gets slower.
     pub fn stats(&self) -> (i64, i64) {
         (
@@ -196,64 +199,23 @@ impl Bus {
         self.inner.hub.close_all();
     }
 
-    /// Keeps a DEDICATED connection subscribed to the one coarse channel.
-    /// Never from the pool's ordinary checkout: the subscription must survive
-    /// as long as the connection does, and reconnect when it does not.
+    /// Forwards the in-process bell to the tail loop. There is no connection
+    /// to lose any more; what remains of the old listener is the counter and
+    /// the rule that the tail loop, never this task, does the reading.
     async fn listen(&self, cancel: CancellationToken) {
-        let cfg = &self.inner.cfg;
+        if !self.inner.cfg.listen {
+            cancel.cancelled().await;
+            return;
+        }
+        let bell = hive_store::event_wake();
         loop {
-            if cancel.is_cancelled() {
-                return;
-            }
-            let mut listener =
-                match sqlx::postgres::PgListener::connect_with(&self.inner.pool).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        // Non-fatal by design. The backstop poll is already
-                        // covering us, which is the entire reason a listener
-                        // outage is survivable.
-                        tracing::warn!(err = %e, "bus listener connect");
-                        self.reconnect_pause(&cancel).await;
-                        continue;
-                    }
-                };
-            if let Err(e) = listener.listen(&cfg.channel).await {
-                tracing::warn!(err = %e, "bus listener listen");
-                self.reconnect_pause(&cancel).await;
-                continue;
-            }
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    got = listener.try_recv() => match got {
-                        // Never query on the listening connection: buffer and
-                        // return; the tail loop does the reading.
-                        Ok(Some(_)) => {
-                            self.inner.notified.fetch_add(1, Ordering::SeqCst);
-                            self.kick();
-                        }
-                        // The connection dropped and was re-established:
-                        // anything sent meanwhile is exactly what the poll
-                        // covers.
-                        Ok(None) => self.kick(),
-                        Err(e) => {
-                            tracing::warn!(err = %e, "bus listener");
-                            break;
-                        }
-                    },
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = bell.wait() => {
+                    self.inner.notified.fetch_add(1, Ordering::SeqCst);
+                    self.kick();
                 }
             }
-            self.reconnect_pause(&cancel).await;
-        }
-    }
-
-    /// Jittered so N hosts do not reconnect in lockstep after a restart.
-    /// Nothing here is a secret, so a weak generator is the right one.
-    async fn reconnect_pause(&self, cancel: &CancellationToken) {
-        let jitter = Duration::from_millis(rand::random_range(0..500));
-        tokio::select! {
-            _ = cancel.cancelled() => {}
-            _ = tokio::time::sleep(self.inner.cfg.reconnect_delay + jitter) => {}
         }
     }
 }

@@ -48,9 +48,9 @@ dropped rather than waited for, so a slow browser never sits on the critical
 path of a child process's pipe. The table is the transport; the stream fills a
 detected gap from it.
 
-Run events are **not** mirrored onto the events bus. `append_events` issues one
-NOTIFY per call, so ten concurrent turns would put thousands of rows inside the
-bus's overlap window and past its late-commit sweep, truncating the one
+Run events are **not** mirrored onto the events bus. `append_events` rings the
+bell once per call, so ten concurrent turns would put thousands of rows inside
+the bus's overlap window and past its late-commit sweep, truncating the one
 mechanism that catches an id assigned before commit, for every consumer. The
 second transport is legitimate rather than a bypass because invariant 4's
 hazard is structurally absent here: one writer per run, one autocommit INSERT

@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use hive_blob::{Catalog, Hash, Range};
+use hive_db::query;
 use hive_identity::Credential;
 use hive_manifest::{Impl, Manifest, Op, Surface};
 use hive_mcp::{CrudCall, Dispatcher, Guard, GuestCall, Install, Installs, ToolResult};
@@ -34,7 +35,6 @@ use hive_trust::Level;
 use hive_wasmhost::{
     CallRequest, Caller, CapabilitySet, Host, Module, ModuleSource, Request, Storage as _,
 };
-use sqlx::Row;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
@@ -62,24 +62,24 @@ impl Surfaces {
     /// The predicate decides the rest, per tool and per route.
     async fn candidates(&self, cred: &Credential) -> Result<Vec<Install>, String> {
         cred.validate().map_err(|e| e.to_string())?;
-        let rows = sqlx::query(
+        let rows = query(
             "SELECT i.id, i.slug, b.manifest
                FROM installs i
                JOIN app_builds b ON b.id = i.build_id
               WHERE i.state = 'active'
                 AND (
-                     (i.owner_kind = $1 AND i.owner_id = $2)
+                     (i.owner_kind = ?1 AND i.owner_id = ?2)
                   OR EXISTS (
                        SELECT 1 FROM grants g
                         WHERE g.subject_id = i.id
                           AND g.subject_kind IN ('install', 'tool', 'route', 'collection')
                           AND g.revoked_at IS NULL
-                          AND (g.expires_at IS NULL OR g.expires_at > now())
+                          AND (g.expires_at IS NULL OR g.expires_at > ?3)
                           AND (
-                               (g.target_kind = $1 AND g.target_id = $2)
-                            OR ($1 = 'user' AND g.target_kind = 'org' AND EXISTS (
+                               (g.target_kind = ?1 AND g.target_id = ?2)
+                            OR (?1 = 'user' AND g.target_kind = 'org' AND EXISTS (
                                   SELECT 1 FROM org_members m
-                                   WHERE m.org_id = g.target_id AND m.user_id = $2))
+                                   WHERE m.org_id = g.target_id AND m.user_id = ?2))
                           )
                      )
                 )
@@ -87,7 +87,8 @@ impl Surfaces {
         )
         .bind(cred.principal_kind.as_str())
         .bind(cred.principal_id)
-        .fetch_all(self.store.pool())
+        .bind(hive_db::now())
+        .fetch_all(&*self.store.conn().await.map_err(|e| e.to_string())?)
         .await
         .map_err(|e| format!("installs: {e}"))?;
 
@@ -116,17 +117,17 @@ impl Surfaces {
     /// call bites (the same reason `call_tool` does not trust a cached
     /// listing).
     async fn module_for(&self, install: &Install) -> Result<Module, String> {
-        let mut conn = self.store.conn().await.map_err(|e| e.to_string())?;
-        let info = resolve_active_install(&mut *conn, install.id)
+        let conn = self.store.conn().await.map_err(|e| e.to_string())?;
+        let info = resolve_active_install(&conn, install.id)
             .await
             .map_err(|e| e.to_string())?;
-        let row = sqlx::query(
+        let row = query(
             "SELECT b.module_sha256, b.version
                FROM installs i JOIN app_builds b ON b.id = i.build_id
-              WHERE i.id = $1",
+              WHERE i.id = ?1",
         )
         .bind(install.id)
-        .fetch_one(&mut *conn)
+        .fetch_one(&conn)
         .await
         .map_err(|e| format!("build of install {}: {e}", install.id))?;
         let hash: Option<String> = row.get("module_sha256");
@@ -236,14 +237,14 @@ impl Surfaces {
             };
             let name = format!("{} {}", route.method, route.path);
             let allowed = {
-                let mut conn = self
+                let conn = self
                     .store
                     .conn()
                     .await
                     .map_err(|e| RouteError::Failed(e.to_string()))?;
                 self.store
                     .guard()
-                    .route_reason(&mut conn, &call.cred, inst.id, &name)
+                    .route_reason(&conn, &call.cred, inst.id, &name)
                     .await
                     .map_err(|e| RouteError::Failed(e.to_string()))?
                     .is_some()
@@ -291,10 +292,10 @@ impl Guard for Surfaces {
         install_id: Uuid,
         tool: &str,
     ) -> Result<bool, String> {
-        let mut conn = self.store.conn().await.map_err(|e| e.to_string())?;
+        let conn = self.store.conn().await.map_err(|e| e.to_string())?;
         self.store
             .guard()
-            .tool_reason(&mut conn, cred, install_id, tool)
+            .tool_reason(&conn, cred, install_id, tool)
             .await
             .map(|r| r.is_some())
             .map_err(|e| e.to_string())

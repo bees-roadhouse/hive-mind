@@ -19,16 +19,17 @@ Phase 0, and honest about the gap. What exists:
 
 | | |
 |---|---|
-| `crates/hive-schema` | the forward-only migrations, with the advisory lock and the checksum |
+| `crates/hive-db` | the store's engine behind one seam: SQLite through `rusqlite`, pooled, `BEGIN IMMEDIATE` (D38) |
+| `crates/hive-schema` | the forward-only migrations, applied in one write transaction, with the checksum |
 | `crates/hive-store` | the data layer, the grant predicate, install authority, credentials, chat, the guest-facing storage |
 | `crates/hive-wasmhost` | guest apps on wasmtime behind the JSON ABI, with trust structural in the ABI |
 | `crates/hive-blob` | the driver seam — disk and S3-compatible (Garage) drivers — and the reference layer |
-| `crates/hive-bus` | the events table as transport, NOTIFY as wakeup, SSE fan-out |
+| `crates/hive-bus` | the events table as transport, an in-process bell as wakeup, SSE fan-out |
 | `crates/hive-mcp` | the tools tier: what `tools/list` shows is what `tools/call` accepts |
 | `crates/hive-surfaces` | hive-mcp's collaborators over the store and the wasm host, and the app routes |
 | `crates/hive-manifest` | the app declaration and everything derivable from it; pure, no I/O |
-| `crates/hive-registry` | manifest + module + Postgres = an installed app |
-| `crates/hive-harness` | hosted agent runs under Podman, persisted in Postgres |
+| `crates/hive-registry` | manifest + module + the store = an installed app |
+| `crates/hive-harness` | hosted agent runs under Podman, persisted in the store |
 | `crates/hive-egress` | the allowlisting proxy a run reaches the internet through |
 | `crates/hive-httpapi` | liveness, readiness, events, enrollment, blob reads, session and chat |
 | `crates/hive-chat` | a message becomes one hosted agent run; the worker, its heartbeat and the reclaimers |
@@ -36,22 +37,24 @@ Phase 0, and honest about the gap. What exists:
 | `crates/hive-sandbox` | the daemon: every role in one process, on a port and a unix socket |
 | `guest/`, `apps/hello` | the guest SDK and the reference guest |
 
-**The daemon composes.** It opens the store, migrates, bootstraps an empty
-database, keeps the event partitions ahead of the clock, runs the LISTEN/NOTIFY
-bus, instantiates the wasm host with real Storage, Blob and Events, and serves
+**The daemon composes.** It opens the store (two SQLite files under
+`--data-dir`, created on first boot), migrates, bootstraps an empty store,
+runs the bus, instantiates the wasm host with real Storage, Blob and Events, and serves
 its API on a port **and a unix socket** — the socket because a harness container
 runs `--network=none` with it bind-mounted, and on rootless Podman an
 `--internal` network has no gateway to the host at all.
 
-`docker/docker-compose.stack.yml` brings the whole thing up: Postgres, a
-pre-migration database dump, then the daemon.
+`docker/docker-compose.stack.yml` brings the whole thing up: the daemon and
+its volumes. There is no database container; a backup is a copy of the data
+volume taken with the daemon stopped, or `sqlite3 hive.db ".backup out.db"`
+while it runs.
 
 ```bash
 podman compose -f docker/docker-compose.stack.yml up -d
 curl localhost:7979/readyz
 ```
 
-`/healthz` is liveness and stays dumb on purpose; `/readyz` reports Postgres and
+`/healthz` is liveness and stays dumb on purpose; `/readyz` reports the store and
 the bus, and refuses until the bus has tailed once — serving before that
 publishes a replica whose stream resumes from a watermark it never established.
 
@@ -87,8 +90,7 @@ pass.
 ## Running it
 
 ```bash
-export HIVE_SANDBOX_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
-cargo run -p hive-sandbox -- --plain-http     # api + workflows by default, listens on :7979
+cargo run -p hive-sandbox -- --data-dir ./data --plain-http     # api + workflows by default, listens on :7979
 cargo run -p hive-sandbox -- --version
 curl localhost:7979/healthz
 ```
@@ -132,9 +134,7 @@ gate; `docs/chat.md` says how the pieces fit.
 ## Development
 
 ```bash
-./scripts/db-up.sh           # Postgres on 127.0.0.1:55432, prints the connection string
-./scripts/gate-rust.sh       # web build + diff, fmt, clippy, build, test, named skips
-./scripts/db-down.sh         # --purge also deletes the volume
+./scripts/gate-rust.sh       # fmt, clippy, build, test, named skips; nothing to start first
 
 ./scripts/garage-up.sh       # S3 on 127.0.0.1:53900, for the blob driver tests
 ./scripts/garage-down.sh

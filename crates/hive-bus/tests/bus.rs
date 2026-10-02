@@ -5,10 +5,10 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use hive_bus::{Bus, Config};
+use hive_db::{Db, query};
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_store::{BootstrapConfig, Event, Store, append_events};
 use hive_testdb::TestDb;
-use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -22,15 +22,9 @@ struct Harness {
 }
 
 impl Harness {
-    async fn new(test: &str) -> Option<Harness> {
-        let db = TestDb::new(test).await?;
-        hive_store::migrate(db.pool()).await.expect("migrate");
-        let mut conn = db.pool().acquire().await.unwrap();
-        hive_store::ensure_event_partitions(&mut conn, 1)
-            .await
-            .expect("partitions");
-        drop(conn);
-        let store = Store::from_pool(db.pool().clone());
+    async fn new(test: &str) -> Harness {
+        let db = TestDb::new(test).await;
+        let store = Store::from_dbs(db.db().clone(), db.audit().clone());
         let res = store
             .bootstrap_in_tx(&BootstrapConfig {
                 root_handle: "alice".into(),
@@ -40,18 +34,22 @@ impl Harness {
             .await
             .expect("bootstrap");
         let alice = res.root_actor_id;
-        Some(Harness {
+        Harness {
             db,
             store,
             alice,
             cred: Credential::new(alice, PrincipalKind::User, alice),
             cancel: CancellationToken::new(),
             runs: Vec::new(),
-        })
+        }
     }
 
-    fn pool(&self) -> &PgPool {
-        self.db.pool()
+    fn db(&self) -> &Db {
+        self.db.db()
+    }
+
+    async fn conn(&self) -> hive_db::Conn {
+        self.store.conn().await.expect("checkout")
     }
 
     fn owner(&self) -> Owner {
@@ -60,7 +58,7 @@ impl Harness {
 
     /// Starts a bus and waits until it has tailed once.
     async fn run(&mut self, cfg: Config) -> Bus {
-        let b = Bus::new(self.pool().clone(), cfg);
+        let b = Bus::new(self.db().clone(), cfg);
         let bus = b.clone();
         let cancel = self.cancel.clone();
         self.runs
@@ -80,14 +78,14 @@ impl Harness {
 
     async fn human(&self, handle: &str) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', $2, $2, 'user', $1, $3)",
+             VALUES (?1, 'human', ?2, ?2, 'user', ?1, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(self.alice)
-        .execute(self.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap();
         id
@@ -100,20 +98,10 @@ impl Harness {
             format!("{{\"kind\":{kind:?}}}").into_bytes(),
         );
         ev.owner = owner;
-        let mut conn = self.pool().acquire().await.unwrap();
-        append_events(&mut conn, std::slice::from_mut(&mut ev))
+        append_events(&*self.conn().await, std::slice::from_mut(&mut ev))
             .await
             .expect("append");
         ev
-    }
-
-    /// Rings the wakeup bell on a channel of this test's own.
-    async fn notify(&self, channel: &str) {
-        sqlx::query("SELECT pg_notify($1, '')")
-            .bind(channel)
-            .execute(self.pool())
-            .await
-            .unwrap();
     }
 }
 
@@ -132,7 +120,7 @@ async fn collect(sub: &mut hive_bus::Subscription, n: usize, within: Duration) -
 
 fn quiet(poll: Duration, overlap: Duration) -> Config {
     Config {
-        channel: "a_channel_nobody_notifies".into(),
+        listen: false,
         poll_interval: poll,
         overlap,
         ..Config::default()
@@ -140,13 +128,11 @@ fn quiet(poll: Duration, overlap: Duration) -> Config {
 }
 
 /// Ported from `TestCorrectWithEveryNotificationDropped`: THE test. If this
-/// fails, "a missed notification is a latency event, never a correctness
+/// fails, "a missed ring is a latency event, never a correctness
 /// event" is false.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn correct_with_every_notification_dropped() {
-    let Some(mut h) = Harness::new("bus_correct_without_notifications").await else {
-        return;
-    };
+    let mut h = Harness::new("bus_correct_without_notifications").await;
     // A batch limit under the event count, so the inner catch-up loop runs.
     let b = h
         .run(Config {
@@ -182,9 +168,7 @@ async fn correct_with_every_notification_dropped() {
 /// Ported from `TestBurstLargerThanOneBatchIsFullyDelivered`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn burst_larger_than_one_batch_is_fully_delivered() {
-    let Some(mut h) = Harness::new("bus_burst").await else {
-        return;
-    };
+    let mut h = Harness::new("bus_burst").await;
     let b = h
         .run(Config {
             batch_limit: 10,
@@ -196,8 +180,8 @@ async fn burst_larger_than_one_batch_is_fully_delivered() {
     let mut events: Vec<Event> = (0..120)
         .map(|i| Event::new(format!("burst.{i}"), &h.cred, b"{}".to_vec()))
         .collect();
-    let mut conn = h.pool().acquire().await.unwrap();
-    append_events(&mut conn, &mut events)
+    let conn = h.conn().await;
+    append_events(&conn, &mut events)
         .await
         .expect("append burst");
     drop(conn);
@@ -222,110 +206,100 @@ async fn burst_larger_than_one_batch_is_fully_delivered() {
     h.stop().await;
 }
 
-/// A transaction holding an unfinished event insert.
+/// A transaction holding an unfinished event insert. Its id is assigned at
+/// the INSERT, before the commit, exactly as it was in Postgres.
 struct LateEvent {
-    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    tx: hive_db::Transaction,
     id: i64,
 }
 
 async fn begin_late_event(h: &Harness) -> LateEvent {
-    let mut conn = h.pool().acquire().await.unwrap();
-    sqlx::query("BEGIN").execute(&mut *conn).await.unwrap();
-    let id: i64 = sqlx::query_scalar(
+    let tx = h.db().begin().await.unwrap();
+    let id: i64 = query(
         "INSERT INTO events (kind, owner_kind, owner_id, author_actor, principal_kind, principal_id)
-         VALUES ('late.event', 'user', $1, $1, 'user', $1) RETURNING id",
+         VALUES ('late.event', 'user', ?1, ?1, 'user', ?1) RETURNING id",
     )
     .bind(h.alice)
-    .fetch_one(&mut *conn)
+    .fetch_scalar(&tx)
     .await
     .unwrap();
-    LateEvent { conn, id }
+    LateEvent { tx, id }
 }
 
 impl LateEvent {
-    async fn commit(mut self) -> i64 {
-        sqlx::query("COMMIT")
-            .execute(&mut *self.conn)
-            .await
-            .unwrap();
+    async fn commit(self) -> i64 {
+        self.tx.commit().await.unwrap();
         self.id
     }
 }
 
-/// Ported from `TestLateCommitWithALowerIDIsNotSkipped`: the bug the overlap
-/// window exists for.
+/// Ported from `TestLateCommitWithALowerIDIsNotSkipped`, and changed by the
+/// engine (D38). The hazard the overlap window exists for is a row that
+/// takes a low id early and commits after a higher one is already visible.
+/// Postgres allows that; this engine has one writer at a time, so a second
+/// append cannot even START until the late transaction ends, and the low id
+/// commits first by construction. The test now proves that ordering rather
+/// than arranging the hazard it rules out: the fast append blocks behind the
+/// late one, lands with the HIGHER id, and both are delivered exactly once.
+/// The overlap window and the dedupe set stay, because a second writer
+/// process (phase 2 of D38) brings the hazard back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn late_commit_with_a_lower_id_is_not_skipped() {
-    let Some(mut h) = Harness::new("bus_late_commit").await else {
-        return;
-    };
+async fn a_lower_id_cannot_commit_late_because_writers_are_serialised() {
+    let mut h = Harness::new("bus_late_commit").await;
     let b = h
         .run(quiet(Duration::from_millis(100), Duration::from_secs(5)))
         .await;
     let mut sub = b.subscribe(64);
     let late = begin_late_event(&h).await;
-    let fast = h.append("fast.event", h.owner()).await;
-    let got = collect(&mut sub, 1, Duration::from_secs(10)).await;
-    assert!(
-        got.len() == 1 && got[0].id == fast.id,
-        "expected the fast event first, got {got:?}"
-    );
-    let late_id = late.commit().await;
-    assert!(late_id < fast.id, "the test is not reproducing the hazard");
-    let got = collect(&mut sub, 1, Duration::from_secs(10)).await;
-    assert!(
-        got.len() == 1 && got[0].id == late_id,
-        "the late-committing row (id {late_id}) was never delivered; got {got:?}"
-    );
-    h.stop().await;
-}
-
-/// Ported from `TestLateCommitIsSkippedWithoutTheOverlap`: the negative
-/// control.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn late_commit_is_skipped_without_the_overlap() {
-    let Some(mut h) = Harness::new("bus_late_commit_no_overlap").await else {
-        return;
+    let fast = {
+        let store = h.store.clone();
+        let cred = h.cred;
+        let owner = h.owner();
+        tokio::spawn(async move {
+            let mut ev = Event::new("fast.event", &cred, b"{}".to_vec());
+            ev.owner = owner;
+            let conn = store.conn().await.unwrap();
+            append_events(&conn, std::slice::from_mut(&mut ev))
+                .await
+                .expect("append");
+            ev
+        })
     };
-    let b = h
-        .run(quiet(Duration::from_millis(100), Duration::from_nanos(1)))
-        .await;
-    let mut sub = b.subscribe(64);
-    let late = begin_late_event(&h).await;
-    let fast = h.append("fast.event", h.owner()).await;
-    let got = collect(&mut sub, 1, Duration::from_secs(10)).await;
-    assert!(got.len() == 1 && got[0].id == fast.id);
+    // The fast append is queued behind the open write transaction: nothing
+    // reaches the subscriber while the late one is open.
+    let got = collect(&mut sub, 1, Duration::from_millis(500)).await;
+    assert!(
+        got.is_empty(),
+        "an event committed while another writer held the lock: {got:?}"
+    );
     let late_id = late.commit().await;
-    // A near-zero overlap also collapses the dedupe window, so already
-    // delivered rows may come round again; only the LATE id matters.
-    for e in collect(&mut sub, 50, Duration::from_secs(2)).await {
-        assert_ne!(
-            e.id, late_id,
-            "with the overlap disabled the late row still arrived; the overlap is not what makes the positive test pass"
-        );
-    }
+    let fast = fast.await.unwrap();
+    assert!(
+        late_id < fast.id,
+        "the append that waited took the lower id ({} < {late_id})",
+        fast.id
+    );
+    let got = collect(&mut sub, 2, Duration::from_secs(10)).await;
+    let ids: Vec<i64> = got.iter().map(|e| e.id).collect();
+    assert_eq!(ids, vec![late_id, fast.id], "delivered {ids:?}");
     h.stop().await;
 }
 
-/// Ported from `TestNotificationDeliversFasterThanThePoll`.
+/// Ported from `TestNotificationDeliversFasterThanThePoll`. The bell is the
+/// in-process one every append rings (D38); the process-wide counter is what
+/// proves the delivery came from a ring and not from the 30s poll.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notification_delivers_faster_than_the_poll() {
-    let Some(mut h) = Harness::new("bus_notification_fast").await else {
-        return;
-    };
-    // Its own channel: a NOTIFY channel is database-wide, and any other test
-    // appending an event would satisfy the warmup for an unrelated reason.
-    let channel = format!("bus_test_{}", Uuid::new_v4().simple());
+    let mut h = Harness::new("bus_notification_fast").await;
     let b = h
         .run(Config {
-            channel: channel.clone(),
             poll_interval: Duration::from_secs(30),
             overlap: Duration::from_secs(2),
             ..Config::default()
         })
         .await;
     let mut sub = b.subscribe(256);
-    // The listener connects asynchronously. Warm up until a notification has
+    // The listener task starts asynchronously. Warm up until a ring has
     // actually been received.
     let warmup = tokio::time::Instant::now() + Duration::from_secs(20);
     while b.stats().0 == 0 {
@@ -334,13 +308,11 @@ async fn notification_delivers_faster_than_the_poll() {
             "the listener never subscribed"
         );
         h.append("warmup", h.owner()).await;
-        h.notify(&channel).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let (before, _) = b.stats();
     let start = tokio::time::Instant::now();
     let want = h.append("journal.entry.created", h.owner()).await;
-    h.notify(&channel).await;
     let deadline = start + Duration::from_secs(5);
     let elapsed = loop {
         match tokio::time::timeout_at(deadline, sub.recv()).await {
@@ -367,9 +339,7 @@ async fn notification_delivers_faster_than_the_poll() {
 /// Ported from `TestVisibilityIsPerSubscriber` (D4.9).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn visibility_is_per_subscriber() {
-    let Some(mut h) = Harness::new("bus_visibility_per_subscriber").await else {
-        return;
-    };
+    let mut h = Harness::new("bus_visibility_per_subscriber").await;
     let bob = h.human("bob").await;
     let bob_cred = Credential::new(bob, PrincipalKind::User, bob);
     let b = h
@@ -385,14 +355,14 @@ async fn visibility_is_per_subscriber() {
     let got = collect(&mut sub, 2, Duration::from_secs(10)).await;
     assert_eq!(got.len(), 2, "the hub is unfiltered by design");
     let g = h.store.guard();
-    let mut conn = h.pool().acquire().await.unwrap();
-    let for_alice = g.visible(&mut conn, &h.cred, &got).await.unwrap();
+    let conn = h.conn().await;
+    let for_alice = g.visible(&conn, &h.cred, &got).await.unwrap();
     assert!(
         for_alice.len() == 1 && for_alice[0].id == mine.id,
         "alice saw {} events",
         for_alice.len()
     );
-    let for_bob = g.visible(&mut conn, &bob_cred, &got).await.unwrap();
+    let for_bob = g.visible(&conn, &bob_cred, &got).await.unwrap();
     assert!(
         for_bob.len() == 1 && for_bob[0].id == theirs.id,
         "bob saw {} events",
@@ -405,9 +375,7 @@ async fn visibility_is_per_subscriber() {
 /// Ported from `TestSlowSubscriberIsDroppedNotBlocking`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_subscriber_is_dropped_not_blocking() {
-    let Some(mut h) = Harness::new("bus_slow_subscriber").await else {
-        return;
-    };
+    let mut h = Harness::new("bus_slow_subscriber").await;
     let b = h
         .run(Config {
             poll_interval: Duration::from_millis(100),
@@ -446,9 +414,7 @@ async fn slow_subscriber_is_dropped_not_blocking() {
 /// Ported from `TestSettledWatermarkLagsTheNewestEvent`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settled_watermark_lags_the_newest_event() {
-    let Some(mut h) = Harness::new("bus_settled_lags").await else {
-        return;
-    };
+    let mut h = Harness::new("bus_settled_lags").await;
     let b = h
         .run(Config {
             poll_interval: Duration::from_millis(100),

@@ -65,7 +65,8 @@ reason to invent a second scheme.
 ## Pluggable, and pluggable through WASM
 
 The vault is a **seam, not a store**. The default backend keeps entries in
-Postgres, encrypted, because a self-hosted deployment should need nothing else.
+the daemon's own store, encrypted, because a self-hosted deployment should
+need nothing else.
 But the interesting credentials for a household already live somewhere:
 
 - **1Password** — `op` is already how this fleet reads secrets at launch, and

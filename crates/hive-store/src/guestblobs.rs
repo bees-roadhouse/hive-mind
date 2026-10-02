@@ -152,8 +152,8 @@ impl GuestBlobs {
             return Err(HostError::invalid("blob.append: too large"));
         }
 
-        let mut conn = self.store.conn().await.map_err(store_err)?;
-        let info = resolve_active_install(&mut *conn, req.caller.install_id)
+        let conn = self.store.conn().await.map_err(store_err)?;
+        let info = resolve_active_install(&conn, req.caller.install_id)
             .await
             .map_err(store_err)?;
 
@@ -162,7 +162,7 @@ impl GuestBlobs {
         self.store
             .guard()
             .authorize(
-                &mut conn,
+                &conn,
                 &req.caller.cred,
                 &Subject::install(info.id),
                 Access::Write,
@@ -202,7 +202,7 @@ impl GuestBlobs {
             }
         };
 
-        let mut tx = self.store.begin().await.map_err(store_err)?;
+        let tx = self.store.begin().await.map_err(store_err)?;
         // The ref is what makes the bytes the caller's, and it carries the
         // invocation's trust verbatim ... a write made after an untrusted read
         // inherits untrusted whatever the guest claims (invariant 12).
@@ -211,7 +211,7 @@ impl GuestBlobs {
         let (desc, _) = self
             .blobs
             .publish(
-                &mut tx,
+                &tx,
                 sealed,
                 &input.mime,
                 &Provenance::original(),
@@ -224,7 +224,7 @@ impl GuestBlobs {
             )
             .await
             .map_err(|e| HostError::error(e.to_string()))?;
-        tx.commit()
+        crate::commit(tx, "blob.append")
             .await
             .map_err(|e| HostError::error(e.to_string()))?;
 

@@ -12,9 +12,9 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use hive_db::{Row, query};
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_trust::Level;
-use sqlx::Row;
 use uuid::Uuid;
 
 use crate::grants::{Access, Subject};
@@ -71,7 +71,7 @@ pub struct TurnState {
 }
 
 /// A turn a worker has taken responsibility for, with the conversation's context
-/// resolved in the same statement that took the claim.
+/// resolved in the same transaction that took the claim.
 ///
 /// Owner and author come from the row rather than from the worker. A worker is
 /// host machinery with no credential of its own; it acts for the conversation's
@@ -115,7 +115,7 @@ pub struct Chat {
 const CONVERSATION_COLUMNS: &str =
     "id, author_actor, owner_kind, owner_id, runtime, model, title, created_at, updated_at";
 
-fn scan_conversation(row: &sqlx::postgres::PgRow) -> Result<Conversation> {
+fn scan_conversation(row: &Row) -> Result<Conversation> {
     let kind: String = row.get("owner_kind");
     Ok(Conversation {
         id: row.get("id"),
@@ -133,8 +133,8 @@ fn scan_conversation(row: &sqlx::postgres::PgRow) -> Result<Conversation> {
     })
 }
 
-fn interval(d: Duration) -> String {
-    format!("{} seconds", d.as_secs())
+fn lease_until(lease: Duration) -> DateTime<Utc> {
+    hive_db::now() + chrono::Duration::from_std(lease).unwrap_or_default()
 }
 
 impl Chat {
@@ -157,36 +157,38 @@ impl Chat {
             ));
         }
         let owner = cred.owner_of();
-        let mut tx = self.store.begin().await?;
+        let tx = self.store.begin().await?;
         // No authorize here on purpose: creating a conversation for your own
         // principal is not a grant question, and there is no existing subject
         // to authorize against. The owner comes from the credential, which is
         // the only place it can come from.
-        let row = sqlx::query(&format!(
-            "INSERT INTO conversations (author_actor, owner_kind, owner_id, runtime, model, title)
-             VALUES ($1,$2,$3,$4,$5,$6) RETURNING {CONVERSATION_COLUMNS}"
+        let now = hive_db::now();
+        let row = query(&format!(
+            "INSERT INTO conversations (id, author_actor, owner_kind, owner_id, runtime, model, title, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8) RETURNING {CONVERSATION_COLUMNS}"
         ))
+        .bind(Uuid::new_v4())
         .bind(cred.actor_id)
         .bind(owner.kind.as_str())
         .bind(owner.id)
         .bind(runtime)
         .bind(model)
         .bind(title)
-        .fetch_one(&mut *tx)
+        .bind(now)
+        .fetch_one(&tx)
         .await
         .map_err(|e| StoreError::db("chat: create conversation", e))?;
         let conv = scan_conversation(&row)?;
         // The session row exists from the start, empty. The first turn starts
         // fresh and every later turn resumes what that one reported.
-        sqlx::query("INSERT INTO chat_sessions (conversation_id, runtime) VALUES ($1,$2)")
+        query("INSERT INTO chat_sessions (conversation_id, runtime, updated_at) VALUES (?1,?2,?3)")
             .bind(conv.id)
             .bind(runtime)
-            .execute(&mut *tx)
+            .bind(now)
+            .execute(&tx)
             .await
             .map_err(|e| StoreError::db("chat: create session", e))?;
-        tx.commit()
-            .await
-            .map_err(|e| StoreError::db("chat: commit", e))?;
+        crate::commit(tx, "chat: create conversation").await?;
         Ok(conv)
     }
 
@@ -197,22 +199,22 @@ impl Chat {
     /// existence oracle, and `Denied` is the one answer for all three.
     pub async fn conversation(&self, cred: &Credential, id: Uuid) -> Result<Conversation> {
         cred.validate()?;
-        let mut conn = self.store.conn().await?;
+        let conn = self.store.conn().await?;
         self.store
             .guard()
             .authorize(
-                &mut conn,
+                &conn,
                 cred,
                 &Subject::conversation(id),
                 Access::Read,
                 "chat.read",
             )
             .await?;
-        let row = sqlx::query(&format!(
-            "SELECT {CONVERSATION_COLUMNS} FROM conversations WHERE id = $1 AND archived_at IS NULL"
+        let row = query(&format!(
+            "SELECT {CONVERSATION_COLUMNS} FROM conversations WHERE id = ?1 AND archived_at IS NULL"
         ))
         .bind(id)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&conn)
         .await
         .map_err(|e| StoreError::db("chat: read conversation", e))?
         .ok_or(StoreError::Denied)?;
@@ -229,20 +231,25 @@ impl Chat {
     pub async fn conversations(&self, cred: &Credential, limit: i64) -> Result<Vec<Conversation>> {
         cred.validate()?;
         let limit = if limit <= 0 || limit > 200 { 50 } else { limit };
-        let mut conn = self.store.conn().await?;
+        let conn = self.store.conn().await?;
         let ids = self
             .store
             .guard()
-            .visible_conversation_ids(&mut conn, cred, Access::Read, limit)
+            .visible_conversation_ids(&conn, cred, Access::Read, limit)
             .await?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(&format!(
-            "SELECT {CONVERSATION_COLUMNS} FROM conversations WHERE id = ANY($1) ORDER BY updated_at DESC"
+        let ids_json = serde_json::Value::from(
+            ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        );
+        let rows = query(&format!(
+            "SELECT {CONVERSATION_COLUMNS} FROM conversations
+              WHERE id IN (SELECT value FROM json_each(?1))
+              ORDER BY updated_at DESC"
         ))
-        .bind(&ids)
-        .fetch_all(&mut *conn)
+        .bind(ids_json)
+        .fetch_all(&conn)
         .await
         .map_err(|e| StoreError::db("chat: list conversations", e))?;
         rows.iter().map(scan_conversation).collect()
@@ -272,13 +279,13 @@ impl Chat {
         if !matches!(role, "user" | "agent" | "system") {
             return Err(StoreError::InvalidInput(format!("unknown role {role:?}")));
         }
-        let mut tx = self.store.begin().await?;
+        let tx = self.store.begin().await?;
         // Posting is a WRITE on the conversation, and the predicate decides it.
         // Absence of scope is deny.
         self.store
             .guard()
             .authorize(
-                &mut tx,
+                &tx,
                 cred,
                 &Subject::conversation(conv_id),
                 Access::Write,
@@ -288,18 +295,18 @@ impl Chat {
 
         // The sequence is assigned INSIDE the transaction that appends, against
         // the row the primary key protects. Two concurrent posts serialise on
-        // the unique key rather than both reading the same max.
-        let seq: i32 = sqlx::query_scalar(
-            "SELECT coalesce(max(seq), 0) + 1 FROM chat_messages WHERE conversation_id = $1",
+        // the write lock rather than both reading the same max.
+        let seq: i32 = query(
+            "SELECT coalesce(max(seq), 0) + 1 FROM chat_messages WHERE conversation_id = ?1",
         )
         .bind(conv_id)
-        .fetch_one(&mut *tx)
+        .fetch_scalar(&tx)
         .await
         .map_err(|e| StoreError::db("chat: next seq", e))?;
-        let created: DateTime<Utc> = sqlx::query_scalar(
-            "INSERT INTO chat_messages (conversation_id, seq, role, author_actor, body, trust, run_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)
-             RETURNING created_at",
+        let created = hive_db::now();
+        query(
+            "INSERT INTO chat_messages (conversation_id, seq, role, author_actor, body, trust, run_id, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
         )
         .bind(conv_id)
         .bind(seq)
@@ -308,7 +315,8 @@ impl Chat {
         .bind(body)
         .bind(level.as_str())
         .bind(run_id)
-        .fetch_one(&mut *tx)
+        .bind(created)
+        .execute(&tx)
         .await
         .map_err(|e| StoreError::db("chat: post", e))?;
         let msg = Message {
@@ -320,9 +328,10 @@ impl Chat {
             run_id,
             created_at: created,
         };
-        sqlx::query("UPDATE conversations SET updated_at = now() WHERE id = $1")
+        query("UPDATE conversations SET updated_at = ?2 WHERE id = ?1")
             .bind(conv_id)
-            .execute(&mut *tx)
+            .bind(created)
+            .execute(&tx)
             .await
             .map_err(|e| StoreError::db("chat: touch conversation", e))?;
 
@@ -330,13 +339,15 @@ impl Chat {
         // one, and opening a turn for it is how a conversation talks to itself
         // forever.
         let turn = if role == "user" {
-            let row = sqlx::query(
-                "INSERT INTO chat_turns (conversation_id, request_seq) VALUES ($1,$2)
+            let row = query(
+                "INSERT INTO chat_turns (id, conversation_id, request_seq, created_at) VALUES (?1,?2,?3,?4)
                  RETURNING id, conversation_id, request_seq",
             )
+            .bind(Uuid::new_v4())
             .bind(conv_id)
             .bind(seq)
-            .fetch_one(&mut *tx)
+            .bind(created)
+            .fetch_one(&tx)
             .await
             .map_err(|e| StoreError::db("chat: open turn", e))?;
             Some(Turn {
@@ -347,9 +358,7 @@ impl Chat {
         } else {
             None
         };
-        tx.commit()
-            .await
-            .map_err(|e| StoreError::db("chat: commit post", e))?;
+        crate::commit(tx, "chat: post").await?;
         Ok((msg, turn))
     }
 
@@ -367,7 +376,7 @@ impl Chat {
         } else {
             limit
         };
-        let mut conn = self.store.conn().await?;
+        let conn = self.store.conn().await?;
         // Authorize before reading, and against the conversation rather than
         // the rows: a message carries no owner of its own, by design, because
         // its conversation has exactly one and duplicating it would be a second
@@ -375,23 +384,23 @@ impl Chat {
         self.store
             .guard()
             .authorize(
-                &mut conn,
+                &conn,
                 cred,
                 &Subject::conversation(conv_id),
                 Access::Read,
                 "chat.read",
             )
             .await?;
-        let rows = sqlx::query(
+        let rows = query(
             "SELECT seq, role, author_actor, body, trust, run_id, created_at
                FROM chat_messages
-              WHERE conversation_id = $1 AND seq > $2
-              ORDER BY seq LIMIT $3",
+              WHERE conversation_id = ?1 AND seq > ?2
+              ORDER BY seq LIMIT ?3",
         )
         .bind(conv_id)
         .bind(after_seq)
         .bind(limit)
-        .fetch_all(&mut *conn)
+        .fetch_all(&conn)
         .await
         .map_err(|e| StoreError::db("chat: read messages", e))?;
         Ok(rows
@@ -401,7 +410,7 @@ impl Chat {
                 role: r.get("role"),
                 author_actor: r.get("author_actor"),
                 body: r.get("body"),
-                trust: Level::from_db(r.get::<String, _>("trust").as_str()),
+                trust: Level::from_db(r.get::<String>("trust").as_str()),
                 run_id: r.get("run_id"),
                 created_at: r.get("created_at"),
             })
@@ -413,26 +422,26 @@ impl Chat {
     /// message, and it is empty for a conversation that is caught up.
     pub async fn open_turns(&self, cred: &Credential, conv_id: Uuid) -> Result<Vec<TurnState>> {
         cred.validate()?;
-        let mut conn = self.store.conn().await?;
+        let conn = self.store.conn().await?;
         self.store
             .guard()
             .authorize(
-                &mut conn,
+                &conn,
                 cred,
                 &Subject::conversation(conv_id),
                 Access::Read,
                 "chat.read",
             )
             .await?;
-        let rows = sqlx::query(
+        let rows = query(
             "SELECT id, request_seq, state FROM chat_turns
-              WHERE conversation_id = $1 AND state IN ($2, $3)
+              WHERE conversation_id = ?1 AND state IN (?2, ?3)
               ORDER BY request_seq",
         )
         .bind(conv_id)
         .bind(TURN_PENDING)
         .bind(TURN_CLAIMED)
-        .fetch_all(&mut *conn)
+        .fetch_all(&conn)
         .await
         .map_err(|e| StoreError::db("chat: read turns", e))?;
         Ok(rows
@@ -451,7 +460,7 @@ impl Chat {
     ///
     /// This is the read side of the second transport: agent_run_events rather
     /// than the bus, because one run's output is a single writer in seq order
-    /// and a per-run NOTIFY storm would starve the bus's late-commit sweep for
+    /// and a per-run wakeup storm would starve the bus's late-commit sweep for
     /// everyone else.
     pub async fn turn_events(
         &self,
@@ -467,38 +476,38 @@ impl Chat {
         } else {
             limit
         };
-        let mut conn = self.store.conn().await?;
+        let conn = self.store.conn().await?;
         self.store
             .guard()
             .authorize(
-                &mut conn,
+                &conn,
                 cred,
                 &Subject::conversation(conv_id),
                 Access::Read,
                 "chat.read",
             )
             .await?;
-        let rows = sqlx::query(
+        let rows = query(
             "SELECT t.request_seq, r.id, e.seq, e.at, e.stream, e.type, e.body, e.text
                FROM agent_runs r
                JOIN chat_turns t ON t.id = r.turn_id
                JOIN agent_run_events e ON e.run_id = r.id
-              WHERE r.conversation_id = $1
-                AND (t.request_seq, e.seq) > ($2, $3)
+              WHERE r.conversation_id = ?1
+                AND (t.request_seq, e.seq) > (?2, ?3)
               ORDER BY t.request_seq, e.seq
-              LIMIT $4",
+              LIMIT ?4",
         )
         .bind(conv_id)
         .bind(after_request_seq)
         .bind(after_seq)
         .bind(limit)
-        .fetch_all(&mut *conn)
+        .fetch_all(&conn)
         .await
         .map_err(|e| StoreError::db("chat: read turn events", e))?;
         Ok(rows
             .iter()
             .map(|r| {
-                let body: Option<serde_json::Value> = r.get("body");
+                let body: Option<String> = r.get("body");
                 RunEvent {
                     request_seq: r.get("request_seq"),
                     run_id: r.get("id"),
@@ -506,9 +515,7 @@ impl Chat {
                     at: r.get("at"),
                     stream: r.get("stream"),
                     r#type: r.get("type"),
-                    body: body
-                        .map(|b| serde_json::to_vec(&b).unwrap_or_default())
-                        .unwrap_or_default(),
+                    body: body.map(String::into_bytes).unwrap_or_default(),
                     text: r.get("text"),
                 }
             })
@@ -521,13 +528,13 @@ impl Chat {
     /// conversation with the same AI would resume the first one's session and
     /// the two threads would merge.
     pub async fn resume_session(&self, conv_id: Uuid) -> Result<(String, String)> {
-        let row =
-            sqlx::query("SELECT runtime, session_id FROM chat_sessions WHERE conversation_id = $1")
-                .bind(conv_id)
-                .fetch_optional(self.store.pool())
-                .await
-                .map_err(|e| StoreError::db("chat: resume session", e))?
-                .ok_or(StoreError::NoRows)?;
+        let conn = self.store.conn().await?;
+        let row = query("SELECT runtime, session_id FROM chat_sessions WHERE conversation_id = ?1")
+            .bind(conv_id)
+            .fetch_optional(&conn)
+            .await
+            .map_err(|e| StoreError::db("chat: resume session", e))?
+            .ok_or(StoreError::NoRows)?;
         Ok((row.get("runtime"), row.get("session_id")))
     }
 
@@ -540,10 +547,12 @@ impl Chat {
         if session_id.trim().is_empty() {
             return Ok(());
         }
-        sqlx::query("UPDATE chat_sessions SET session_id = $1, updated_at = now() WHERE conversation_id = $2")
+        let conn = self.store.conn().await?;
+        query("UPDATE chat_sessions SET session_id = ?1, updated_at = ?3 WHERE conversation_id = ?2")
             .bind(session_id)
             .bind(conv_id)
-            .execute(self.store.pool())
+            .bind(hive_db::now())
+            .execute(&conn)
             .await
             .map_err(|e| StoreError::db("chat: record session", e))?;
         Ok(())
@@ -560,10 +569,12 @@ impl Chat {
     /// Takes the oldest turn that is ready to run, or `None` when there is
     /// none. The claim is good for the lease; `extend_lease` keeps it.
     ///
-    /// FOR UPDATE SKIP LOCKED plus a lease, as the repo's convention requires.
-    /// One conversation runs ONE turn at a time: without the NOT EXISTS below
-    /// two workers would answer two quick messages concurrently, each resuming
-    /// the same session ... two agents in one thread. A lapsed claim therefore
+    /// A claim under `BEGIN IMMEDIATE` plus a lease, as the repo's convention
+    /// requires: the engine admits one writer at a time, so the read and the
+    /// update are one unit and two workers cannot claim one turn. One
+    /// conversation runs ONE turn at a time: without the NOT EXISTS below two
+    /// workers would answer two quick messages concurrently, each resuming the
+    /// same session ... two agents in one thread. A lapsed claim therefore
     /// blocks its conversation until the reclaimer fails it, which is the
     /// at-most-once guard working as intended: the run behind it may still be
     /// spending money.
@@ -582,11 +593,11 @@ impl Chat {
                 "chat: a claim needs a positive lease".into(),
             ));
         }
-        let mut tx = self.store.begin().await?;
+        let tx = self.store.begin().await?;
         // The join resolves the conversation's owner and the request message in
-        // the same statement that takes the claim, so there is no window where
-        // a turn is claimed and its context is read separately.
-        let row = sqlx::query(
+        // the same transaction that takes the claim, so there is no window
+        // where a turn is claimed and its context is read separately.
+        let row = query(
             "SELECT t.id, t.conversation_id, t.request_seq,
                     c.owner_kind, c.owner_id, c.author_actor, c.runtime, c.model,
                     m.body
@@ -594,19 +605,18 @@ impl Chat {
                JOIN conversations c ON c.id = t.conversation_id
                JOIN chat_messages m
                  ON m.conversation_id = t.conversation_id AND m.seq = t.request_seq
-              WHERE t.state = $1
+              WHERE t.state = ?1
                 AND NOT EXISTS (
                     SELECT 1 FROM chat_turns earlier
                      WHERE earlier.conversation_id = t.conversation_id
                        AND earlier.request_seq < t.request_seq
-                       AND earlier.state IN ($1, $2))
+                       AND earlier.state IN (?1, ?2))
               ORDER BY t.created_at
-              FOR UPDATE OF t SKIP LOCKED
               LIMIT 1",
         )
         .bind(TURN_PENDING)
         .bind(TURN_CLAIMED)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&tx)
         .await
         .map_err(|e| StoreError::db("chat: claim turn", e))?;
         let Some(row) = row else {
@@ -627,22 +637,21 @@ impl Chat {
             model: row.get("model"),
             prompt: row.get("body"),
         };
-        sqlx::query(
+        query(
             "UPDATE chat_turns
-                SET state = $1, claimed_by = $2, claimed_at = now(),
-                    lease_expires_at = now() + $3::interval
-              WHERE id = $4",
+                SET state = ?1, claimed_by = ?2, claimed_at = ?3,
+                    lease_expires_at = ?4
+              WHERE id = ?5",
         )
         .bind(TURN_CLAIMED)
         .bind(worker_name)
-        .bind(interval(lease))
+        .bind(hive_db::now())
+        .bind(lease_until(lease))
         .bind(t.turn_id)
-        .execute(&mut *tx)
+        .execute(&tx)
         .await
         .map_err(|e| StoreError::db("chat: claim turn", e))?;
-        tx.commit()
-            .await
-            .map_err(|e| StoreError::db("chat: commit claim", e))?;
+        crate::commit(tx, "chat: claim").await?;
         Ok(Some(t))
     }
 
@@ -655,18 +664,19 @@ impl Chat {
         worker_name: &str,
         lease: Duration,
     ) -> Result<bool> {
-        let res = sqlx::query(
-            "UPDATE chat_turns SET lease_expires_at = now() + $1::interval
-              WHERE id = $2 AND state = $3 AND claimed_by = $4",
+        let conn = self.store.conn().await?;
+        let n = query(
+            "UPDATE chat_turns SET lease_expires_at = ?1
+              WHERE id = ?2 AND state = ?3 AND claimed_by = ?4",
         )
-        .bind(interval(lease))
+        .bind(lease_until(lease))
         .bind(turn_id)
         .bind(TURN_CLAIMED)
         .bind(worker_name)
-        .execute(self.store.pool())
+        .execute(&conn)
         .await
         .map_err(|e| StoreError::db("chat: extend lease", e))?;
-        Ok(res.rows_affected() == 1)
+        Ok(n == 1)
     }
 
     /// Moves a claimed turn to done or failed. Only a claimed turn moves: a turn
@@ -680,11 +690,12 @@ impl Chat {
                 "chat: {state:?} is not a terminal turn state"
             )));
         }
-        sqlx::query("UPDATE chat_turns SET state = $1 WHERE id = $2 AND state = $3")
+        let conn = self.store.conn().await?;
+        query("UPDATE chat_turns SET state = ?1 WHERE id = ?2 AND state = ?3")
             .bind(state)
             .bind(turn_id)
             .bind(TURN_CLAIMED)
-            .execute(self.store.pool())
+            .execute(&conn)
             .await
             .map_err(|e| StoreError::db("chat: close turn", e))?;
         Ok(())
@@ -701,18 +712,19 @@ impl Chat {
     /// resends if they want another attempt, and that is a deliberate second
     /// spend rather than an automatic one.
     pub async fn reclaim_lapsed_turns(&self) -> Result<Vec<ClaimedTurn>> {
-        let mut tx = self.store.begin().await?;
-        let rows = sqlx::query(
+        let tx = self.store.begin().await?;
+        let now = hive_db::now();
+        let rows = query(
             "SELECT t.id, t.conversation_id, t.request_seq,
                     c.owner_kind, c.owner_id, c.author_actor, c.runtime, c.model
                FROM chat_turns t
                JOIN conversations c ON c.id = t.conversation_id
-              WHERE t.state = $1 AND t.lease_expires_at < now()
-              ORDER BY t.lease_expires_at
-              FOR UPDATE OF t SKIP LOCKED",
+              WHERE t.state = ?1 AND t.lease_expires_at < ?2
+              ORDER BY t.lease_expires_at",
         )
         .bind(TURN_CLAIMED)
-        .fetch_all(&mut *tx)
+        .bind(now)
+        .fetch_all(&tx)
         .await
         .map_err(|e| StoreError::db("chat: reclaim turns", e))?;
         let mut out = Vec::with_capacity(rows.len());
@@ -734,26 +746,25 @@ impl Chat {
             });
         }
         for t in &out {
-            sqlx::query("UPDATE chat_turns SET state = $1 WHERE id = $2")
+            query("UPDATE chat_turns SET state = ?1 WHERE id = ?2")
                 .bind(TURN_FAILED)
                 .bind(t.turn_id)
-                .execute(&mut *tx)
+                .execute(&tx)
                 .await
                 .map_err(|e| StoreError::db("chat: fail lapsed turn", e))?;
             // state = 'running' for the same reason finish_run checks it: a run
             // the supervisor already closed keeps the state it earned.
-            sqlx::query(
-                "UPDATE agent_runs SET state = 'indeterminate', ended_at = now()
-                  WHERE turn_id = $1 AND state = 'running'",
+            query(
+                "UPDATE agent_runs SET state = 'indeterminate', ended_at = ?2
+                  WHERE turn_id = ?1 AND state = 'running'",
             )
             .bind(t.turn_id)
-            .execute(&mut *tx)
+            .bind(now)
+            .execute(&tx)
             .await
             .map_err(|e| StoreError::db("chat: mark run indeterminate", e))?;
         }
-        tx.commit()
-            .await
-            .map_err(|e| StoreError::db("chat: commit reclaim", e))?;
+        crate::commit(tx, "chat: reclaim").await?;
         Ok(out)
     }
 }

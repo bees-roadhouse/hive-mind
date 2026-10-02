@@ -87,8 +87,8 @@ impl GuestEvents {
         guest_kind(&input.kind)?;
         let body = input.body.unwrap_or_else(|| serde_json::json!({}));
 
-        let mut tx = self.store.begin().await.map_err(host)?;
-        let info = resolve_active_install(&mut *tx, req.caller.install_id)
+        let tx = self.store.begin().await.map_err(host)?;
+        let info = resolve_active_install(&tx, req.caller.install_id)
             .await
             .map_err(host)?;
         // The namespace comes from the install row, not from req.app. Both are
@@ -104,7 +104,7 @@ impl GuestEvents {
         self.store
             .guard()
             .authorize(
-                &mut tx,
+                &tx,
                 &req.caller.cred,
                 &subject,
                 Access::Write,
@@ -122,10 +122,10 @@ impl GuestEvents {
         // layer got it right.
         ev.trust = req.trust.as_str().to_string();
         ev.origin = "guest".into();
-        append_events(&mut tx, std::slice::from_mut(&mut ev))
+        append_events(&tx, std::slice::from_mut(&mut ev))
             .await
             .map_err(host)?;
-        tx.commit()
+        crate::commit(tx, "events.emit")
             .await
             .map_err(|e| HostError::error(e.to_string()))?;
 

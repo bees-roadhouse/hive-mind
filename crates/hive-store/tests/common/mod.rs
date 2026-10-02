@@ -1,7 +1,7 @@
 //! The fixture the Go tree calls `world`, over the typed store API.
 //!
 //! `tests/invariants.rs` keeps its own raw-SQL copy on purpose: those tests
-//! prove the MIGRATIONS hold with no Rust behaviour behind them. Everything
+//! prove the MIGRATION holds with no Rust behaviour behind it. Everything
 //! else goes through this one, so a test here exercises the same code a
 //! daemon would.
 
@@ -10,10 +10,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use hive_db::{Conn, Db, query};
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_store::{Access, BootstrapConfig, Guard, Reason, Store, StoreError, Subject};
 use hive_testdb::TestDb;
-use sqlx::PgPool;
 use uuid::Uuid;
 
 static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +39,12 @@ pub fn org(id: Uuid) -> Owner {
     Owner::org(id)
 }
 
+/// The host clock in the schema's unit, for a test that writes a timestamp
+/// column by hand.
+pub fn now() -> DateTime<Utc> {
+    hive_db::now()
+}
+
 pub struct World {
     db: TestDb,
     pub store: Store,
@@ -45,12 +52,10 @@ pub struct World {
 }
 
 impl World {
-    /// Migrates a private schema and bootstraps a root. `None` means the
-    /// database variable is unset and a SKIPPED line has been printed.
-    pub async fn new(test: &str) -> Option<World> {
-        let db = TestDb::new(test).await?;
-        hive_store::migrate(db.pool()).await.expect("migrate");
-        let store = Store::from_pool(db.pool().clone());
+    /// Migrates a private file and bootstraps a root.
+    pub async fn new(test: &str) -> World {
+        let db = TestDb::new(test).await;
+        let store = Store::from_db(db.db().clone());
         let res = store
             .bootstrap_in_tx(&BootstrapConfig {
                 root_handle: "root".into(),
@@ -59,48 +64,47 @@ impl World {
             })
             .await
             .expect("bootstrap");
-        Some(World {
+        World {
             db,
             store,
             root: res.root_actor_id,
-        })
+        }
     }
 
-    /// A migrated schema with no root, for the bootstrap tests.
-    pub async fn bare(test: &str) -> Option<World> {
-        let db = TestDb::new(test).await?;
-        hive_store::migrate(db.pool()).await.expect("migrate");
-        let store = Store::from_pool(db.pool().clone());
-        Some(World {
+    /// A migrated file with no root, for the bootstrap tests.
+    pub async fn bare(test: &str) -> World {
+        let db = TestDb::new(test).await;
+        let store = Store::from_db(db.db().clone());
+        World {
             db,
             store,
             root: Uuid::nil(),
-        })
+        }
     }
 
-    pub fn pool(&self) -> &PgPool {
-        self.db.pool()
+    pub fn db(&self) -> &Db {
+        self.db.db()
     }
 
     pub fn guard(&self) -> Guard {
         self.store.guard()
     }
 
-    pub async fn conn(&self) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
-        self.store.conn().await.expect("acquire connection")
+    pub async fn conn(&self) -> Conn {
+        self.store.conn().await.expect("open connection")
     }
 
     /// A person. Every actor after the root names its creator.
     pub async fn human(&self, handle: &str) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', $2, $2, 'user', $1, $3)",
+             VALUES (?1, 'human', ?2, ?2, 'user', ?1, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(self.root)
-        .execute(self.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create human {handle}: {e}"));
         id
@@ -109,14 +113,14 @@ impl World {
     /// An org with `creator` as its first admin.
     pub async fn org(&self, handle: &str, creator: Uuid) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'org', $2, $2, 'org', $1, $3)",
+             VALUES (?1, 'org', ?2, ?2, 'org', ?1, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(creator)
-        .execute(self.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create org {handle}: {e}"));
         self.member(id, creator, "admin", creator).await;
@@ -124,15 +128,15 @@ impl World {
     }
 
     pub async fn member(&self, org: Uuid, user: Uuid, role: &str, by: Uuid) {
-        sqlx::query(
-            "INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES ($1,$2,$3,$4)
-             ON CONFLICT (org_id, user_id) DO UPDATE SET role = $3",
+        query(
+            "INSERT INTO org_members (org_id, user_id, role, added_by_actor) VALUES (?1,?2,?3,?4)
+             ON CONFLICT (org_id, user_id) DO UPDATE SET role = ?3",
         )
         .bind(org)
         .bind(user)
         .bind(role)
         .bind(by)
-        .execute(self.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("add member: {e}"));
     }
@@ -140,9 +144,9 @@ impl World {
     /// An AI persona instance owned by one principal (D13.9).
     pub async fn ai(&self, handle: &str, persona: &str, principal: Owner, creator: Uuid) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, persona, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'ai', $2, $2, $3, $4, $5, $6)",
+             VALUES (?1, 'ai', ?2, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(id)
         .bind(handle)
@@ -150,7 +154,7 @@ impl World {
         .bind(principal.kind.as_str())
         .bind(principal.id)
         .bind(creator)
-        .execute(self.pool())
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create ai {handle}: {e}"));
         id
@@ -159,33 +163,36 @@ impl World {
     /// A minimal app build plus an ACTIVE install owned by `owner`.
     pub async fn install(&self, slug: &str, owner: Owner, by: Uuid) -> Uuid {
         let sum = next_hash();
-        let build_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
+        let c = self.conn().await;
+        let build_id: Uuid = query(
+            "INSERT INTO app_builds (id, slug, kind, impl, manifest, content_hash,
                                      author_actor, owner_kind, owner_id, visibility, trust, status)
-             VALUES ($1, 'app', 'host', '{}', $2, $3, $4, $5, 'private', 'builtin', 'registered')
+             VALUES (?1, ?2, 'app', 'host', '{}', ?3, ?4, ?5, ?6, 'private', 'builtin', 'registered')
              RETURNING id",
         )
+        .bind(Uuid::new_v4())
         .bind(slug)
         .bind(&sum)
         .bind(by)
         .bind(owner.kind.as_str())
         .bind(owner.id)
-        .fetch_one(self.pool())
+        .fetch_scalar(&c)
         .await
         .unwrap_or_else(|e| panic!("create build: {e}"));
-        sqlx::query_scalar(
-            "INSERT INTO installs (build_id, slug, owner_kind, owner_id, installed_by_actor,
+        query(
+            "INSERT INTO installs (id, build_id, slug, owner_kind, owner_id, installed_by_actor,
                                    activated_by_actor, schema_name, state)
-             VALUES ($1, $2, $3, $4, $5, $5, $6, 'active')
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 'active')
              RETURNING id",
         )
+        .bind(Uuid::new_v4())
         .bind(build_id)
         .bind(slug)
         .bind(owner.kind.as_str())
         .bind(owner.id)
         .bind(by)
         .bind(format!("app_{slug}_{}", &sum[..8]))
-        .fetch_one(self.pool())
+        .fetch_scalar(&c)
         .await
         .unwrap_or_else(|e| panic!("create install: {e}"))
     }
@@ -199,18 +206,19 @@ impl World {
         owner: Owner,
         author: Uuid,
     ) -> Uuid {
-        sqlx::query_scalar(
-            "INSERT INTO entities (kind, install_id, collection, ref, owner_kind, owner_id, author_actor)
-             VALUES ('entry', $1, $2, $3, $4, $5, $6)
+        query(
+            "INSERT INTO entities (id, kind, install_id, collection, ref, owner_kind, owner_id, author_actor)
+             VALUES (?1, 'entry', ?2, ?3, ?4, ?5, ?6, ?7)
              RETURNING id",
         )
+        .bind(Uuid::new_v4())
         .bind(install)
         .bind(collection)
         .bind(r#ref)
         .bind(owner.kind.as_str())
         .bind(owner.id)
         .bind(author)
-        .fetch_one(self.pool())
+        .fetch_scalar(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create entity: {e}"))
     }
@@ -224,8 +232,8 @@ impl World {
         subj: &Subject,
         access: Access,
     ) -> Option<Reason> {
-        let mut conn = self.conn().await;
-        match self.guard().authorize(&mut conn, c, subj, access, "").await {
+        let conn = self.conn().await;
+        match self.guard().authorize(&conn, c, subj, access, "").await {
             Ok(r) => Some(r),
             Err(StoreError::Denied) => None,
             Err(e) => panic!("authorize: {e}"),
@@ -234,7 +242,9 @@ impl World {
 
     /// What the predicate will say at some offset from now, so a test can
     /// cross a break-glass window without sleeping and without mutating a
-    /// grant, which the schema refuses.
+    /// grant, which the schema refuses. It binds the predicate's own clock
+    /// argument; nothing in the daemon can, which is the point of the
+    /// hidden accessor it uses.
     pub async fn reason_at(
         &self,
         c: &Credential,
@@ -242,36 +252,37 @@ impl World {
         access: Access,
         offset: Duration,
     ) -> Option<Reason> {
-        let reason: Option<String> = sqlx::query_scalar(
-            "SELECT access_reason($1, $2, $3, $4, $5, $6, $7, now() + $8::interval)",
-        )
-        .bind(subj.kind.as_str())
-        .bind(subj.id)
-        .bind(subj.name.as_deref())
-        .bind(c.principal_kind.as_str())
-        .bind(c.principal_id)
-        .bind(c.actor_id)
-        .bind(access.as_str())
-        .bind(format!("{} seconds", offset.as_secs()))
-        .fetch_one(self.pool())
-        .await
-        .unwrap_or_else(|e| panic!("access_reason at +{offset:?}: {e}"));
+        let at = now() + chrono::Duration::from_std(offset).unwrap_or_default();
+        let row = query(&hive_store::__predicate_sql_for_tests())
+            .bind(subj.kind.as_str())
+            .bind(subj.id)
+            .bind(subj.name.as_deref())
+            .bind(c.principal_kind.as_str())
+            .bind(c.principal_id)
+            .bind(c.actor_id)
+            .bind(access.as_str())
+            .bind(at)
+            .bind(None::<Uuid>)
+            .fetch_one(&*self.conn().await)
+            .await
+            .unwrap_or_else(|e| panic!("access_decision at +{offset:?}: {e}"));
+        let reason: Option<String> = row.get("reason");
         reason.as_deref().and_then(Reason::parse)
     }
 
     /// Disables the grant write policy so the READ predicate can be tested
-    /// against rows a bug would have written. The schema is dropped with the
+    /// against rows a bug would have written. The file is deleted with the
     /// test, so nothing re-enables it.
     pub async fn issue_policy_off(&self) {
-        sqlx::query("ALTER TABLE grants DISABLE TRIGGER grants_issue_policy")
-            .execute(self.pool())
+        query("DROP TRIGGER grants_issue_policy")
+            .execute(&*self.conn().await)
             .await
             .expect("disable issue policy");
     }
 
     pub async fn count(&self, sql: &str) -> i64 {
-        sqlx::query_scalar(sql)
-            .fetch_one(self.pool())
+        query(sql)
+            .fetch_scalar(&*self.conn().await)
             .await
             .unwrap_or_else(|e| panic!("{sql}: {e}"))
     }
@@ -279,23 +290,24 @@ impl World {
     /// Registers a build authored by `author` and stages a DISABLED install of
     /// it for `owner`. Both halves are the unprivileged ones.
     pub async fn stage_build(&self, slug: &str, author: Uuid, owner: Owner) -> Uuid {
-        let build_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO app_builds (slug, kind, impl, manifest, content_hash,
+        let conn = self.conn().await;
+        let build_id: Uuid = query(
+            "INSERT INTO app_builds (id, slug, kind, impl, manifest, content_hash,
                                      author_actor, owner_kind, owner_id, visibility, trust, status)
-             VALUES ($1, 'tool', 'host', '{}', $2, $3, $4, $5, 'private', 'local', 'registered')
+             VALUES (?1, ?2, 'tool', 'host', '{}', ?3, ?4, ?5, ?6, 'private', 'local', 'registered')
              RETURNING id",
         )
+        .bind(Uuid::new_v4())
         .bind(slug)
         .bind(next_hash())
         .bind(author)
         .bind(owner.kind.as_str())
         .bind(owner.id)
-        .fetch_one(self.pool())
+        .fetch_scalar(&conn)
         .await
         .unwrap_or_else(|e| panic!("register build: {e}"));
-        let mut conn = self.conn().await;
         hive_store::stage_install(
-            &mut conn,
+            &conn,
             &hive_store::InstallSpec {
                 build_id,
                 slug: slug.into(),
@@ -308,9 +320,9 @@ impl World {
     }
 
     pub async fn install_state(&self, install_id: Uuid) -> String {
-        sqlx::query_scalar("SELECT state FROM installs WHERE id = $1")
+        query("SELECT state FROM installs WHERE id = ?1")
             .bind(install_id)
-            .fetch_one(self.pool())
+            .fetch_scalar(&*self.conn().await)
             .await
             .expect("read install state")
     }

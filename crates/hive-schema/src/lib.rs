@@ -7,7 +7,7 @@
 //! port used: a `schema_migrations` table, a SHA-256 over the bytes, and a
 //! file that was applied differently refused rather than reapplied.
 
-use hive_db::{Connection, Db, query};
+use hive_db::{Db, Transaction, query};
 use sha2::{Digest, Sha256};
 
 /// One forward-only step. There are no down migrations: rolling back a schema
@@ -67,13 +67,7 @@ pub enum MigrateError {
 /// engine's write lock is the mutex and the loser waits, then finds nothing to
 /// do. (The Postgres port used an advisory lock for the same reason.)
 pub async fn migrate(db: &Db) -> Result<Vec<String>, MigrateError> {
-    let conn = db.conn().await?;
-    migrate_on(&conn).await
-}
-
-/// The same, on a connection the caller holds.
-pub async fn migrate_on(conn: &Connection) -> Result<Vec<String>, MigrateError> {
-    let tx = Db::begin_on(conn).await?;
+    let tx = db.begin().await?;
     query(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version    TEXT PRIMARY KEY,
@@ -122,11 +116,11 @@ pub async fn migrate_on(conn: &Connection) -> Result<Vec<String>, MigrateError> 
             return Err(MigrateError::Unknown(version.clone()));
         }
     }
-    tx.commit().await.map_err(hive_db::Error::from)?;
+    tx.commit().await?;
     Ok(ran)
 }
 
-async fn apply(tx: &Connection, m: &Migration, checksum: &str) -> Result<(), MigrateError> {
+async fn apply(tx: &Transaction, m: &Migration, checksum: &str) -> Result<(), MigrateError> {
     let wrap = |source: hive_db::Error| MigrateError::Apply {
         version: m.version.to_string(),
         name: m.name.to_string(),

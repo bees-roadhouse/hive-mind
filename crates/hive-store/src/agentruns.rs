@@ -1,15 +1,15 @@
-//! Harness runs, persisted in Postgres.
+//! Harness runs, persisted in the store.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use hive_db::{Connection, query};
 use hive_harness::{Event, RunRecord, RunResult, RunStore, StoreError as HarnessStoreError};
 use hive_identity::Credential;
 use hive_trust::Level;
 use parking_lot::RwLock;
-use sqlx::{Executor, Postgres};
 use uuid::Uuid;
 
 use crate::{Result, Store, StoreError};
@@ -17,7 +17,7 @@ use crate::{Result, Store, StoreError};
 /// Everything the store must PIN rather than accept.
 ///
 /// This is the whole reason `AgentRunStore` is constructed per run instead of
-/// being a stateless struct over a pool. `RunRecord` carries no actor, no
+/// being a stateless struct over a store. `RunRecord` carries no actor, no
 /// principal, no trust and no step ... and it must never grow them. The moment
 /// `create_run` reads an owner out of its argument, the caller supplies the fact
 /// the row is deciding about, and there are as many enforcement points as call
@@ -59,7 +59,7 @@ impl RunWriter {
     }
 }
 
-/// Persists harness runs in Postgres, bound to one credential.
+/// Persists harness runs, bound to one credential.
 pub struct AgentRunStore {
     store: Store,
     writer: RunWriter,
@@ -84,7 +84,7 @@ impl AgentRunStore {
     }
 
     /// Resolves the harness's run id to its row, from cache where possible.
-    async fn row_id(&self, run_id: &str) -> Result<Uuid> {
+    async fn row_id(&self, conn: &Connection, run_id: &str) -> Result<Uuid> {
         if let Some(id) = self.ids.read().get(run_id) {
             return Ok(*id);
         }
@@ -93,13 +93,13 @@ impl AgentRunStore {
         // run_key is a container name rather than a capability ... resolving it
         // without the owner would let one principal append to another's run.
         let owner = self.writer.cred.owner_of();
-        let id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM agent_runs WHERE run_key = $1 AND owner_kind = $2 AND owner_id = $3",
+        let id: Option<Uuid> = query(
+            "SELECT id FROM agent_runs WHERE run_key = ?1 AND owner_kind = ?2 AND owner_id = ?3",
         )
         .bind(run_id)
         .bind(owner.kind.as_str())
         .bind(owner.id)
-        .fetch_optional(self.store.pool())
+        .fetch_scalar_optional(conn)
         .await
         .map_err(|e| StoreError::db(format!("agent run {run_id}"), e))?;
         let id =
@@ -115,15 +115,17 @@ impl AgentRunStore {
         } else {
             Some(rec.started_at + chrono::Duration::from_std(rec.deadline).unwrap_or_default())
         };
-        let id: Uuid = sqlx::query_scalar(
+        let conn = self.store.conn().await?;
+        let id: Uuid = query(
             "INSERT INTO agent_runs (
-                 author_actor, owner_kind, owner_id, agent_actor, workflow_step_id,
+                 id, author_actor, owner_kind, owner_id, agent_actor, workflow_step_id,
                  run_key, runtime, image_digest, cli_version, model, session_id,
                  network, memory_bytes, cpus, pids_limit, trust,
                  started_at, deadline_at, conversation_id, turn_id
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::float8::numeric,$15,$16,$17,$18,$19,$20)
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)
              RETURNING id",
         )
+        .bind(Uuid::new_v4())
         // Pinned from the credential, never from rec.
         .bind(self.writer.cred.actor_id)
         .bind(owner.kind.as_str())
@@ -146,7 +148,7 @@ impl AgentRunStore {
         .bind(deadline)
         .bind(self.writer.conversation_id)
         .bind(self.writer.turn_id)
-        .fetch_one(self.store.pool())
+        .fetch_scalar(&conn)
         .await
         .map_err(|e| StoreError::db(format!("agent run: create {}", rec.run_id), e))?;
         self.ids.write().insert(rec.run_id.clone(), id);
@@ -154,7 +156,8 @@ impl AgentRunStore {
     }
 
     async fn append(&self, run_id: &str, ev: &Event) -> Result<()> {
-        let id = self.row_id(run_id).await?;
+        let conn = self.store.conn().await?;
+        let id = self.row_id(&conn, run_id).await?;
         // JSON is None when the line did not parse. A line that failed to parse
         // is still evidence, so the raw text is stored either way.
         let body: Option<serde_json::Value> = ev
@@ -166,9 +169,9 @@ impl AgentRunStore {
         // as an agent that stalls. The (run_id, seq) primary key turns an
         // accidental double-append into a constraint violation rather than a
         // duplicated line in a transcript.
-        sqlx::query(
+        query(
             "INSERT INTO agent_run_events (run_id, seq, at, stream, type, body, text)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
         )
         .bind(id)
         .bind(ev.seq)
@@ -177,7 +180,7 @@ impl AgentRunStore {
         .bind(&ev.r#type)
         .bind(body)
         .bind(&ev.text)
-        .execute(self.store.pool())
+        .execute(&conn)
         .await
         .map_err(|e| {
             StoreError::db(format!("agent run: append event {} to {run_id}", ev.seq), e)
@@ -193,7 +196,8 @@ impl AgentRunStore {
     /// automatically (invariant 10). Collapsing it to 'failed' here would make a
     /// reclaim look retryable.
     async fn finish(&self, run_id: &str, res: &RunResult) -> Result<()> {
-        let id = self.row_id(run_id).await?;
+        let conn = self.store.conn().await?;
+        let id = self.row_id(&conn, run_id).await?;
         let exit: Option<i32> = if res.exit_code >= 0 {
             Some(res.exit_code)
         } else {
@@ -204,12 +208,12 @@ impl AgentRunStore {
         // writer wins. Overwriting would let a late supervisor turn an
         // 'indeterminate' a reclaimer recorded back into 'succeeded', which is
         // exactly the fact invariant 10 protects.
-        sqlx::query(
+        query(
             "UPDATE agent_runs
-                SET state = $1, exit_code = $2, event_count = $3,
-                    stderr_tail = $4, session_id = COALESCE(NULLIF($5, ''), session_id),
-                    ended_at = $6
-              WHERE id = $7 AND state = 'running'",
+                SET state = ?1, exit_code = ?2, event_count = ?3,
+                    stderr_tail = ?4, session_id = COALESCE(NULLIF(?5, ''), session_id),
+                    ended_at = ?6
+              WHERE id = ?7 AND state = 'running'",
         )
         .bind(res.state.as_str())
         .bind(exit)
@@ -218,7 +222,7 @@ impl AgentRunStore {
         .bind(&res.session_id)
         .bind(res.ended_at)
         .bind(id)
-        .execute(self.store.pool())
+        .execute(&conn)
         .await
         .map_err(|e| StoreError::db(format!("agent run: finish {run_id}"), e))?;
         Ok(())
@@ -259,18 +263,17 @@ impl RunStore for AgentRunStore {
 /// A run with no deadline is not touched. The supervisor refuses to start one,
 /// so such a row is a writer bypassing the harness, and guessing at its fate is
 /// worse than leaving it visible.
-pub async fn reclaim_abandoned_runs<'e, E>(db: E, grace: Duration) -> Result<u64>
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let res = sqlx::query(
-        "UPDATE agent_runs SET state = 'indeterminate', ended_at = now()
+pub async fn reclaim_abandoned_runs(db: &Connection, grace: Duration) -> Result<u64> {
+    let now = hive_db::now();
+    let cutoff = now - chrono::Duration::from_std(grace).unwrap_or_default();
+    query(
+        "UPDATE agent_runs SET state = 'indeterminate', ended_at = ?1
           WHERE state = 'running' AND deadline_at IS NOT NULL
-            AND deadline_at < now() - $1::interval",
+            AND deadline_at < ?2",
     )
-    .bind(format!("{} seconds", grace.as_secs()))
+    .bind(now)
+    .bind(cutoff)
     .execute(db)
     .await
-    .map_err(|e| StoreError::db("agent runs: reclaim abandoned", e))?;
-    Ok(res.rows_affected())
+    .map_err(|e| StoreError::db("agent runs: reclaim abandoned", e))
 }

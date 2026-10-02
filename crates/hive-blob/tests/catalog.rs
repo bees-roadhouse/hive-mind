@@ -6,7 +6,7 @@ use hive_blob::*;
 use hive_identity::{Credential, PrincipalKind};
 use hive_testdb::TestDb;
 use hive_trust::Level;
-use hive_db::{Connection, Db, query};
+use hive_db::{Conn, Db, query};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
@@ -45,7 +45,7 @@ impl World {
         self.db.db()
     }
 
-    async fn conn(&self) -> Connection {
+    async fn conn(&self) -> Conn {
         self.db().conn().await.expect("connection")
     }
 
@@ -59,7 +59,7 @@ impl World {
         .bind(id)
         .bind(handle)
         .bind(self.root)
-        .execute(&self.conn().await)
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create {handle}: {e}"));
         Credential::new(id, PrincipalKind::User, id)
@@ -79,7 +79,7 @@ impl World {
         .bind(id)
         .bind(handle)
         .bind(principal)
-        .execute(&self.conn().await)
+        .execute(&*self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create ai {handle}: {e}"));
         id
@@ -208,7 +208,7 @@ async fn no_live_blob_without_a_ref() {
 
     let state: Option<String> = query("SELECT state FROM blobs WHERE sha256 = ?1")
         .bind(sealed.hash().to_string())
-        .fetch_scalar_optional(&w.conn().await)
+        .fetch_scalar_optional(&*w.conn().await)
         .await
         .unwrap();
     assert!(
@@ -313,7 +313,7 @@ async fn two_owners_share_one_object() {
     // Alice releasing hers must not make the bytes collectable while Bob still
     // holds one. Counting per tenant is exactly what would get this wrong.
     w.catalog
-        .release(&w.conn().await, &alice, first.hash, SourceKind::Upload, "upload-a")
+        .release(&*w.conn().await, &alice, first.hash, SourceKind::Upload, "upload-a")
         .await
         .expect("release");
     let candidates = w
@@ -433,7 +433,7 @@ async fn sweep_collects_only_unreferenced_bytes() {
         )
         .await;
     w.catalog
-        .release(&w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
+        .release(&*w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
         .await
         .unwrap();
 
@@ -477,7 +477,7 @@ async fn trash_refuses_when_a_reference_reappears() {
         )
         .await;
     w.catalog
-        .release(&w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
+        .release(&*w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
         .await
         .unwrap();
 
@@ -786,7 +786,7 @@ async fn release_by_source_and_held_by_source() {
     }
     let held = w
         .catalog
-        .held_by_source(&w.conn().await, &alice, SourceKind::Collection, entry)
+        .held_by_source(&*w.conn().await, &alice, SourceKind::Collection, entry)
         .await
         .unwrap();
     assert_eq!(held.len(), 2);
@@ -794,7 +794,7 @@ async fn release_by_source_and_held_by_source() {
     // The update: the new document no longer names `dropped`.
     w.catalog
         .release(
-            &w.conn().await,
+            &*w.conn().await,
             &alice,
             dropped.hash,
             SourceKind::Collection,
@@ -804,7 +804,7 @@ async fn release_by_source_and_held_by_source() {
         .unwrap();
     let held = w
         .catalog
-        .held_by_source(&w.conn().await, &alice, SourceKind::Collection, entry)
+        .held_by_source(&*w.conn().await, &alice, SourceKind::Collection, entry)
         .await
         .unwrap();
     assert_eq!(held, vec![kept.hash]);
@@ -812,14 +812,14 @@ async fn release_by_source_and_held_by_source() {
     // The delete: everything the document held goes.
     let released = w
         .catalog
-        .release_by_source(&w.conn().await, &alice, SourceKind::Collection, entry)
+        .release_by_source(&*w.conn().await, &alice, SourceKind::Collection, entry)
         .await
         .unwrap();
     assert_eq!(released, 1);
     // Releasing nothing is not an error.
     let again = w
         .catalog
-        .release_by_source(&w.conn().await, &alice, SourceKind::Collection, entry)
+        .release_by_source(&*w.conn().await, &alice, SourceKind::Collection, entry)
         .await
         .unwrap();
     assert_eq!(again, 0);
@@ -848,7 +848,7 @@ async fn release_by_source_is_owner_scoped() {
         .await;
     let released = w
         .catalog
-        .release_by_source(&w.conn().await, &carol, SourceKind::Collection, "entry-1")
+        .release_by_source(&*w.conn().await, &carol, SourceKind::Collection, "entry-1")
         .await
         .unwrap();
     assert_eq!(released, 0, "carol released alice's references");
@@ -884,7 +884,7 @@ async fn ref_attribution_follows_the_act() {
 
     // Released, then revived by the assistant: that is a new act.
     w.catalog
-        .release(&w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
+        .release(&*w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
         .await
         .unwrap();
     let sealed = w.seal(b"a document alice uploaded").await;

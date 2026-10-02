@@ -8,7 +8,7 @@
 use std::fmt;
 
 use chrono::{DateTime, Utc};
-use hive_db::{Connection, Db, Transaction, query};
+use hive_db::{Conn, Connection, Db, Transaction, query};
 use hive_identity::{Credential, Owner};
 use hive_trust::Level;
 use serde::{Deserialize, Serialize};
@@ -263,7 +263,7 @@ impl Catalog {
         &self.db
     }
 
-    async fn conn(&self) -> Result<Connection> {
+    async fn conn(&self) -> Result<Conn> {
         self.db
             .conn()
             .await

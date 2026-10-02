@@ -2,13 +2,13 @@
 //!
 //! libSQL is SQLite with additions, reached through the `libsql` crate. This
 //! crate wraps it just enough that the rest of the workspace speaks one shape:
-//! a [`Db`] is a file, a [`Connection`] is a handle on it with the pragmas the
-//! schema assumes already set, and [`query`] binds typed values and reads
-//! typed columns by name. There is deliberately no query helper that knows
-//! about grants: the predicate lives in `hive-store`, and nothing here reads
-//! policy.
+//! a [`Db`] is a file, a [`Conn`] is a checked-out connection on it with the
+//! pragmas the schema assumes already set, a [`Transaction`] is `BEGIN
+//! IMMEDIATE` on one, and [`query`] binds typed values and reads typed columns
+//! by name. There is deliberately no query helper that knows about grants: the
+//! predicate lives in `hive-store`, and nothing here reads policy.
 //!
-//! Two facts every caller relies on and should know it relies on:
+//! Three facts every caller relies on and should know it relies on:
 //!
 //! - **One writer at a time per file.** A write transaction is `BEGIN
 //!   IMMEDIATE`, so two writers serialise in the engine rather than racing;
@@ -20,13 +20,25 @@
 //!   expression a column default or a trigger uses. They read the same clock
 //!   at different resolutions (microseconds and milliseconds), and nothing
 //!   orders rows across the two.
+//! - **Connections are pooled and few.** A [`Conn`] goes back to its file's
+//!   pool when dropped, and the number open at once is capped. Measured, not
+//!   assumed: the engine as built crashes the process once a few hundred
+//!   connections are open on one WAL file (reproduced on Windows with bare
+//!   `libsql`, no pragmas, 600 connections; 200 was fine), and opening one per
+//!   statement crashed intermittently on the way there. The cap keeps the
+//!   daemon far from that cliff and the reuse keeps a statement from paying
+//!   an open. A connection is keyed on nothing a caller could forget
+//!   (invariant 14): every one has the same pragmas and no state outlives a
+//!   checkout, because one mid-transaction is closed rather than returned.
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-pub use libsql::{Connection, Transaction, TransactionBehavior, Value};
+pub use libsql::{Connection, TransactionBehavior, Value};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 /// The SQL expression for "now" in the schema's unit. Millisecond resolution,
@@ -44,6 +56,16 @@ pub const UUID_SQL: &str = "(lower(hex(randomblob(4)) || '-' || hex(randomblob(2
 /// enough that a migration or a batch of events in another process is waited
 /// out rather than reported; short enough that a wedged writer is noticed.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many connections one file may have open at once, counting the ones
+/// checked out. Past this a caller waits for a return. Well under the few
+/// hundred where the engine falls over, and well over what one daemon's
+/// handlers and workers hold at a time.
+const MAX_OPEN: usize = 32;
+
+/// How many idle connections the pool keeps. More than this and a returned
+/// connection is closed instead.
+const MAX_IDLE: usize = 8;
 
 /// Everything this crate can fail with.
 #[derive(Debug, thiserror::Error)]
@@ -101,22 +123,23 @@ impl Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// One database file. Cheap to clone; every clone is the same file.
-///
-/// It holds no connections of its own: [`Db::conn`] opens one per call, with
-/// the pragmas set, and the caller drops it when done. Opening a connection on
-/// an already-open file is a `sqlite3_open` plus a schema read, which is cheap,
-/// and a connection that is created per operation is keyed on nothing it could
-/// forget (invariant 14). A pool is a measured decision for later (D38).
+struct Inner {
+    db: libsql::Database,
+    path: PathBuf,
+    idle: parking_lot::Mutex<Vec<Connection>>,
+    slots: Arc<Semaphore>,
+}
+
+/// One database file. Cheap to clone; every clone is the same file and the
+/// same pool.
 #[derive(Clone)]
 pub struct Db {
-    inner: Arc<libsql::Database>,
-    path: Arc<PathBuf>,
+    inner: Arc<Inner>,
 }
 
 impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Db").field("path", &self.path).finish()
+        f.debug_struct("Db").field("path", &self.inner.path).finish()
     }
 }
 
@@ -124,7 +147,7 @@ impl Db {
     /// Opens (creating if needed) the file at `path`, creating its parent
     /// directory, and switches it to WAL so readers never block the writer.
     /// WAL is a property of the file and persists; the per-connection pragmas
-    /// are set by [`Db::conn`].
+    /// are set when a connection is opened for the pool.
     pub async fn open(path: impl AsRef<Path>) -> Result<Db> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent()
@@ -134,8 +157,12 @@ impl Db {
         }
         let inner = libsql::Builder::new_local(&path).build().await?;
         let db = Db {
-            inner: Arc::new(inner),
-            path: Arc::new(path),
+            inner: Arc::new(Inner {
+                db: inner,
+                path,
+                idle: parking_lot::Mutex::new(Vec::new()),
+                slots: Arc::new(Semaphore::new(MAX_OPEN)),
+            }),
         };
         let c = db.conn().await?;
         // PRAGMA journal_mode returns a row, so it is a query rather than an
@@ -144,7 +171,7 @@ impl Db {
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Other(format!(
                 "{}: journal_mode is {mode:?}, wanted wal",
-                db.path.display()
+                db.inner.path.display()
             )));
         }
         Ok(db)
@@ -152,40 +179,118 @@ impl Db {
 
     /// The file this is.
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
 
-    /// A fresh connection with foreign keys enforced and the busy timeout set.
-    /// Foreign keys are per connection in SQLite and default to off, so a
-    /// connection that skipped this would silently ignore every `REFERENCES`
-    /// in the schema; that is why there is no other way to get one.
-    pub async fn conn(&self) -> Result<Connection> {
-        let c = self.inner.connect()?;
-        c.busy_timeout(BUSY_TIMEOUT)?;
-        c.execute("PRAGMA foreign_keys = ON", ()).await?;
-        c.execute("PRAGMA synchronous = NORMAL", ()).await?;
-        Ok(c)
+    /// A connection from the pool, or a fresh one with foreign keys enforced
+    /// and the busy timeout set. Foreign keys are per connection in SQLite and
+    /// default to off, so a connection that skipped this would silently ignore
+    /// every `REFERENCES` in the schema; that is why there is no other way to
+    /// get one. Waits when the file's cap of open connections is reached.
+    pub async fn conn(&self) -> Result<Conn> {
+        let permit = self
+            .inner
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Other("connection pool closed".into()))?;
+        let reused = self.inner.idle.lock().pop();
+        let c = match reused {
+            Some(c) => c,
+            None => {
+                let c = self.inner.db.connect()?;
+                c.busy_timeout(BUSY_TIMEOUT)?;
+                c.execute("PRAGMA foreign_keys = ON", ()).await?;
+                c.execute("PRAGMA synchronous = NORMAL", ()).await?;
+                c
+            }
+        };
+        Ok(Conn {
+            c: Some(c),
+            pool: self.inner.clone(),
+            _permit: permit,
+        })
     }
 
-    /// A write transaction on a fresh connection: `BEGIN IMMEDIATE`, so the
+    /// A write transaction on a pooled connection: `BEGIN IMMEDIATE`, so the
     /// write lock is taken now rather than at the first write, and two writers
     /// queue in the engine instead of one failing mid-transaction with BUSY.
     /// Dropping the transaction without committing rolls it back.
     pub async fn begin(&self) -> Result<Transaction> {
-        let c = self.conn().await?;
-        Ok(c.transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?)
-    }
-
-    /// A write transaction on a connection the caller already holds.
-    pub async fn begin_on(c: &Connection) -> Result<Transaction> {
-        Ok(c.transaction_with_behavior(TransactionBehavior::Immediate)
-            .await?)
+        let conn = self.conn().await?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .await?;
+        Ok(Transaction { tx: Some(tx), conn })
     }
 
     /// Runs many statements. Migrations and DDL only; nothing here binds.
     pub async fn batch(c: &Connection, sql: &str) -> Result<()> {
         c.execute_batch(sql).await?;
+        Ok(())
+    }
+}
+
+/// A checked-out connection. Derefs to the engine's connection; goes back to
+/// the pool when dropped unless it is mid-transaction, in which case it is
+/// closed, because a connection with state is not interchangeable with one
+/// without.
+pub struct Conn {
+    c: Option<Connection>,
+    pool: Arc<Inner>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Deref for Conn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.c.as_ref().expect("connection present until drop")
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        let Some(c) = self.c.take() else {
+            return;
+        };
+        if !c.is_autocommit() {
+            return;
+        }
+        let mut idle = self.pool.idle.lock();
+        if idle.len() < MAX_IDLE {
+            idle.push(c);
+        }
+    }
+}
+
+/// `BEGIN IMMEDIATE` on a pooled connection. Derefs to the connection so
+/// statements run inside it; `commit` ends it; dropping it rolls it back and
+/// returns the connection to the pool afterwards (fields drop in order).
+pub struct Transaction {
+    tx: Option<libsql::Transaction>,
+    conn: Conn,
+}
+
+impl Deref for Transaction {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl Transaction {
+    pub async fn commit(mut self) -> Result<()> {
+        if let Some(tx) = self.tx.take() {
+            tx.commit().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn rollback(mut self) -> Result<()> {
+        if let Some(tx) = self.tx.take() {
+            tx.rollback().await?;
+        }
         Ok(())
     }
 }
@@ -755,6 +860,46 @@ mod tests {
         tx.commit().await.unwrap();
         let n: i64 = query("SELECT count(*) FROM t").fetch_scalar(&c).await.unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// The pool: a returned connection is the one handed out next, a
+    /// connection dropped mid-transaction is not, and the cap holds. The
+    /// crash this guards against needs hundreds of connections; the test
+    /// checks the mechanism rather than reproducing the crash.
+    #[tokio::test]
+    async fn connections_are_reused_and_capped() {
+        let (_d, db) = temp().await;
+        {
+            let c = db.conn().await.unwrap();
+            query("CREATE TABLE t (n INTEGER)").execute(&c).await.unwrap();
+        }
+        assert_eq!(db.inner.idle.lock().len(), 1, "one idle after return");
+        {
+            let _a = db.conn().await.unwrap();
+            assert_eq!(db.inner.idle.lock().len(), 0, "the idle one was reused");
+            let _b = db.conn().await.unwrap();
+            assert_eq!(db.inner.slots.available_permits(), MAX_OPEN - 2);
+        }
+        assert_eq!(db.inner.idle.lock().len(), 2);
+        assert_eq!(db.inner.slots.available_permits(), MAX_OPEN);
+        // A connection left inside a transaction is closed, not pooled.
+        {
+            let c = db.conn().await.unwrap();
+            c.execute("BEGIN", ()).await.unwrap();
+            query("INSERT INTO t VALUES (1)").execute(&c).await.unwrap();
+        }
+        assert_eq!(db.inner.idle.lock().len(), 1, "a mid-transaction connection was pooled");
+        let c = db.conn().await.unwrap();
+        let n: i64 = query("SELECT count(*) FROM t").fetch_scalar(&c).await.unwrap();
+        assert_eq!(n, 0, "the abandoned transaction leaked a row");
+        // Many sequential checkouts never exceed the idle cap.
+        drop(c);
+        let mut held = Vec::new();
+        for _ in 0..(MAX_IDLE + 4) {
+            held.push(db.conn().await.unwrap());
+        }
+        drop(held);
+        assert!(db.inner.idle.lock().len() <= MAX_IDLE);
     }
 
     #[tokio::test]

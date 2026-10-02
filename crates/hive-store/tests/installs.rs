@@ -614,9 +614,13 @@ fn short_slug() -> String {
 
 /// Drops the collection tables a test provisioned. The file is deleted with
 /// the test anyway; this keeps the uninstall path exercised.
-async fn drop_app_schema(w: &World, spec: &hive_registry::InstallSpec) {
+async fn drop_app_schema(
+    w: &World,
+    owner: hive_identity::Owner,
+    spec: &hive_registry::InstallSpec,
+) {
     let tx = w.store.begin().await.unwrap();
-    hive_store::drop_schema_plan(&tx, &spec.schema)
+    hive_store::drop_schema_plan(&tx, owner, &spec.schema)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -676,8 +680,8 @@ async fn bob_cannot_stage_an_install_onto_alices_schema() {
     )
     .await
     else {
-        drop_app_schema(&w, &alice_spec).await;
-        drop_app_schema(&w, &bob_spec).await;
+        drop_app_schema(&w, user(alice), &alice_spec).await;
+        drop_app_schema(&w, user(bob), &bob_spec).await;
         return; // refused outright is a correct outcome too
     };
     let captured: String = query("SELECT schema_name FROM installs WHERE id = ?1")
@@ -685,8 +689,8 @@ async fn bob_cannot_stage_an_install_onto_alices_schema() {
         .fetch_scalar(&*w.conn().await)
         .await
         .unwrap();
-    drop_app_schema(&w, &alice_spec).await;
-    drop_app_schema(&w, &bob_spec).await;
+    drop_app_schema(&w, user(alice), &alice_spec).await;
+    drop_app_schema(&w, user(bob), &bob_spec).await;
     assert_ne!(captured, alices_schema, "bob's install owns alice's schema");
     assert_eq!(captured, bob_build.schema_name);
 }
@@ -772,7 +776,7 @@ async fn the_longest_legal_slug_still_works() {
     )
     .await;
     drop(conn);
-    drop_app_schema(&w, &spec).await;
+    drop_app_schema(&w, user(alice), &spec).await;
     staged.expect("the longest legal slug was refused at staging");
 }
 

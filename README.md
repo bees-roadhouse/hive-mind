@@ -38,7 +38,8 @@ Phase 0, and honest about the gap. What exists:
 | `guest/`, `apps/hello` | the guest SDK and the reference guest |
 
 **The daemon composes.** It opens the store (two SQLite files under
-`--data-dir`, created on first boot), migrates, bootstraps an empty store,
+`--data-dir`, created on first boot, and a file per owner beside them for
+what that owner's apps store), migrates, bootstraps an empty store,
 runs the bus, instantiates the wasm host with real Storage, Blob and Events, and serves
 its API on a port **and a unix socket** — the socket because a harness container
 runs `--network=none` with it bind-mounted, and on rootless Podman an

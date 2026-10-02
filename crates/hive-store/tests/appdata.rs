@@ -26,6 +26,8 @@ struct AppFixture {
     blobs: Arc<Catalog>,
     driver: DiskDriver,
     install: Uuid,
+    /// Whose file the collection tables are in (D39).
+    owner: Owner,
     collection: String,
     plan: hive_manifest::SchemaPlan,
     _dir: tempfile::TempDir,
@@ -93,7 +95,7 @@ impl AppFixture {
             .await
             .expect("activate install");
         let tx = w.store.begin().await.unwrap();
-        hive_store::apply_schema_plan(&tx, &plan)
+        hive_store::apply_schema_plan(&tx, owner, &plan)
             .await
             .expect("apply schema plan");
         tx.commit().await.unwrap();
@@ -113,6 +115,7 @@ impl AppFixture {
                 blobs: catalog,
                 driver,
                 install,
+                owner,
                 collection: collection.into(),
                 plan,
                 _dir: dir,
@@ -125,7 +128,9 @@ impl AppFixture {
     /// this keeps the uninstall path exercised on the ordinary path.
     async fn cleanup(&self) {
         let tx = self.w.store.begin().await.unwrap();
-        hive_store::drop_schema_plan(&tx, &self.plan).await.unwrap();
+        hive_store::drop_schema_plan(&tx, self.owner, &self.plan)
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -267,16 +272,18 @@ impl AppFixture {
             .expect("activate install");
         drop(conn);
         let tx = self.w.store.begin().await.unwrap();
-        hive_store::apply_schema_plan(&tx, &plan)
+        hive_store::apply_schema_plan(&tx, owner, &plan)
             .await
             .expect("apply schema plan");
         tx.commit().await.unwrap();
         (install, plan)
     }
 
-    async fn drop_plan(&self, plan: &hive_manifest::SchemaPlan) {
+    async fn drop_plan(&self, owner: Owner, plan: &hive_manifest::SchemaPlan) {
         let tx = self.w.store.begin().await.unwrap();
-        hive_store::drop_schema_plan(&tx, plan).await.unwrap();
+        hive_store::drop_schema_plan(&tx, owner, plan)
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
     }
 
@@ -331,18 +338,20 @@ impl AppFixture {
     /// Rewrites a document's stored body WITHOUT touching its references, so a
     /// test can prove which of the two an implementation reads.
     async fn diverge(&self, id: Uuid, body: &str) {
+        let conn = self.w.conn().await;
         let schema: String = query("SELECT schema_name FROM installs WHERE id = ?1")
             .bind(self.install)
-            .fetch_scalar(&*self.w.conn().await)
+            .fetch_scalar(&conn)
             .await
             .unwrap();
+        let alias = hive_store::attach_owner(&conn, self.owner).await.unwrap();
         let rows = query(&format!(
-            "UPDATE \"{schema}__{}\" SET doc = ?2 WHERE id = ?1",
-            self.collection
+            "UPDATE {} SET doc = ?2 WHERE id = ?1",
+            hive_store::owner_table(&alias, &format!("{schema}__{}", self.collection))
         ))
         .bind(id)
         .bind(body)
-        .execute(&*self.w.conn().await)
+        .execute(&conn)
         .await
         .expect("diverge document");
         assert_eq!(rows, 1, "diverge is not rewriting what it thinks it is");
@@ -1062,7 +1071,7 @@ async fn an_app_cannot_reach_another_apps_collection_without_a_grant() {
         "expected a denial on the collection, got {err}"
     );
 
-    f.drop_plan(&mail_plan).await;
+    f.drop_plan(user(alice), &mail_plan).await;
     f.cleanup().await;
 }
 
@@ -1109,7 +1118,7 @@ async fn an_install_grant_opens_another_apps_collection() {
         "the row landed somewhere other than the journal it was addressed to"
     );
 
-    f.drop_plan(&mail_plan).await;
+    f.drop_plan(user(alice), &mail_plan).await;
     f.cleanup().await;
 }
 
@@ -1176,8 +1185,8 @@ async fn the_qualifier_names_an_app_not_an_owner() {
         .unwrap();
     assert_eq!(in_alices, 0, "bob's write reached alice's journal");
 
-    f.drop_plan(&bob_mail_plan).await;
-    f.drop_plan(&bob_journal_plan).await;
+    f.drop_plan(user(bob), &bob_mail_plan).await;
+    f.drop_plan(user(bob), &bob_journal_plan).await;
     f.cleanup().await;
 }
 

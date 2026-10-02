@@ -16,8 +16,9 @@ because the two disagree, they are meant to. D24 and D31 both left "whether
 **The daemon is Rust** (D24, decided 2026-09-02; the Go tree it replaced was
 removed 2026-09-05, D31). A Cargo workspace at `crates/*`, wasmtime for the
 guests, axum for the HTTP surface, SQLite through `rusqlite` for the store
-(D38, decided 2026-10-02: one file per daemon now, one per owner next; the
-libSQL fork was the first pick and was measured out). The browser client is a
+(D38, decided 2026-10-02: a control plane file per daemon, and an owner's
+documents in a file per owner beside it, D39; the libSQL fork was the first
+pick and was measured out). The browser client is a
 server-rendered by the daemon and swapped by htmx (D32); its static assets are
 embedded by `crates/hive-webui`, and apps contribute UI as HTML fragments. The guest SDK and the reference guest
 are Rust too, built for `wasm32-wasip1`. The reasons and the picks are in
@@ -207,9 +208,10 @@ cargo test --workspace -- --nocapture                       # everything; skips 
 ```
 
 A single test needs nothing running. `hive_testdb::TestDb` hands every test a
-private store (two files under the temp directory) and deletes them on the
-way out, so there is no shared mutable fixture and no ordering between tests:
-run one, run them in parallel, run them in any order.
+private store (two files under the temp directory, plus the owner files a
+test creates beside them) and deletes them on the way out, so there is no
+shared mutable fixture and no ordering between tests: run one, run them in
+parallel, run them in any order.
 
 There are four test tiers and three of them are invisible to `cargo test` on
 a bare machine:
@@ -277,6 +279,7 @@ crates/hive-schema/    the forward-only migrations, embedded, applied in one wri
                        with the checksum that refuses a file applied differently. migrations/
                        is the store's; migrations-audit/ is the override audit file's (D38)
 crates/hive-store/     SQLite: the data layer, the grant predicate, credentials, installs,
+                       the owner files and the one way they are attached (D39),
                        builds, events, chat, the guest-facing Storage/Blob/Events. The single
                        enforcement point; nothing outside it touches grants. lib.rs carries
                        the table of where each of the fourteen invariants lives

@@ -9,7 +9,10 @@ use hive_identity::{Owner, PrincipalKind};
 use hive_manifest::{
     Collection, CollectionPlan, Index, IndexMethod, Kind, Manifest, SchemaPlan, Storage,
 };
-use hive_store::{BuildSpec, StoreError, apply_schema_plan, drop_schema_plan, register_build};
+use hive_store::{
+    BuildSpec, StoreError, apply_schema_plan, attach_owner, drop_schema_plan, owner_table,
+    register_build,
+};
 use uuid::Uuid;
 
 fn short_slug() -> String {
@@ -61,34 +64,49 @@ async fn register_in(
     }
 }
 
-/// Whether any table under the install's prefix exists: the engine has no
-/// schemas, so "the schema exists" means "its tables do".
-async fn schema_exists(w: &World, schema: &str) -> bool {
-    let n: i64 = query(
-        "SELECT count(*) FROM sqlite_master
+/// The owner a test with no actors provisions for. Owner files are keyed on
+/// the owner and nothing else, so a bare World can have one.
+fn bare_owner() -> Owner {
+    Owner::user(Uuid::from_u128(0xB0B))
+}
+
+/// Whether any table under the install's prefix exists in the OWNER's file
+/// (D39): the engine has no schemas, so "the schema exists" means "its
+/// tables do".
+async fn schema_exists(w: &World, owner: Owner, schema: &str) -> bool {
+    let conn = w.conn().await;
+    let alias = attach_owner(&conn, owner).await.unwrap();
+    let n: i64 = query(&format!(
+        "SELECT count(*) FROM {}.sqlite_master
           WHERE type = 'table' AND substr(name, 1, length(?1)) = ?1",
-    )
+        hive_db::quote_ident(&alias)
+    ))
     .bind(format!("{schema}__"))
-    .fetch_scalar(&*w.conn().await)
+    .fetch_scalar(&conn)
     .await
     .unwrap();
     n > 0
 }
 
-async fn table_exists(w: &World, schema: &str, table: &str) -> bool {
-    let n: i64 = query("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
-        .bind(format!("{schema}__{table}"))
-        .fetch_scalar(&*w.conn().await)
-        .await
-        .unwrap();
+async fn table_exists(w: &World, owner: Owner, schema: &str, table: &str) -> bool {
+    let conn = w.conn().await;
+    let alias = attach_owner(&conn, owner).await.unwrap();
+    let n: i64 = query(&format!(
+        "SELECT count(*) FROM {}.sqlite_master WHERE type = 'table' AND name = ?1",
+        hive_db::quote_ident(&alias)
+    ))
+    .bind(format!("{schema}__{table}"))
+    .fetch_scalar(&conn)
+    .await
+    .unwrap();
     n > 0
 }
 
 /// Drops the collection tables a test provisioned. The file goes with the
 /// test anyway; this keeps the uninstall path exercised.
-async fn drop_plan(w: &World, plan: &SchemaPlan) {
+async fn drop_plan(w: &World, owner: Owner, plan: &SchemaPlan) {
     let tx = w.store.begin().await.unwrap();
-    drop_schema_plan(&tx, plan).await.unwrap();
+    drop_schema_plan(&tx, owner, plan).await.unwrap();
     tx.commit().await.unwrap();
 }
 
@@ -110,7 +128,7 @@ async fn register_build_writes_the_row_and_provisions_the_schema() {
     .await
     .expect("register_build");
     assert!(
-        table_exists(&w, &out.schema_name, "links").await,
+        table_exists(&w, user(alice), &out.schema_name, "links").await,
         "{}.links was not provisioned",
         out.schema_name
     );
@@ -123,7 +141,7 @@ async fn register_build_writes_the_row_and_provisions_the_schema() {
         (row.get("surface_hash"), row.get("derive_version"));
     assert_eq!(surface_hash.as_deref(), Some(spec.surface_hash.as_str()));
     assert_eq!(derive_version, Some(hive_manifest::DERIVE_VERSION));
-    drop_plan(&w, &plan).await;
+    drop_plan(&w, user(alice), &plan).await;
 }
 
 /// Ported from `TestRegisterBuildCreatesNoInstall` (D19.4).
@@ -147,7 +165,7 @@ async fn register_build_creates_no_install() {
         .await
         .unwrap();
     assert_eq!(installs, 0, "registering a build is not making it live");
-    drop_plan(&w, &plan).await;
+    drop_plan(&w, user(alice), &plan).await;
 }
 
 /// Ported from `TestTwoOwnersGetSeparateSchemas`: the bug that made the schema
@@ -180,11 +198,11 @@ async fn two_owners_get_separate_schemas() {
         "one app, one schema, two people's documents"
     );
     assert_ne!(a.build_id, b.build_id, "two owners share one build row");
-    for s in [&a.schema_name, &b.schema_name] {
-        assert!(schema_exists(&w, s).await, "{s} was not created");
+    for (s, o) in [(&a.schema_name, user(alice)), (&b.schema_name, user(bob))] {
+        assert!(schema_exists(&w, o, s).await, "{s} was not created");
     }
-    drop_plan(&w, &a_plan).await;
-    drop_plan(&w, &b_plan).await;
+    drop_plan(&w, user(alice), &a_plan).await;
+    drop_plan(&w, user(bob), &b_plan).await;
 }
 
 /// Ported from `TestReRegisteringLandsOnTheSameSchema`.
@@ -207,7 +225,7 @@ async fn re_registering_lands_on_the_same_schema() {
         first.build_id, second.build_id,
         "identical registrations produced two build rows"
     );
-    drop_plan(&w, &plan).await;
+    drop_plan(&w, user(alice), &plan).await;
 }
 
 /// Ported from `TestFailedRegistrationLeavesNothing`.
@@ -228,7 +246,7 @@ async fn failed_registration_leaves_nothing() {
     .expect("register inside tx");
     tx.rollback().await.unwrap(); // something later failed
     assert!(
-        !schema_exists(&w, &schema).await,
+        !schema_exists(&w, user(alice), &schema).await,
         "{schema} survived a failed registration"
     );
     let builds: i64 = query("SELECT count(*) FROM app_builds WHERE slug = ?1")
@@ -556,20 +574,23 @@ fn coll(name: &str, indexes: &[&str]) -> Collection {
     }
 }
 
-/// Applies in its own transaction and commits.
+/// Applies in its own transaction and commits, for the bare owner.
 async fn apply(w: &World, plan: &SchemaPlan) -> Result<(), StoreError> {
     let tx = w.store.begin().await.unwrap();
-    apply_schema_plan(&tx, plan).await?;
+    apply_schema_plan(&tx, bare_owner(), plan).await?;
     tx.commit()
         .await
         .map_err(|e| StoreError::Other(e.to_string()))
 }
 
 async fn column_exists(w: &World, schema: &str, table: &str, col: &str) -> bool {
-    let n: i64 = query("SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2")
+    let conn = w.conn().await;
+    let alias = attach_owner(&conn, bare_owner()).await.unwrap();
+    let n: i64 = query("SELECT count(*) FROM pragma_table_info(?1, ?2) WHERE name = ?3")
         .bind(format!("{schema}__{table}"))
+        .bind(&alias)
         .bind(col)
-        .fetch_scalar(&*w.conn().await)
+        .fetch_scalar(&conn)
         .await
         .unwrap();
     n > 0
@@ -578,11 +599,16 @@ async fn column_exists(w: &World, schema: &str, table: &str, col: &str) -> bool 
 /// The names of every index on a collection table, the autoindex behind the
 /// primary key included.
 async fn index_names(w: &World, schema: &str, table: &str) -> Vec<String> {
-    query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 ORDER BY name")
-        .bind(format!("{schema}__{table}"))
-        .fetch_scalars(&*w.conn().await)
-        .await
-        .unwrap()
+    let conn = w.conn().await;
+    let alias = attach_owner(&conn, bare_owner()).await.unwrap();
+    query(&format!(
+        "SELECT name FROM {}.sqlite_master WHERE type = 'index' AND tbl_name = ?1 ORDER BY name",
+        hive_db::quote_ident(&alias)
+    ))
+    .bind(format!("{schema}__{table}"))
+    .fetch_scalars(&conn)
+    .await
+    .unwrap()
 }
 
 /// Ported from `TestApplySchemaPlanProvisionsCollections`.
@@ -603,7 +629,7 @@ async fn apply_schema_plan_provisions_collections() {
     apply(&w, &plan).await.expect("apply_schema_plan");
     for table in ["entries", "drafts"] {
         assert!(
-            table_exists(&w, &plan.schema, table).await,
+            table_exists(&w, bare_owner(), &plan.schema, table).await,
             "{}.{table} was not created",
             plan.schema
         );
@@ -633,7 +659,7 @@ async fn apply_schema_plan_provisions_collections() {
         indexes >= 4,
         "entries has {indexes} indexes, want at least 4"
     );
-    drop_plan(&w, &plan).await;
+    drop_plan(&w, bare_owner(), &plan).await;
 }
 
 /// Ported from `TestLongCollectionNameStillGetsItsIndexes`: Postgres truncated
@@ -656,7 +682,7 @@ async fn long_collection_name_still_gets_its_indexes() {
         names.iter().any(|n| n.contains("btree")),
         "the declared index is missing on {long:?}: {names:?}"
     );
-    drop_plan(&w, &plan).await;
+    drop_plan(&w, bare_owner(), &plan).await;
 }
 
 /// Ported from `TestDerivedIndexNameIsRefusedRatherThanTruncated`. The engine
@@ -675,7 +701,7 @@ async fn derived_index_name_is_refused_rather_than_truncated() {
         }],
     };
     let tx = w.store.begin().await.unwrap();
-    let err = apply_schema_plan(&tx, &plan)
+    let err = apply_schema_plan(&tx, bare_owner(), &plan)
         .await
         .expect_err("a truncating name was accepted");
     assert!(matches!(err, StoreError::UnsafeIdentifier(_)), "{err}");
@@ -688,8 +714,9 @@ async fn updated_at_is_maintained_without_the_writer() {
     let w = World::bare("updated_at_maintained").await;
     let plan = plan_for(&unique_app(), vec![coll("entries", &[])]);
     apply(&w, &plan).await.expect("apply");
-    let table = format!("\"{}__entries\"", plan.schema);
     let conn = w.conn().await;
+    let alias = attach_owner(&conn, bare_owner()).await.unwrap();
+    let table = owner_table(&alias, &format!("{}__entries", plan.schema));
     let row = query(&format!(
         "INSERT INTO {table} (id, doc) VALUES (?1, '{{\"a\":1}}') RETURNING id, created_at, updated_at"
     ))
@@ -728,7 +755,7 @@ async fn updated_at_is_maintained_without_the_writer() {
             .await
             .unwrap();
     assert_eq!(after, created, "created_at moved");
-    drop_plan(&w, &plan).await;
+    drop_plan(&w, bare_owner(), &plan).await;
 }
 
 /// Ported from `TestTouchFunctionLivesInTheAppSchema`: the touch trigger is
@@ -740,22 +767,32 @@ async fn touch_trigger_lives_on_the_collection_table() {
     let plan = plan_for(&unique_app(), vec![coll("entries", &[])]);
     apply(&w, &plan).await.expect("apply");
     let table = format!("{}__entries", plan.schema);
-    let triggers: Vec<String> =
-        query("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1")
-            .bind(&table)
-            .fetch_scalars(&*w.conn().await)
-            .await
-            .unwrap();
+    let conn = w.conn().await;
+    let alias = attach_owner(&conn, bare_owner()).await.unwrap();
+    let master = format!("{}.sqlite_master", hive_db::quote_ident(&alias));
+    let triggers: Vec<String> = query(&format!(
+        "SELECT name FROM {master} WHERE type = 'trigger' AND tbl_name = ?1"
+    ))
+    .bind(&table)
+    .fetch_scalars(&conn)
+    .await
+    .unwrap();
     assert!(
         triggers.iter().any(|t| t.ends_with("_touch")),
         "no touch trigger on {table}: {triggers:?}"
     );
-    drop_plan(&w, &plan).await;
-    let left: i64 = query("SELECT count(*) FROM sqlite_master WHERE tbl_name = ?1")
-        .bind(&table)
-        .fetch_scalar(&*w.conn().await)
-        .await
-        .unwrap();
+    drop(conn);
+    drop_plan(&w, bare_owner(), &plan).await;
+    let conn = w.conn().await;
+    let alias = attach_owner(&conn, bare_owner()).await.unwrap();
+    let left: i64 = query(&format!(
+        "SELECT count(*) FROM {}.sqlite_master WHERE tbl_name = ?1",
+        hive_db::quote_ident(&alias)
+    ))
+    .bind(&table)
+    .fetch_scalar(&conn)
+    .await
+    .unwrap();
     assert_eq!(left, 0, "dropping the table left {left} objects behind");
 }
 
@@ -766,7 +803,7 @@ async fn apply_schema_plan_is_idempotent() {
     let plan = plan_for(&unique_app(), vec![coll("entries", &["btree(entry_date)"])]);
     apply(&w, &plan).await.expect("first apply");
     apply(&w, &plan).await.expect("second apply");
-    drop_plan(&w, &plan).await;
+    drop_plan(&w, bare_owner(), &plan).await;
 }
 
 /// Ported from `TestApplySchemaPlanRollsBackWholly` and
@@ -776,10 +813,12 @@ async fn apply_schema_plan_rolls_back_wholly() {
     let w = World::bare("apply_schema_plan_rolls_back").await;
     let plan = plan_for(&unique_app(), vec![coll("entries", &[])]);
     let tx = w.store.begin().await.unwrap();
-    apply_schema_plan(&tx, &plan).await.expect("apply");
+    apply_schema_plan(&tx, bare_owner(), &plan)
+        .await
+        .expect("apply");
     tx.rollback().await.unwrap(); // something else in the same unit of work fails
     assert!(
-        !schema_exists(&w, &plan.schema).await,
+        !schema_exists(&w, bare_owner(), &plan.schema).await,
         "{} survived a rolled-back transaction",
         plan.schema
     );
@@ -791,9 +830,9 @@ async fn drop_schema_plan_removes_everything() {
     let w = World::bare("drop_schema_plan_removes").await;
     let plan = plan_for(&unique_app(), vec![coll("entries", &[])]);
     apply(&w, &plan).await.expect("apply");
-    drop_plan(&w, &plan).await;
+    drop_plan(&w, bare_owner(), &plan).await;
     assert!(
-        !schema_exists(&w, &plan.schema).await,
+        !schema_exists(&w, bare_owner(), &plan.schema).await,
         "{} survived a drop",
         plan.schema
     );
@@ -808,7 +847,7 @@ async fn vector_index_is_refused_rather_than_skipped() {
         vec![coll("entries", &["vector(embedding, 1536)"])],
     );
     let tx = w.store.begin().await.unwrap();
-    let err = apply_schema_plan(&tx, &plan)
+    let err = apply_schema_plan(&tx, bare_owner(), &plan)
         .await
         .expect_err("a vector index was silently accepted");
     assert!(matches!(err, StoreError::NotImplemented(_)), "{err}");
@@ -848,7 +887,7 @@ async fn apply_schema_plan_refuses_unsafe_identifiers() {
     ];
     for plan in plans {
         let tx = w.store.begin().await.unwrap();
-        let err = apply_schema_plan(&tx, &plan)
+        let err = apply_schema_plan(&tx, bare_owner(), &plan)
             .await
             .err()
             .unwrap_or_else(|| panic!("plan {:?} accepted", plan.schema));
@@ -887,7 +926,7 @@ async fn index_expression_cannot_be_escaped() {
         }],
     };
     let tx = w.store.begin().await.unwrap();
-    let err = apply_schema_plan(&tx, &plan)
+    let err = apply_schema_plan(&tx, bare_owner(), &plan)
         .await
         .expect_err("an escaping path was accepted");
     assert!(matches!(err, StoreError::UnsafeIdentifier(_)), "{err}");

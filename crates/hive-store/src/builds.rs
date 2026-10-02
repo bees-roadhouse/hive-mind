@@ -40,7 +40,8 @@ pub struct RegisteredBuild {
 }
 
 /// Records a build and provisions the tables its install will use, in the
-/// caller's transaction.
+/// caller's transaction. The tables land in the OWNER's file (D39), attached
+/// on the transaction's connection so both commit or neither does.
 ///
 /// Both or neither: a build row whose tables were never created fails on its
 /// first call, and tables with no build are orphans nobody will find.
@@ -120,7 +121,7 @@ pub async fn register_build(
     // Idempotent, so registering a second build of the same app for the same
     // owner is a manifest diff applied to the tables they share rather than a
     // conflict (D3.3).
-    apply_schema_plan(tx, &spec.spec.schema).await?;
+    apply_schema_plan(tx, owner, &spec.spec.schema).await?;
     Ok(RegisteredBuild {
         build_id,
         schema_name: spec.spec.schema.schema.clone(),

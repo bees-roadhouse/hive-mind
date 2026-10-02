@@ -42,9 +42,18 @@ pub const AUDIT_MIGRATIONS: &[Migration] = &[Migration {
     sql: include_str!("../migrations-audit/0001_override_audit.sql"),
 }];
 
+/// An owner's file (D39): the marker that says whose it is. The collection
+/// tables in it are provisioned from manifests, never by a migration.
+pub const OWNER_MIGRATIONS: &[Migration] = &[Migration {
+    version: "0001",
+    name: "owner_file",
+    sql: include_str!("../migrations-owner/0001_owner_file.sql"),
+}];
+
 /// The shared directories, for the tests that keep the lists honest.
 pub const SHARED_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
 pub const AUDIT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations-audit");
+pub const OWNER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations-owner");
 
 #[derive(Debug, thiserror::Error)]
 pub enum MigrateError {
@@ -82,6 +91,11 @@ pub async fn migrate(db: &Db) -> Result<Vec<String>, MigrateError> {
 /// The audit file's migrations, same machinery.
 pub async fn migrate_audit(db: &Db) -> Result<Vec<String>, MigrateError> {
     apply_all(db, AUDIT_MIGRATIONS).await
+}
+
+/// An owner file's migrations, same machinery (D39).
+pub async fn migrate_owner(db: &Db) -> Result<Vec<String>, MigrateError> {
+    apply_all(db, OWNER_MIGRATIONS).await
 }
 
 async fn apply_all(db: &Db, list: &[Migration]) -> Result<Vec<String>, MigrateError> {
@@ -171,6 +185,7 @@ mod tests {
         for (dir, list, what) in [
             (SHARED_DIR, MIGRATIONS, "MIGRATIONS"),
             (AUDIT_DIR, AUDIT_MIGRATIONS, "AUDIT_MIGRATIONS"),
+            (OWNER_DIR, OWNER_MIGRATIONS, "OWNER_MIGRATIONS"),
         ] {
             let mut on_disk: Vec<String> = std::fs::read_dir(dir)
                 .expect("shared migrations directory")

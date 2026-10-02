@@ -1,16 +1,16 @@
 //! The reference layer, ported from internal/blob/catalog_test.go. Every test
-//! here runs against a migrated private schema and a disk driver in a temp dir.
+//! here runs against a migrated private file and a disk driver in a temp dir.
 
 use chrono::{Duration as ChronoDuration, Utc};
 use hive_blob::*;
 use hive_identity::{Credential, PrincipalKind};
 use hive_testdb::TestDb;
 use hive_trust::Level;
-use sqlx::PgPool;
+use hive_db::{Connection, Db, query};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-/// A migrated schema, a disk driver and a catalog over both.
+/// A migrated file, a disk driver and a catalog over both.
 struct World {
     db: TestDb,
     _dir: tempfile::TempDir,
@@ -19,44 +19,47 @@ struct World {
 }
 
 impl World {
-    async fn new(test: &str) -> Option<World> {
-        let db = TestDb::new(test).await?;
-        hive_schema::migrate(db.pool()).await.expect("migrate");
+    async fn new(test: &str) -> World {
+        let db = TestDb::new(test).await;
         let root = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', 'root', 'Root', 'user', $1, NULL)",
+             VALUES (?1, 'human', 'root', 'Root', 'user', ?1, NULL)",
         )
         .bind(root)
-        .execute(db.pool())
+        .execute(&db.db().conn().await.unwrap())
         .await
         .expect("root actor");
         let dir = tempfile::tempdir().unwrap();
         let driver = DiskDriver::new(dir.path()).await.expect("driver");
-        let catalog = Catalog::new(db.pool().clone(), Box::new(driver));
-        Some(World {
+        let catalog = Catalog::new(db.db().clone(), Box::new(driver));
+        World {
             db,
             _dir: dir,
             catalog,
             root,
-        })
+        }
     }
 
-    fn pool(&self) -> &PgPool {
-        self.db.pool()
+    fn db(&self) -> &Db {
+        self.db.db()
+    }
+
+    async fn conn(&self) -> Connection {
+        self.db().conn().await.expect("connection")
     }
 
     /// A human actor and a credential acting as themselves.
     async fn person(&self, handle: &str) -> Credential {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'human', $2, $2, 'user', $1, $3)",
+             VALUES (?1, 'human', ?2, ?2, 'user', ?1, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(self.root)
-        .execute(self.pool())
+        .execute(&self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create {handle}: {e}"));
         Credential::new(id, PrincipalKind::User, id)
@@ -69,14 +72,14 @@ impl World {
     /// trigger.
     async fn ai_actor(&self, handle: &str, principal: Uuid) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query(
+        query(
             "INSERT INTO actors (id, kind, handle, display_name, persona, principal_kind, principal_id, created_by_actor)
-             VALUES ($1, 'ai', $2, $2, $2, 'user', $3, $3)",
+             VALUES (?1, 'ai', ?2, ?2, ?2, 'user', ?3, ?3)",
         )
         .bind(id)
         .bind(handle)
         .bind(principal)
-        .execute(self.pool())
+        .execute(&self.conn().await)
         .await
         .unwrap_or_else(|e| panic!("create ai {handle}: {e}"));
         id
@@ -97,10 +100,10 @@ impl World {
     /// transaction.
     async fn publish(&self, content: &[u8], spec: RefSpec, prov: Provenance) -> Descriptor {
         let sealed = self.seal(content).await;
-        let mut tx = self.pool().begin().await.unwrap();
+        let tx = self.db().begin().await.unwrap();
         let (desc, _) = self
             .catalog
-            .publish(&mut tx, sealed, "application/octet-stream", &prov, &spec)
+            .publish(&tx, sealed, "application/octet-stream", &prov, &spec)
             .await
             .expect("publish");
         tx.commit().await.unwrap();
@@ -108,8 +111,8 @@ impl World {
     }
 
     async fn add_ref(&self, sealed: Sealed, spec: &RefSpec) -> Result<Ref> {
-        let mut tx = self.pool().begin().await.unwrap();
-        let r = self.catalog.add_ref(&mut tx, sealed, spec).await;
+        let tx = self.db().begin().await.unwrap();
+        let r = self.catalog.add_ref(&tx, sealed, spec).await;
         if r.is_ok() {
             tx.commit().await.unwrap();
         }
@@ -117,8 +120,8 @@ impl World {
     }
 
     async fn link_ref(&self, cred: &Credential, h: Hash, spec: &RefSpec) -> Result<Ref> {
-        let mut tx = self.pool().begin().await.unwrap();
-        let r = self.catalog.link_ref(&mut tx, cred, h, spec).await;
+        let tx = self.db().begin().await.unwrap();
+        let r = self.catalog.link_ref(&tx, cred, h, spec).await;
         if r.is_ok() {
             tx.commit().await.unwrap();
         }
@@ -126,8 +129,8 @@ impl World {
     }
 
     async fn trash(&self, h: Hash) -> bool {
-        let mut tx = self.pool().begin().await.unwrap();
-        let t = self.catalog.trash(&mut tx, h).await.expect("trash");
+        let tx = self.db().begin().await.unwrap();
+        let t = self.catalog.trash(&tx, h).await.expect("trash");
         tx.commit().await.unwrap();
         t
     }
@@ -148,10 +151,7 @@ fn original() -> Provenance {
 
 macro_rules! world {
     ($name:expr) => {
-        match World::new($name).await {
-            Some(w) => w,
-            None => return,
-        }
+        World::new($name).await
     };
 }
 
@@ -181,11 +181,11 @@ async fn no_live_blob_without_a_ref() {
     // same transaction: an empty source id fails RefSpec validation, but to
     // exercise the database half the row write has to have happened first, so
     // this one names a source id the schema's CHECK refuses.
-    let mut tx = w.pool().begin().await.unwrap();
+    let tx = w.db().begin().await.unwrap();
     let res = w
         .catalog
         .publish(
-            &mut tx,
+            &tx,
             sealed,
             "",
             &original(),
@@ -206,9 +206,9 @@ async fn no_live_blob_without_a_ref() {
         drop(tx);
     }
 
-    let state: Option<String> = sqlx::query_scalar("SELECT state FROM blobs WHERE sha256 = $1")
+    let state: Option<String> = query("SELECT state FROM blobs WHERE sha256 = ?1")
         .bind(sealed.hash().to_string())
-        .fetch_optional(w.pool())
+        .fetch_scalar_optional(&w.conn().await)
         .await
         .unwrap();
     assert!(
@@ -313,7 +313,7 @@ async fn two_owners_share_one_object() {
     // Alice releasing hers must not make the bytes collectable while Bob still
     // holds one. Counting per tenant is exactly what would get this wrong.
     w.catalog
-        .release(w.pool(), &alice, first.hash, SourceKind::Upload, "upload-a")
+        .release(&w.conn().await, &alice, first.hash, SourceKind::Upload, "upload-a")
         .await
         .expect("release");
     let candidates = w
@@ -433,7 +433,7 @@ async fn sweep_collects_only_unreferenced_bytes() {
         )
         .await;
     w.catalog
-        .release(w.pool(), &alice, desc.hash, SourceKind::Upload, "upload-1")
+        .release(&w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
         .await
         .unwrap();
 
@@ -477,7 +477,7 @@ async fn trash_refuses_when_a_reference_reappears() {
         )
         .await;
     w.catalog
-        .release(w.pool(), &alice, desc.hash, SourceKind::Upload, "upload-1")
+        .release(&w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
         .await
         .unwrap();
 
@@ -527,11 +527,11 @@ async fn evictable_class_needs_a_source_and_a_recipe() {
     let w = world!("evictable_class_needs_a_source_and_a_recipe");
     let alice = w.person("alice").await;
     let sealed = w.seal(b"a thumbnail with no origin").await;
-    let mut tx = w.pool().begin().await.unwrap();
+    let tx = w.db().begin().await.unwrap();
     let res = w
         .catalog
         .publish(
-            &mut tx,
+            &tx,
             sealed,
             "",
             &Provenance {
@@ -786,7 +786,7 @@ async fn release_by_source_and_held_by_source() {
     }
     let held = w
         .catalog
-        .held_by_source(w.pool(), &alice, SourceKind::Collection, entry)
+        .held_by_source(&w.conn().await, &alice, SourceKind::Collection, entry)
         .await
         .unwrap();
     assert_eq!(held.len(), 2);
@@ -794,7 +794,7 @@ async fn release_by_source_and_held_by_source() {
     // The update: the new document no longer names `dropped`.
     w.catalog
         .release(
-            w.pool(),
+            &w.conn().await,
             &alice,
             dropped.hash,
             SourceKind::Collection,
@@ -804,7 +804,7 @@ async fn release_by_source_and_held_by_source() {
         .unwrap();
     let held = w
         .catalog
-        .held_by_source(w.pool(), &alice, SourceKind::Collection, entry)
+        .held_by_source(&w.conn().await, &alice, SourceKind::Collection, entry)
         .await
         .unwrap();
     assert_eq!(held, vec![kept.hash]);
@@ -812,14 +812,14 @@ async fn release_by_source_and_held_by_source() {
     // The delete: everything the document held goes.
     let released = w
         .catalog
-        .release_by_source(w.pool(), &alice, SourceKind::Collection, entry)
+        .release_by_source(&w.conn().await, &alice, SourceKind::Collection, entry)
         .await
         .unwrap();
     assert_eq!(released, 1);
     // Releasing nothing is not an error.
     let again = w
         .catalog
-        .release_by_source(w.pool(), &alice, SourceKind::Collection, entry)
+        .release_by_source(&w.conn().await, &alice, SourceKind::Collection, entry)
         .await
         .unwrap();
     assert_eq!(again, 0);
@@ -848,7 +848,7 @@ async fn release_by_source_is_owner_scoped() {
         .await;
     let released = w
         .catalog
-        .release_by_source(w.pool(), &carol, SourceKind::Collection, "entry-1")
+        .release_by_source(&w.conn().await, &carol, SourceKind::Collection, "entry-1")
         .await
         .unwrap();
     assert_eq!(released, 0, "carol released alice's references");
@@ -884,7 +884,7 @@ async fn ref_attribution_follows_the_act() {
 
     // Released, then revived by the assistant: that is a new act.
     w.catalog
-        .release(w.pool(), &alice, desc.hash, SourceKind::Upload, "upload-1")
+        .release(&w.conn().await, &alice, desc.hash, SourceKind::Upload, "upload-1")
         .await
         .unwrap();
     let sealed = w.seal(b"a document alice uploaded").await;

@@ -1,10 +1,9 @@
 //! The relocator's driver-level properties, ported from
-//! internal/blob/relocate_test.go. The constructor checks need a pool they
-//! never use; the Go tests used a stub DB, and here a lazy pool that never
-//! connects stands in.
+//! internal/blob/relocate_test.go. The constructor checks need a database
+//! they never use; the Go tests used a stub DB, and here an empty file in a
+//! temp dir stands in.
 
 use hive_blob::*;
-use sqlx::postgres::PgPoolOptions;
 use tokio::io::AsyncReadExt;
 
 async fn two_disks() -> (DiskDriver, DiskDriver, tempfile::TempDir, tempfile::TempDir) {
@@ -15,10 +14,10 @@ async fn two_disks() -> (DiskDriver, DiskDriver, tempfile::TempDir, tempfile::Te
     (src, dst, a, b)
 }
 
-fn lazy_pool() -> sqlx::PgPool {
-    PgPoolOptions::new()
-        .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/never")
-        .unwrap()
+async fn unused_db() -> (tempfile::TempDir, hive_db::Db) {
+    let dir = tempfile::tempdir().unwrap();
+    let db = hive_db::Db::open(dir.path().join("unused.db")).await.unwrap();
+    (dir, db)
 }
 
 /// Both drivers being disk means name() collides, which the constructor refuses
@@ -27,7 +26,8 @@ fn lazy_pool() -> sqlx::PgPool {
 #[tokio::test]
 async fn relocator_refuses_the_same_driver() {
     let (src, dst, _a, _b) = two_disks().await;
-    assert!(Relocator::new(lazy_pool(), Box::new(src), Box::new(dst)).is_err());
+    let (_d, db) = unused_db().await;
+    assert!(Relocator::new(db, Box::new(src), Box::new(dst)).is_err());
 }
 
 /// The bytes must survive the trip byte for byte. A relocation that silently

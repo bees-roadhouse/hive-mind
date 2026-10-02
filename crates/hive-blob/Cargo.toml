@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 tokio.workspace = true
 tokio-util.workspace = true
-sqlx.workspace = true
+hive-db = { path = "../hive-db" }
 uuid.workspace = true
 chrono.workspace = true
 serde.workspace = true
@@ -41,4 +41,4 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 http.workspace = true
 hive-testdb = { path = "../hive-testdb" }
-hive-schema = { path = "../hive-schema" }
+hive-db = { path = "../hive-db" }

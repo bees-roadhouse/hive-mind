@@ -22,7 +22,9 @@ use hive_db::Db;
 pub const DIR_ENV: &str = "HIVE_SANDBOX_TEST_DB_DIR";
 
 /// One test's private files, migrated: the platform file and the override
-/// audit's file beside it, exactly as the daemon lays them out.
+/// audit's file beside it, exactly as the daemon lays them out. Owner files
+/// (D39) appear beside them under `<stem>-owners/` as the test creates them
+/// and are deleted with the rest.
 pub struct TestDb {
     db: Option<Db>,
     audit: Option<Db>,
@@ -89,6 +91,15 @@ impl Drop for TestDb {
     fn drop(&mut self) {
         drop(self.db.take());
         drop(self.audit.take());
+        // The owner files beside the control plane (D39) go with it. Their
+        // directory is derived from the control plane's path the same way
+        // hive-store derives it, so there is nothing to look up.
+        let owners = PathBuf::from(format!("{}-owners", self.path.with_extension("").display()));
+        if owners.is_dir()
+            && let Err(e) = std::fs::remove_dir_all(&owners)
+        {
+            eprintln!("testdb: could not delete {}: {e}", owners.display());
+        }
         for base in [&self.path, &self.audit_path] {
             for suffix in ["", "-wal", "-shm"] {
                 let p = PathBuf::from(format!("{}{suffix}", base.display()));

@@ -138,6 +138,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// never shared: the pool hands each one to one holder at a time.
 pub struct Connection {
     inner: Mutex<rusqlite::Connection>,
+    path: PathBuf,
+    /// The aliases attached on this connection, in attach order. What the
+    /// pool detaches before reusing it; what a caller reads to attach once.
+    attached: Mutex<Vec<String>>,
 }
 
 impl Connection {
@@ -151,7 +155,61 @@ impl Connection {
         c.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
         Ok(Connection {
             inner: Mutex::new(c),
+            path: path.to_path_buf(),
+            attached: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The file this connection is `main` on.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// `ATTACH DATABASE <path> AS <alias>`. Allowed inside a transaction,
+    /// where the attached file joins it. Attaching an alias this connection
+    /// already has is a no-op when it is the same file and an error when it
+    /// is not: an alias is a name for one file at a time.
+    pub fn attach(&self, path: &Path, alias: &str) -> Result<()> {
+        if !is_identifier(alias) {
+            return Err(Error::Other(format!("{alias:?} is not an identifier")));
+        }
+        {
+            let held = self.attached.lock();
+            if held.iter().any(|a| a == alias) {
+                return Ok(());
+            }
+        }
+        let sql = format!("ATTACH DATABASE ?1 AS {}", quote_ident(alias));
+        self.inner
+            .lock()
+            .execute(&sql, [path.to_string_lossy().as_ref()])?;
+        self.attached.lock().push(alias.to_string());
+        Ok(())
+    }
+
+    /// The aliases currently attached, in attach order.
+    pub fn attached(&self) -> Vec<String> {
+        self.attached.lock().clone()
+    }
+
+    /// `DETACH` one alias. Refused by the engine while an open transaction
+    /// holds the file; the alias then stays recorded, so the pool knows the
+    /// connection is not clean.
+    pub fn detach(&self, alias: &str) -> Result<()> {
+        let sql = format!("DETACH DATABASE {}", quote_ident(alias));
+        self.inner.lock().execute_batch(&sql)?;
+        self.attached.lock().retain(|a| a != alias);
+        Ok(())
+    }
+
+    /// `DETACH` everything this connection attached. Stops at the first
+    /// refusal, which is why the pool closes a connection it cannot clean
+    /// rather than returning it.
+    pub fn detach_all(&self) -> Result<()> {
+        for a in self.attached() {
+            self.detach(&a)?;
+        }
+        Ok(())
     }
 
     /// Whether no transaction is open on this connection.
@@ -294,6 +352,12 @@ impl Drop for Conn {
             return;
         };
         if !c.is_autocommit() {
+            return;
+        }
+        // An attachment is state a checkout must not inherit: the next
+        // caller did not ask for that file (invariant 14). A connection that
+        // cannot shed it is closed instead of pooled.
+        if c.detach_all().is_err() {
             return;
         }
         let mut idle = self.pool.idle.lock();
@@ -768,6 +832,13 @@ impl Query<'_> {
 
 /// Double-quotes an identifier for DDL. Callers validate the name first; the
 /// doubling is the last line, not the only one.
+/// `[a-z_][a-z0-9_]*`: what an attach alias has to be.
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
 pub fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -972,6 +1043,66 @@ mod tests {
         }
         drop(held);
         assert!(db.inner.idle.lock().len() <= MAX_IDLE);
+    }
+
+    /// An attachment made on a checkout is gone by the next checkout, and a
+    /// connection that could not detach (one still mid-transaction) is not
+    /// pooled at all.
+    #[tokio::test]
+    async fn attachments_do_not_survive_a_checkout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(dir.path().join("main.db")).await.unwrap();
+        let other = dir.path().join("other.db");
+        {
+            let c = db.conn().await.unwrap();
+            c.attach(&other, "o").unwrap();
+            c.attach(&other, "o").unwrap();
+            assert_eq!(c.attached(), vec!["o".to_string()]);
+            assert!(
+                c.attach(&other, "o; DROP").is_err(),
+                "an alias is an identifier"
+            );
+            query("CREATE TABLE o.t (n INTEGER)")
+                .execute(&c)
+                .await
+                .unwrap();
+        }
+        let c = db.conn().await.unwrap();
+        assert!(c.attached().is_empty());
+        let names: Vec<String> = query("PRAGMA database_list")
+            .fetch_all(&c)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String>("name"))
+            .collect();
+        assert_eq!(names, vec!["main".to_string()]);
+        // Mid-transaction with the file in use, the detach is refused and
+        // the connection is closed rather than pooled. (An attached file the
+        // transaction never touched detaches fine; the engine refuses only
+        // what the transaction holds.)
+        {
+            c.execute_batch("BEGIN IMMEDIATE").unwrap();
+            c.attach(&other, "o").unwrap();
+            query("INSERT INTO o.t VALUES (1)")
+                .execute(&c)
+                .await
+                .unwrap();
+            assert!(
+                c.detach_all().is_err(),
+                "DETACH of a file the transaction wrote"
+            );
+            assert_eq!(
+                c.attached(),
+                vec!["o".to_string()],
+                "a failed detach forgot the alias"
+            );
+        }
+        drop(c);
+        assert!(
+            db.inner.idle.lock().iter().all(|c| c.attached().is_empty()),
+            "a connection with an attachment was pooled"
+        );
     }
 
     /// The pattern that took the libSQL fork down: many connections open at

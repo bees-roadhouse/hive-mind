@@ -186,7 +186,11 @@ bytes, a file applied differently refused rather than reapplied.
   collection tables, the blob catalog and the event log live in it.
   `HIVE_SANDBOX_DATABASE_URL` and the Postgres scripts, service container,
   compose entry and `db-up` go. The whole data tier is now in-process.
-- **Phase 2: one file per owner principal.** The control plane (actors,
+- **Phase 2: one file per owner principal.** (Landed as D39, which
+  narrows this: only the collection tables move, because a trigger cannot
+  reach a table in another file; `entities`, `links`, `mentions` and the
+  events stay central, and the directory is `<stem>-owners/` beside the
+  control plane.) The control plane (actors,
   memberships, credentials, grants, install authorities, installs, builds,
   the blob catalog, runs, chat, workflow state) stays in `hive.db`; what
   an owner's apps store (collection tables, entities, links, mentions,
@@ -292,7 +296,7 @@ Until then the only replica is the daemon's own.
 
 ## Open
 
-- Phase 2's file layout and the central-events question.
+- Phase 2's file layout and the central-events question: closed by D39.
 - Phase 2 reintroduces a second writer per file; the late-commit hazard
   the bus's overlap window guards against becomes reproducible again then,
   and the test that proves the ordering today should be joined by one

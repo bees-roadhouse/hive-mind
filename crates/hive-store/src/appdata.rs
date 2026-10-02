@@ -41,6 +41,7 @@ use crate::appschema::{check_ident, table_name};
 use crate::docblobs::descriptors_in;
 use crate::events::{Event, append_events};
 use crate::grants::{Access, ActingInstall, Reason, Subject};
+use crate::owners::attach_owner;
 use crate::predicate::{self, Args};
 use crate::{Result, Store, StoreError};
 
@@ -262,6 +263,10 @@ struct Target {
     /// standing at all, which is the whole D13 sharing model. Within one
     /// install the entity check governs, as it always has.
     cross: bool,
+    /// The alias the target owner's file is attached under on the connection
+    /// the target was resolved on. The owner is the install's (off its row),
+    /// never the request's.
+    alias: String,
 }
 
 impl DocRequest {
@@ -323,10 +328,12 @@ async fn resolve_target(
 ) -> Result<Target> {
     let q = QualifiedName::parse(raw)?;
     let Some(app) = q.app else {
+        let alias = attach_owner(conn, caller.owner).await?;
         return Ok(Target {
             info: caller.clone(),
             collection: q.collection.to_string(),
             cross: false,
+            alias,
         });
     };
 
@@ -354,10 +361,12 @@ async fn resolve_target(
     // cross-install ... `journal/entries` written by the journal is the same
     // thing as `entries`, and must not need a grant to itself.
     let cross = info.id != caller.id;
+    let alias = attach_owner(conn, info.owner).await?;
     Ok(Target {
         info,
         collection: q.collection.to_string(),
         cross,
+        alias,
     })
 }
 
@@ -377,7 +386,7 @@ impl Target {
     }
 
     fn table(&self) -> String {
-        table_name(&self.info.schema, &self.collection)
+        table_name(&self.alias, &self.info.schema, &self.collection)
     }
 
     /// D33's dimension. Not an `Option`, and that is the point rather than an
@@ -600,28 +609,19 @@ impl AppData {
             .await
             .map_err(|e| StoreError::Host(host_error(e, true)))?;
 
-        let row = self
-            .read_doc(&conn, &target.info, &target.collection, id)
-            .await?;
+        let row = self.read_doc(&conn, &target.table(), id).await?;
         // The response's trust is the ROW's, never the request's. "The caller
         // asked for trusted data, so return Trusted" reads as reasonable and is
         // a laundering machine.
         Ok(Response::with_trust(row.trust, serde_json::to_vec(&row)?))
     }
 
-    async fn read_doc(
-        &self,
-        conn: &Connection,
-        info: &InstallInfo,
-        collection: &str,
-        id: Uuid,
-    ) -> Result<DocRow> {
+    async fn read_doc(&self, conn: &Connection, table: &str, id: Uuid) -> Result<DocRow> {
         let row = query(&format!(
             "SELECT t.id, e.ref, e.kind, t.doc, t.trust, t.tainted_by, t.created_at, t.updated_at
-               FROM {} t
-               JOIN entities e ON e.id = t.id
-              WHERE t.id = ?1 AND e.deleted_at IS NULL",
-            table_name(&info.schema, collection)
+               FROM {table} t
+               JOIN main.entities e ON e.id = t.id
+              WHERE t.id = ?1 AND e.deleted_at IS NULL"
         ))
         .bind(id)
         .fetch_optional(conn)
@@ -897,7 +897,7 @@ impl AppData {
         let sql = format!(
             "SELECT t.id, e.ref, e.kind, t.doc, t.trust, t.tainted_by, t.created_at, t.updated_at
                FROM {} t
-               JOIN entities e ON e.id = t.id
+               JOIN main.entities e ON e.id = t.id
               WHERE e.deleted_at IS NULL
                 AND (?1 = '' OR e.kind = ?1)
                 AND (?2 IS NULL OR (t.created_at, t.id) < (

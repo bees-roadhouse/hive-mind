@@ -1,4 +1,5 @@
-//! The data layer and the grant predicate, over the one database file (D38).
+//! The data layer and the grant predicate, over the control plane file (D38)
+//! and the owner files beside it (D39).
 //!
 //! The single enforcement point for "may this actor do this" (D1.4): no
 //! handler, guest, tool or workflow step composes its own access check, and
@@ -46,6 +47,7 @@ mod grants;
 mod guestblobs;
 mod guestevents;
 mod installs;
+mod owners;
 mod predicate;
 
 pub use actors::{Actor, actor_by_id};
@@ -76,11 +78,15 @@ pub use guestevents::{GuestEvents, platform_kind, visible_to};
 pub use hive_db::{Conn, Connection, Db, Transaction};
 pub use hive_identity::{Credential, Owner, PrincipalKind};
 pub use hive_schema::{
-    AUDIT_MIGRATIONS, MIGRATIONS, MigrateError, Migration, migrate, migrate_audit,
+    AUDIT_MIGRATIONS, MIGRATIONS, MigrateError, Migration, OWNER_MIGRATIONS, migrate,
+    migrate_audit, migrate_owner,
 };
 pub use installs::{
     CAPABILITY_ACTIVATE, InstallSpec, activate_install, grant_install_authority,
     revoke_install_authority, stage_install,
+};
+pub use owners::{
+    OWNERS_DIR_SUFFIX, attach_owner, owner_alias, owner_file, owner_table, owners_dir,
 };
 
 use std::path::Path;

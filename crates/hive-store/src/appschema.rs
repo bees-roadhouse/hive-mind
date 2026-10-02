@@ -11,10 +11,11 @@
 //! gets made (invariant 1, and D21's shape).
 //!
 //! An install's collections are tables named `<schema>__<collection>` in the
-//! one file (D38 phase 1). The schema name is the install's, derived from the
-//! app and the owner, so two installs of one app are two sets of tables
-//! (invariant 14). Phase 2 moves them to the owner's file; the naming is what
-//! stays.
+//! OWNER's file (D39), attached on the caller's connection and addressed
+//! through the alias `attach_owner` returns. The schema name is the
+//! install's, derived from the app and the owner, so two installs of one app
+//! are two sets of tables (invariant 14); the file is the owner's, so two
+//! owners of one app are two files.
 //!
 //! Nothing in here interpolates a string that came from a manifest without
 //! having been through `parse_index` or the identifier check below. A manifest
@@ -22,8 +23,10 @@
 //! and quoting at this end is the last line rather than the only one.
 
 use hive_db::{Connection, query, quote_ident, quote_literal};
+use hive_identity::Owner;
 use hive_manifest::{CollectionPlan, Index, IndexMethod, SchemaPlan};
 
+use crate::owners::{attach_owner, owner_table};
 use crate::{Result, StoreError};
 
 /// The bound a derived name must fit in. The engine has no limit of its own;
@@ -38,10 +41,16 @@ const MAX_IDENTIFIER: usize = 63;
 /// It runs inside the caller's transaction, so a failed install leaves nothing
 /// behind, and it never commits ... registering an install and provisioning its
 /// storage are one unit of work or they are tables nobody owns.
-pub async fn apply_schema_plan(tx: &Connection, plan: &SchemaPlan) -> Result<()> {
+pub async fn apply_schema_plan(tx: &Connection, owner: Owner, plan: &SchemaPlan) -> Result<()> {
     check_ident(&plan.schema)?;
     for c in &plan.collections {
-        apply_collection(tx, &plan.schema, c).await?;
+        check_ident(&c.name)?;
+    }
+    // After every name is checked and before any DDL: a refused plan attaches
+    // nothing and creates no file.
+    let alias = attach_owner(tx, owner).await?;
+    for c in &plan.collections {
+        apply_collection(tx, &alias, &plan.schema, c).await?;
     }
     Ok(())
 }
@@ -50,19 +59,21 @@ pub async fn apply_schema_plan(tx: &Connection, plan: &SchemaPlan) -> Result<()>
 /// catalogue rather than taken from the plan, so a collection a later manifest
 /// dropped is removed too. Per-install prefixes exist so that the blast radius
 /// of a bad app is exactly this (D3.2).
-pub async fn drop_schema_plan(tx: &Connection, plan: &SchemaPlan) -> Result<()> {
+pub async fn drop_schema_plan(tx: &Connection, owner: Owner, plan: &SchemaPlan) -> Result<()> {
     check_ident(&plan.schema)?;
+    let alias = attach_owner(tx, owner).await?;
     let prefix = format!("{}__", plan.schema);
-    let tables: Vec<String> = query(
-        "SELECT name FROM sqlite_master
+    let tables: Vec<String> = query(&format!(
+        "SELECT name FROM {}.sqlite_master
           WHERE type = 'table' AND substr(name, 1, length(?1)) = ?1",
-    )
+        quote_ident(&alias)
+    ))
     .bind(&prefix)
     .fetch_scalars(tx)
     .await
     .map_err(|e| StoreError::db(format!("list tables of {}", plan.schema), e))?;
     for t in tables {
-        query(&format!("DROP TABLE IF EXISTS {}", quote_ident(&t)))
+        query(&format!("DROP TABLE IF EXISTS {}", owner_table(&alias, &t)))
             .execute(tx)
             .await
             .map_err(|e| StoreError::db(format!("drop table {t}"), e))?;
@@ -72,9 +83,18 @@ pub async fn drop_schema_plan(tx: &Connection, plan: &SchemaPlan) -> Result<()> 
 
 /// Creates one collection's table, its updated_at trigger and its indexes. The
 /// table shape is the same for every collection and is not the app's to choose.
-async fn apply_collection(tx: &Connection, schema: &str, c: &CollectionPlan) -> Result<()> {
+async fn apply_collection(
+    tx: &Connection,
+    alias: &str,
+    schema: &str,
+    c: &CollectionPlan,
+) -> Result<()> {
     check_ident(&c.name)?;
-    let table = table_name(schema, &c.name);
+    let table = table_name(alias, schema, &c.name);
+    // Inside a trigger body a qualified name is refused by the engine (D39
+    // measurement 3); the trigger lives in the owner's file, so the bare
+    // name resolves there.
+    let bare = quote_ident(&format!("{schema}__{}", c.name));
 
     // There is deliberately no owner pair and no author here.
     //
@@ -117,15 +137,16 @@ async fn apply_collection(tx: &Connection, schema: &str, c: &CollectionPlan) -> 
     // cannot rewrite NEW in a BEFORE trigger, so this fires AFTER and only when
     // the writer left the column alone.
     let trigger = derived_ident(&format!("{schema}__{}", c.name), "_touch")?;
+    let trigger = format!("{}.{trigger}", quote_ident(alias));
     query(&format!("DROP TRIGGER IF EXISTS {trigger}"))
         .execute(tx)
         .await
         .map_err(|e| StoreError::db(format!("drop touch trigger on {schema}__{}", c.name), e))?;
     query(&format!(
-        "CREATE TRIGGER {trigger} AFTER UPDATE OF doc, trust, tainted_by ON {table}
+        "CREATE TRIGGER {trigger} AFTER UPDATE OF doc, trust, tainted_by ON {bare}
          WHEN NEW.updated_at IS OLD.updated_at
          BEGIN
-             UPDATE {table} SET updated_at = {now} WHERE id = NEW.id;
+             UPDATE {bare} SET updated_at = {now} WHERE id = NEW.id;
          END",
         now = hive_db::NOW_SQL
     ))
@@ -134,13 +155,14 @@ async fn apply_collection(tx: &Connection, schema: &str, c: &CollectionPlan) -> 
     .map_err(|e| StoreError::db(format!("create touch trigger on {schema}__{}", c.name), e))?;
 
     for (i, idx) in c.indexes.iter().enumerate() {
-        apply_index(tx, schema, &c.name, &table, i, idx).await?;
+        apply_index(tx, alias, schema, &c.name, &bare, i, idx).await?;
     }
     Ok(())
 }
 
 async fn apply_index(
     tx: &Connection,
+    alias: &str,
     schema: &str,
     collection: &str,
     table: &str,
@@ -150,11 +172,13 @@ async fn apply_index(
     let expr = doc_path(idx)?;
     // The index name is derived rather than taken from the manifest, so two
     // apps cannot argue about it and an app cannot name one after something
-    // that already exists.
+    // that already exists. It is created in the owner's file, where the
+    // table is; `table` is the bare name, which the engine resolves there.
     let name = derived_ident(
         &format!("{schema}__{collection}"),
         &format!("_{}_{ordinal}_idx", idx.method),
     )?;
+    let name = format!("{}.{name}", quote_ident(alias));
     let stmt = match idx.method {
         // An expression index over the JSON path: what an equality or a range
         // on that path uses.
@@ -190,9 +214,10 @@ async fn apply_index(
     Ok(())
 }
 
-/// The quoted table name for a collection: `"<schema>__<collection>"`.
-pub(crate) fn table_name(schema: &str, collection: &str) -> String {
-    quote_ident(&format!("{schema}__{collection}"))
+/// The qualified, quoted table name for a collection in the owner's file:
+/// `"<alias>"."<schema>__<collection>"`.
+pub(crate) fn table_name(alias: &str, schema: &str, collection: &str) -> String {
+    owner_table(alias, &format!("{schema}__{collection}"))
 }
 
 /// Builds the JSON accessor for an index path. The `->` and `->>` operators
@@ -284,7 +309,10 @@ mod tests {
         let base = format!("{}__{}", "s".repeat(63), "c".repeat(63));
         assert!(derived_ident(&base, "_touch").is_err());
         assert_eq!(derived_ident("c", "_touch").unwrap(), "\"c_touch\"");
-        assert_eq!(table_name("app_1", "entries"), "\"app_1__entries\"");
+        assert_eq!(
+            table_name("o_user_ab", "app_1", "entries"),
+            "\"o_user_ab\".\"app_1__entries\""
+        );
     }
 
     #[test]

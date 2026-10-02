@@ -28,9 +28,10 @@ cargo fetch
 
 There is nothing to bring up. The store is SQLite (D38): the daemon keeps two
 files under `--data-dir` (`hive.db` and `hive-audit.db`), creates them on first
-boot and migrates them on every boot, and every integration test makes a
-private pair of its own under the temp directory and deletes them on the way
-out. `HIVE_SANDBOX_TEST_DB_DIR` moves that directory if the temp directory is
+boot and migrates them on every boot, and a file per owner under
+`hive-owners/` beside them for what that owner's apps store (D39), created on
+first use. Every integration test makes a private set of its own under the
+temp directory and deletes them on the way out. `HIVE_SANDBOX_TEST_DB_DIR` moves that directory if the temp directory is
 the wrong place (a RAM disk, a slower disk you want to keep off).
 
 `cargo test --workspace` therefore runs every database test on a bare machine.
@@ -106,6 +107,12 @@ Three things worth knowing before you write a store test:
   has to survive the rollback of the transaction that caused it, and a second
   connection on the same file would wait on the caller's lock forever. Read it
   through `TestDb::audit()`, not `db()`.
+- **A collection table is in the owner's file**, not the control plane. To
+  look at one, attach the owner on your connection and address the table
+  through the alias: `let alias = attach_owner(&conn, owner).await?;` then
+  `owner_table(&alias, "app_x_1234__entries")`, or `"<alias>".sqlite_master`
+  for the catalogue. An unqualified name resolves to the control plane and
+  finds nothing.
 
 `crates/hive-store/tests/invariants.rs` is the reference: the invariant tests
 were written against the migrations alone, before any Rust behaviour existed,

@@ -106,12 +106,13 @@ projects). The criteria, which outlive the pick:
   `RAISE`, WAL with two connections. (Two connections. The probe that
   found the crash opened sixteen.)
 
-What it costs, accepted: `libsql-ffi` compiles the C amalgamation into the
-binary. D24's rule was "a host with no `unsafe` cannot smuggle a native
-library in"; the rule on *this repository's code* stands unchanged
-(`unsafe_code = "forbid"` at the workspace), and the database engine is
-the one native library the host is now built around rather than one
-smuggled past the rule. The sqlx pick, and the TLS reasoning behind it,
+What it costs, accepted (and unchanged by the engine swap, since
+`rusqlite`'s bundled build does the same thing): the C amalgamation is
+compiled into the binary. D24's rule was "a host with no `unsafe` cannot
+smuggle a native library in"; the rule on *this repository's code* stands
+unchanged (`unsafe_code = "forbid"` at the workspace), and the database
+engine is the one native library the host is now built around rather than
+one smuggled past the rule. The sqlx pick, and the TLS reasoning behind it,
 go with Postgres.
 
 ### 2. Policy stays in the database; the predicate text moves into the store
@@ -230,17 +231,45 @@ Until then the only replica is the daemon's own.
 ### 7. What the engine change makes true operationally
 
 - **Every database test runs everywhere.** `hive_testdb::TestDb` hands each
-  test a private file in a temp directory and deletes it on the way out.
-  No Podman, no service container, no environment variable: the "database
-  line is not optional" rule and the `SKIPPED:` lines it guarded are gone
-  because the precondition they guarded is gone. The named-skip rule
-  stays for the tiers that still have one (containers, Garage, chromium).
+  test a private pair of files in a temp directory and deletes them on the
+  way out. No Podman, no service container, no environment variable: the
+  "database line is not optional" rule and the `SKIPPED:` lines it guarded
+  are gone because the precondition they guarded is gone. The named-skip
+  rule stays for the tiers that still have one (containers, Garage,
+  chromium).
 - CI loses the Postgres service; the stack compose loses its database
-  container and its init dump; the daemon image needs a writable
-  `--data-dir` and nothing else.
+  container, its backup job and its init dump; the daemon image needs a
+  writable `--data-dir` (`HIVE_SANDBOX_DATA_DIR`) and nothing else. A
+  backup is a copy of that directory with the daemon stopped, or `sqlite3
+  hive.db ".backup out.db"` while it runs.
+- **The bell is in-process.** `hive_store::event_wake()` replaces NOTIFY:
+  rung once per `append_events`, forwarded by the bus's listener task,
+  counted so a test can prove a delivery came from a ring. A writer in
+  another process cannot ring it; its rows arrive by the backstop poll,
+  and the e2e suite writes events that way (through `node:sqlite`, no
+  native module) because that is invariant 4 stated the hard way.
+- **One writer at a time changes what the overlap window is for.** With
+  every write under `BEGIN IMMEDIATE`, a second append cannot start until
+  the first commits, so a lower id cannot commit late on the primary; the
+  bus test that used to arrange that hazard now proves the ordering
+  instead. The window and the dedupe set stay for phase 2 (a second
+  process on a file) and phase 3 (a replica receiving frames late).
+- **The override audit is a second file** (`hive-audit.db`, its own
+  migration directory). It has to outlive the rollback of the transaction
+  that caused it, and a second connection on the same file waits on the
+  caller's write lock forever; a second file does not.
+- `Db::close` refuses every later checkout, which is what the readiness
+  probe's and the credential resolver's "store is gone" tests needed in
+  place of closing a Postgres pool.
+- The daemon's own boot path (`Store::open`) was the one path no Rust test
+  covered, and the e2e suite found it refusing to boot on a ping written
+  as a statement; it has a test of its own now
+  (`crates/hive-store/tests/open.rs`).
 - `docs/development.md`, `CLAUDE.md`, `README.md`, `docs/events-tailing.md`
   and the schema's own comments are rewritten with this change rather
   than after it, because `hive-repodocs` pins the phrases that moved.
+- The unix socket and its tests are gated to unix hosts, so the daemon
+  builds and the e2e suite runs on Windows; CI is where those tests run.
 
 ## What lost
 
@@ -264,6 +293,10 @@ Until then the only replica is the daemon's own.
 ## Open
 
 - Phase 2's file layout and the central-events question.
+- Phase 2 reintroduces a second writer per file; the late-commit hazard
+  the bus's overlap window guards against becomes reproducible again then,
+  and the test that proves the ordering today should be joined by one
+  that arranges the hazard across two processes.
 - (Closed the same day.) Whether `hive-db` keeps a connection pool: it
   does, bounded, checkout semantics, a connection mid-transaction closed
   rather than returned. See §1 for what measured it.

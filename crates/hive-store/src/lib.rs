@@ -211,10 +211,15 @@ impl Store {
             .map_err(|e| StoreError::db("open audit", e))?;
         for d in [&db, &audit] {
             let c = d.conn().await.map_err(|e| StoreError::db("connect", e))?;
-            hive_db::query("SELECT 1")
-                .execute(&c)
+            // A query, not a statement: the engine refuses to `execute` a
+            // SELECT, and the e2e suite is where that was found.
+            let one: i64 = hive_db::query("SELECT 1")
+                .fetch_scalar(&c)
                 .await
                 .map_err(|e| StoreError::db("ping", e))?;
+            if one != 1 {
+                return Err(StoreError::Other(format!("ping answered {one}")));
+            }
         }
         Ok(Store::from_dbs(db, audit))
     }

@@ -13,26 +13,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The born-green gate: the same script a laptop runs, against the same shape
-  # of Postgres. scripts/gate-rust.sh refuses without a database, names every
-  # test that skipped.
+  # The born-green gate: the same script a laptop runs. The store is SQLite
+  # (D38), so every database test makes its own files and nothing is
+  # provisioned here; scripts/gate-rust.sh names every test that skipped.
   gate:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg17
-        env:
-          POSTGRES_USER: hive
-          POSTGRES_PASSWORD: hive
-          POSTGRES_DB: hive_sandbox_test
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U hive"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    env:
-      HIVE_SANDBOX_TEST_DATABASE_URL: postgres://hive:hive@localhost:5432/hive_sandbox_test
     steps:
       - uses: actions/checkout@v4
 
@@ -45,44 +30,16 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Mirrors what scripts/db-up.sh does locally. Extensions live in their own
-      # schema so `public` stays empty and a test's private schema is the only
-      # thing on its search path; migration one creates no extensions.
-      - name: provision extensions schema
-        env:
-          PGPASSWORD: hive
-        run: |
-          psql -h localhost -U hive -d hive_sandbox_test -v ON_ERROR_STOP=1 \
-            -c "CREATE SCHEMA IF NOT EXISTS extensions" \
-            -c "CREATE EXTENSION IF NOT EXISTS vector SCHEMA extensions"
-
       - name: gate
         run: ./scripts/gate-rust.sh
 
   # Separate from `gate` on purpose: this job downloads a ~115 MB browser, and a
-  # lint failure should not wait behind it. The daemon serves /events off
-  # Postgres, so the browser specs need one.
+  # lint failure should not wait behind it. Each Playwright worker gives its
+  # daemon a store directory of its own, so workers cannot see each other's
+  # events; these specs assert on what a stream did NOT deliver, and a stray
+  # event would look like a filter bug.
   e2e:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg17
-        env:
-          POSTGRES_USER: hive
-          POSTGRES_PASSWORD: hive
-          POSTGRES_DB: hive_sandbox_test
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U hive"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    env:
-      # Each Playwright worker creates its own schema on this database and
-      # drops it afterwards, so workers cannot see each other's events. These
-      # specs assert on what a stream did NOT deliver, and a stray event would
-      # look like a filter bug.
-      HIVE_SANDBOX_TEST_DATABASE_URL: postgres://hive:hive@localhost:5432/hive_sandbox_test
     steps:
       - uses: actions/checkout@v4
 
@@ -97,14 +54,6 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: test/e2e/package-lock.json
-
-      - name: provision extensions schema
-        env:
-          PGPASSWORD: hive
-        run: |
-          psql -h localhost -U hive -d hive_sandbox_test -v ON_ERROR_STOP=1 \
-            -c "CREATE SCHEMA IF NOT EXISTS extensions" \
-            -c "CREATE EXTENSION IF NOT EXISTS vector SCHEMA extensions"
 
       # Built here rather than in globalSetup so the cargo cache above covers
       # it and a compile error reads as a build failure, not a Playwright one.
@@ -239,21 +188,7 @@ jobs:
   # service container, so the script developers depend on is itself under test.
   blobstore:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg17
-        env:
-          POSTGRES_USER: hive
-          POSTGRES_PASSWORD: hive
-          POSTGRES_DB: hive_sandbox_test
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U hive"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
-      HIVE_SANDBOX_TEST_DATABASE_URL: postgres://hive:hive@localhost:5432/hive_sandbox_test
       # ubuntu-latest ships both; pin the one whose compose is known-good here
       # rather than letting the script's provider detection decide per-runner.
       HIVE_SANDBOX_COMPOSE: "docker compose"
@@ -265,14 +200,6 @@ jobs:
           toolchain: "1.98.1"
 
       - uses: Swatinem/rust-cache@v2
-
-      - name: provision extensions schema
-        env:
-          PGPASSWORD: hive
-        run: |
-          psql -h localhost -U hive -d hive_sandbox_test -v ON_ERROR_STOP=1 \
-            -c "CREATE SCHEMA IF NOT EXISTS extensions" \
-            -c "CREATE EXTENSION IF NOT EXISTS vector SCHEMA extensions"
 
       # --quiet prints exactly four lines: endpoint, bucket, key id, secret.
       # The key is minted by this Garage seconds ago and dies with the runner.

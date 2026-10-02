@@ -63,8 +63,10 @@ test('events written by another process reach a live browser subscriber', async 
   });
   await waitForSSEOpen(page);
 
-  // Written straight to Postgres, so what this proves is that the events table
-  // is the transport rather than the daemon being a message broker.
+  // Written straight to the store file, so what this proves is that the
+  // events table is the transport rather than the daemon being a message
+  // broker. Another process cannot ring the daemon's bell (D38), so these
+  // arrive by the backstop poll, within its interval.
   await events.append('journal.entry.created', { title: 'first' });
   await events.append('journal.entry.updated', { title: 'second' });
 
@@ -93,7 +95,7 @@ test('a consumer still catches up when every notification is dropped', async ({
 
   // Invariant 4, the half that is easy to write and easy to never test: the
   // events table is the transport and NOTIFY is only a wakeup bell. This row
-  // is committed with no pg_notify at all, so the only thing that can deliver
+  // is committed with nothing rung at all, so the only thing that can deliver
   // it is the backstop poll.
   await events.appendWithoutNotify('silent.write', { quiet: true });
 
@@ -136,9 +138,9 @@ test('reconnecting resumes from a cursor without the browser being told how', as
   await events.append('seed.c', { n: 3 });
   await events.append('seed.d', { n: 4 });
 
-  // A bare row id is an accepted cursor, precisely so a client written before
-  // the events table was partitioned can still resume. The daemon resolves it
-  // to a real position with one lookup on connect.
+  // A bare row id is an accepted cursor, precisely so a client holding one
+  // from before the cursor grew its time half can still resume. The daemon
+  // resolves it to a real position with one lookup on connect.
   const got = await collectSSE(page, `${daemon.url}${streamPath}?last_event_id=${cursorSource}`, {
     types: ['seed.c', 'seed.d'],
     count: 2,

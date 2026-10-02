@@ -1,6 +1,6 @@
 [package]
 name = "hive-webui"
-description = "The browser client, a Solid.js build embedded in the daemon and served at / under a strict CSP"
+description = "The browser client's static assets (stylesheet, vendored htmx, two scripts), embedded in the daemon and served under /assets/ under a strict CSP"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true

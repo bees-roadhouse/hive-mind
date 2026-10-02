@@ -8,7 +8,7 @@ From nothing to a passing test suite. Assumes you have none of this installed.
 | ------------------- | -------------------------------------------- | -------------------------------------- | ------------------------------------------ |
 | **Rust** via rustup | the daemon; `rust-toolchain.toml` pins 1.98 with clippy and rustfmt, rustup installs it on first `cargo` | https://rustup.rs | `winget install Rustlang.Rustup` |
 | **`wasm32-wasip1`** | building guests (`rustup target add wasm32-wasip1`); not needed to run the tests, the built guests are checked in | same | same |
-| **Podman 5+**       | local Postgres (Docker works too); the harness and egress tiers | `brew install podman` / your package manager | `winget install RedHat.Podman-Desktop` |
+| **Podman 5+**       | the harness, egress and blob-store tiers only (Docker works too); the store is SQLite files and needs nothing | `brew install podman` / your package manager | `winget install RedHat.Podman-Desktop` |
 | **Node 20+**        | the Playwright suite only | `brew install node` / nvm | `winget install OpenJS.NodeJS.LTS` |
 
 One PATH note that has already bitten someone: rustup installs to
@@ -24,43 +24,18 @@ cd hive-mind
 cargo fetch
 ```
 
-## Bring up Postgres
+## The store
 
-```bash
-./scripts/db-up.sh
-```
+There is nothing to bring up. The store is SQLite (D38): the daemon keeps two
+files under `--data-dir` (`hive.db` and `hive-audit.db`), creates them on first
+boot and migrates them on every boot, and every integration test makes a
+private pair of its own under the temp directory and deletes them on the way
+out. `HIVE_SANDBOX_TEST_DB_DIR` moves that directory if the temp directory is
+the wrong place (a RAM disk, a slower disk you want to keep off).
 
-```powershell
-.\scripts\db-up.ps1
-```
-
-Starts `pgvector/pgvector:pg17` on **127.0.0.1:55432**, waits until it can
-actually answer `select 1` (a listening port is not readiness: during initdb the
-server accepts connections and then restarts), creates `hive_sandbox_test` if it
-is missing, and prints both connection strings. Run it as often as you like ...
-it is idempotent.
-
-Port 55432 is deliberate. The maintainer's box runs other Postgres containers
-on 5432, 55433 and 55434 (`nectar-p3-pg` took 55432 for a while, which is how
-a session ended up with its own database on 55434); colliding with any of them
-would be a confusing way to lose data. If 55432 is taken on your machine, the
-compose file and `db-up` name the port in one place each.
-
-Export the URL so integration tests use it:
-
-```bash
-export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
-```
-
-```powershell
-$env:HIVE_SANDBOX_TEST_DATABASE_URL = .\scripts\db-up.ps1 -Quiet
-```
-
-**Without that variable set, integration tests skip themselves rather than
-fail**, and each one prints `SKIPPED: <name> <why>` so the gate can name it.
-`cargo test --workspace` is green on a machine with no database on purpose ...
-the unit tests have to run anywhere ... and that is exactly why the gate
-refuses to run without the variable.
+`cargo test --workspace` therefore runs every database test on a bare machine.
+The tiers that still skip without a backend (Podman, Garage, chromium) print
+`SKIPPED: <name> <why>` so the gate can name them.
 
 ## Run the gate
 
@@ -70,7 +45,8 @@ refuses to run without the variable.
 
 `cargo fmt --check`, `cargo clippy -D warnings`, `cargo build --all-targets`,
 `cargo test --workspace`, then a named list of every test that printed
-`SKIPPED:`. It prints `GATE GREEN` or `GATE RED: <steps>`.
+`SKIPPED:`. It prints `GATE GREEN` or `GATE RED: <steps>`. Nothing has to be
+running first.
 
 Read the output, not an exit code. A piped `| tail` or a chained `&&` reports
 the status of the last thing in the pipe, which is how a red gate gets pushed.
@@ -102,44 +78,34 @@ while the desktop was swapping and its owner was mid-game. The rule:
 
 ## Write an integration test
 
-`crates/hive-testdb` hands each test a `PgPool` bound to its own empty schema,
-dropped when the test ends. No shared fixture and no ordering between tests.
+`crates/hive-testdb` hands each test a migrated store of its own: a `Db` for
+the main file and one for the override audit file, both deleted when the
+`TestDb` drops. No shared fixture and no ordering between tests.
 
 ```rust
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thing() {
-    // Prints SKIPPED: and returns when HIVE_SANDBOX_TEST_DATABASE_URL is unset.
-    let Some(db) = TestDb::new("thing").await else { return };
-    hive_store::migrate(db.pool()).await.unwrap();
+    let db = TestDb::new("thing").await;
+    let store = Store::from_dbs(db.db().clone(), db.audit().clone());
     ...
 }
 ```
 
-Unqualified DDL lands in the private schema. The search path is that schema plus
-`extensions`, and **not** `public`: pgvector is relocatable, so extension types
-live in their own schema and `public` stays empty. There is no shared schema for
-one test to reach another through.
+Three things worth knowing before you write a store test:
 
-`db-up` creates the `extensions` schema and installs `vector` into it. That is
-provisioning rather than migration one, because it is the only step needing
-rights the migration role does not have.
-
-Two things worth knowing before you write a store test:
-
-- **The database is shared across tests, only the schema is private.** Anything
-  database-scoped ... `DROP SCHEMA public`, `CREATE EXTENSION`, a role change
-  ... is not isolated and will follow every test that runs after it.
-- **A test that ends without awaiting can strand a connection.** sqlx returns a
-  pooled connection on a spawned task; a test that returns synchronously right
-  after a query leaves that task unpolled with a transaction open, and the next
-  `DROP SCHEMA` waits on it forever. `TestDb` terminates its own sessions
-  before dropping the schema, so this shows up as a slow teardown rather than a
-  hang, but the fix is still to await what you started.
-- **Await store and migration futures on the calling task.** Some sqlx-heavy
-  futures cannot be proven `Send` (rust-lang/rust#100013), so `tokio::spawn`
-  refuses them with "implementation of `Send` is not general enough". Run them
-  where they are, or `join_all` them; the crates that hit this document it on
-  the function.
+- **Drop the `TestDb` last.** Its drop deletes the files, and on Windows a file
+  with an open handle cannot be deleted. Declare it as the last field of a
+  fixture, after every `Store`, `Catalog` or `Bus` that holds a pooled
+  connection, so the connections close first.
+- **One writer at a time.** A `Transaction` is `BEGIN IMMEDIATE` and holds the
+  file's write lock until it commits or drops; a second writer waits (up to the
+  busy timeout, ten seconds) rather than failing. A test that opens a
+  transaction and then calls a store function on another connection is waiting
+  on itself.
+- **The override audit is a second file** (`hive-audit.db`), because its row
+  has to survive the rollback of the transaction that caused it, and a second
+  connection on the same file would wait on the caller's lock forever. Read it
+  through `TestDb::audit()`, not `db()`.
 
 `crates/hive-store/tests/invariants.rs` is the reference: the invariant tests
 were written against the migrations alone, before any Rust behaviour existed,
@@ -160,11 +126,9 @@ memory:
 
 - Rust lives at `~/.cargo/bin`, which a Claude shell does not have on `PATH`.
   `export PATH="$HOME/.cargo/bin:$PATH"` first.
-- The test database is the podman container `hive-sandbox-pg-rust` on
-  **55434** (user and database `hive_sandbox`), because `nectar-p3-pg` holds
-  the 55432 that `db-up.sh` uses. It does not autostart: `podman start
-  hive-sandbox-pg-rust` after a reboot. Read the password from the container
-  (`podman inspect ... Config.Env`); never type it into a transcript.
+- There is no test database to start any more (D38): the tests write their
+  store files under the temp directory. The `hive-sandbox-pg-rust` container
+  from the Postgres era can be removed.
 - **The box dies on disk, not CPU.** Three sessions linking Rust at once on the
   single LUKS NVMe froze the desktop with the CPU half idle. Pinning cargo to
   four cores was the wrong dimension. The rule: one cargo at a time across
@@ -200,9 +164,10 @@ ephemeral port per worker, and shuts it down after. Nothing to start by hand and
 no fixed port to collide with. `HIVE_SANDBOX_E2E_BINARY` points it at a binary
 built elsewhere.
 
-It **does** need Postgres ... export `HIVE_SANDBOX_TEST_DATABASE_URL` exactly as
-for the Rust tests. Every worker creates its own schema on that database and
-drops it afterwards, and the daemon migrates into it.
+It needs nothing else running. Every worker gives its daemon a store directory
+of its own under the temp directory and deletes it afterwards; the specs write
+events into that file with `node:sqlite`, so there is no native module to
+build either.
 
 Debugging:
 

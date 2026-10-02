@@ -139,9 +139,9 @@ runs spend money and are at-most-once.
 
 ## The seam for the run record
 
-`RunStore` is the seam; `hive_store::AgentRunStore` implements it over Postgres
-and `MemoryStore` implements it for tests, so the wiring is one constructor
-call either way.
+`RunStore` is the seam; `hive_store::AgentRunStore` implements it over the
+store and `MemoryStore` implements it for tests, so the wiring is one
+constructor call either way.
 
 ```rust
 #[async_trait]

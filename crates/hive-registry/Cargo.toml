@@ -1,6 +1,6 @@
 [package]
 name = "hive-registry"
-description = "Manifest + module + Postgres = an installed app. Where a claim meets its evidence"
+description = "Manifest + module + the store = an installed app. Where a claim meets its evidence"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true

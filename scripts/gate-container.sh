@@ -49,21 +49,9 @@ if [ "$rebuild" -eq 1 ] || ! podman image exists "$image"; then
   fi
 fi
 
-# A database is as mandatory here as it is on the host: the gate refuses
-# without one, and the whole point of that refusal is that it cannot be worked
-# around by changing how the gate is invoked.
-url="${HIVE_SANDBOX_TEST_DATABASE_URL:-}"
-if [ -z "$url" ]; then
-  echo "==> no HIVE_SANDBOX_TEST_DATABASE_URL; bringing the database up"
-  url=$(./scripts/db-up.sh --quiet)
-  if [ -z "$url" ]; then
-    echo "could not start a database. Run ./scripts/db-up.sh and read its output." >&2
-    exit 1
-  fi
-fi
-
-# --network=host so 127.0.0.1:55432 means the same thing inside the container
-# as outside it, and the connection string needs no rewriting.
+# --network=host so 127.0.0.1:53900 (Garage, for the blob driver tier) means
+# the same thing inside the container as outside it. The store needs no
+# network at all: it is SQLite files under the container's temp directory.
 #
 # --security-opt label=disable rather than a :z/:Z mount: SELinux is enforcing
 # on the maintainer's box, and relabelling somebody's git checkout as a side
@@ -83,7 +71,6 @@ podman run --rm \
   -v "$PWD/$cache/registry:/usr/local/cargo/registry" \
   -v "$PWD/$cache/git:/usr/local/cargo/git" \
   -v "$PWD/$cache/target:/src/target" \
-  -e HIVE_SANDBOX_TEST_DATABASE_URL="$url" \
   -e HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS="${HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS:-}" \
   -e CARGO_HOME=/usr/local/cargo \
   -w /src \

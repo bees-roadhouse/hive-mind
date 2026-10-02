@@ -28,7 +28,7 @@ RUN cargo build --release -p hive-sandbox \
 # --- runtime -----------------------------------------------------------------
 # Distroless cc: glibc and libgcc, no shell, no package manager, nothing to
 # pivot to. That is worth more here than in the egress image, because this
-# process holds the database credential. cc rather than static because the
+# process holds every credential in the store. cc rather than static because the
 # binary links glibc dynamically; everything else (TLS included) is Rust.
 #
 # It also means there is no `curl` and no `wget` for a HEALTHCHECK to call. The
@@ -52,9 +52,10 @@ LABEL org.beesroadhouse.hive-sandbox.component=daemon
 # egress image's whole job, and it runs on the per-run internal network where
 # this one has no business being.
 #
-# The database URL arrives at run time as HIVE_SANDBOX_DATABASE_URL. There is no
-# default: a daemon that silently came up against the wrong database would be
-# worse than one that refuses to start, and main.rs already refuses.
+# The store's directory arrives at run time as HIVE_SANDBOX_DATA_DIR, on a
+# mounted volume the nonroot user can write. There is no default: a daemon that
+# silently came up against an empty store in the image's own filesystem would
+# be worse than one that refuses to start, and main.rs already refuses.
 ENTRYPOINT ["/usr/local/bin/hive-sandbox", \
             "--serve-api=true", \
             "--run-workflows=true", \

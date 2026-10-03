@@ -308,6 +308,8 @@ const DOMAINS: &[(&str, &[&str])] = &[
     // trust, which is why it is its own capability domain and why an
     // ordinary app cannot link it.
     ("hive_sanitize", &["sanitize"]),
+    // Asking a local model: a job in, a result out (D42).
+    ("hive_models", &["submit", "result"]),
 ];
 
 /// Registers every domain a manifest can grant. Which ones a given guest may
@@ -347,6 +349,8 @@ async fn dispatch(
         ("hive_blob", "append") => deps.blob.append(req).await,
         ("hive_events", "emit") => deps.events.emit(req).await,
         ("hive_sanitize", "sanitize") => deps.sanitizer.sanitize(req).await,
+        ("hive_models", "submit") => deps.models.submit(req).await,
+        ("hive_models", "result") => deps.models.result(req).await,
         _ => Err(AbiError::error(format!(
             "{module}.{verb}: no such host function"
         ))),

@@ -70,16 +70,19 @@ pub enum Capability {
     /// The only capability that can raise trust, which is why it is a
     /// capability at all rather than something a guest asserts.
     Sanitize,
+    /// Asking a local model (D42): submit a job, read its result.
+    Models,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 7] = [
         Capability::Log,
         Capability::Storage,
         Capability::Kv,
         Capability::Blob,
         Capability::Events,
         Capability::Sanitize,
+        Capability::Models,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -90,6 +93,7 @@ impl Capability {
             Capability::Blob => "blob",
             Capability::Events => "events",
             Capability::Sanitize => "sanitize",
+            Capability::Models => "models",
         }
     }
 
@@ -104,6 +108,7 @@ impl Capability {
             "blob" => Some(Capability::Blob),
             "events" => Some(Capability::Events),
             "sanitize" => Some(Capability::Sanitize),
+            "models" => Some(Capability::Models),
             _ => None,
         }
     }
@@ -117,6 +122,7 @@ impl Capability {
             Capability::Blob => "hive_blob",
             Capability::Events => "hive_events",
             Capability::Sanitize => "hive_sanitize",
+            Capability::Models => "hive_models",
         }
     }
 
@@ -136,6 +142,7 @@ impl Capability {
             Capability::Blob => 1 << 3,
             Capability::Events => 1 << 4,
             Capability::Sanitize => 1 << 5,
+            Capability::Models => 1 << 6,
         }
     }
 }
@@ -481,6 +488,15 @@ pub trait Sanitizer: Send + Sync {
 /// Everything the host functions need from the rest of the daemon. The default
 /// is every stub, so the runtime stands up and runs guests before the store
 /// exists; a stub answers `Status::Unimplemented` and never a crash.
+/// The local model seam (D42): `submit` writes a job the worker answers,
+/// `result` reads it back. Every result is untrusted; the implementation
+/// resolves a blob input through the caller's references.
+#[async_trait]
+pub trait Models: Send + Sync {
+    async fn submit(&self, req: Request) -> Result<Response, HostError>;
+    async fn result(&self, req: Request) -> Result<Response, HostError>;
+}
+
 #[derive(Clone)]
 pub struct Deps {
     pub storage: Arc<dyn Storage>,
@@ -488,6 +504,7 @@ pub struct Deps {
     pub blob: Arc<dyn Blob>,
     pub events: Arc<dyn Events>,
     pub sanitizer: Arc<dyn Sanitizer>,
+    pub models: Arc<dyn Models>,
 }
 
 impl Default for Deps {
@@ -498,6 +515,7 @@ impl Default for Deps {
             blob: Arc::new(Stub),
             events: Arc::new(Stub),
             sanitizer: Arc::new(Stub),
+            models: Arc::new(Stub),
         }
     }
 }
@@ -521,6 +539,10 @@ impl Deps {
     }
     pub fn with_sanitizer(mut self, s: Arc<dyn Sanitizer>) -> Self {
         self.sanitizer = s;
+        self
+    }
+    pub fn with_models(mut self, s: Arc<dyn Models>) -> Self {
+        self.models = s;
         self
     }
 }
@@ -585,6 +607,16 @@ impl Events for Stub {
 impl Sanitizer for Stub {
     async fn sanitize(&self, _: Request) -> Result<Response, HostError> {
         Err(HostError::unimplemented("sanitize"))
+    }
+}
+
+#[async_trait]
+impl Models for Stub {
+    async fn submit(&self, _: Request) -> Result<Response, HostError> {
+        Err(HostError::unimplemented("models.submit"))
+    }
+    async fn result(&self, _: Request) -> Result<Response, HostError> {
+        Err(HostError::unimplemented("models.result"))
     }
 }
 

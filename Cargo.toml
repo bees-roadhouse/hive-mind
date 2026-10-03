@@ -24,6 +24,7 @@ members = [
     "crates/hive-harness",
     "crates/hive-egress",
     "crates/hive-chat",
+    "crates/hive-models",
     "crates/hive-webui",
     "crates/hive-httpapi",
     "crates/hive-repodocs",
@@ -78,7 +79,7 @@ axum = { version = "0.8", features = ["macros", "json", "query", "http1", "tokio
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "set-header"] }
 mime = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
 humantime = "2"
 rust-embed = { version = "8", features = ["include-exclude", "debug-embed"] }

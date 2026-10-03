@@ -703,6 +703,44 @@ async fn egress_proxy_refuses_without_an_image() {
 
 // --- container tier ----------------------------------------------------------------
 
+/// A proxy that dies before it listens must say why. With `--rm` on the proxy,
+/// podman removed it before its logs could be read and the error carried
+/// "no such container" instead (#115). Any image that is not the proxy will do:
+/// alpine handed the proxy's arguments exits at once.
+async fn egress_proxy_that_dies_reports_its_exit() {
+    const T: &str = "egress_proxy_that_dies_reports_its_exit";
+    if !podman_ok(&["version"]) {
+        return skip_or_fail(T, "podman not on PATH");
+    }
+    if !podman_ok(&["image", "exists", "docker.io/library/alpine:3.21"])
+        && !podman_ok(&["pull", "-q", "docker.io/library/alpine:3.21"])
+    {
+        return skip_or_fail(T, "cannot pull alpine:3.21");
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let mut spec = test_spec(&format!("egressdies{}", uuid_suffix()), &ws);
+    spec.network = NetworkMode::Proxied;
+    spec.egress_allow = vec!["example.com".into()];
+    let sup = Supervisor::new(Arc::new(PodmanLauncher {
+        egress_image: "docker.io/library/alpine:3.21".into(),
+        egress_dns: vec!["192.0.2.1".into()],
+        ..Default::default()
+    }));
+    let (_, err) = run(&sup, spec.clone(), None).await;
+    let err = err.expect("a proxy that exited at once was treated as listening");
+    let msg = err.to_string();
+    assert!(msg.contains("exited before listening"), "error = {msg}");
+    assert!(msg.contains("exit code"), "error = {msg}");
+    assert!(
+        !msg.to_ascii_lowercase().contains("no such container"),
+        "the proxy was gone before its logs were read: {msg}"
+    );
+    assert!(
+        !container_exists(&spec.proxy_container_name()),
+        "the dead proxy was left behind"
+    );
+}
+
 const REQUIRE_ENV: &str = "HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS";
 
 /// A skip is right on a laptop that never built a harness and wrong in the one
@@ -902,7 +940,10 @@ async fn egress_proxy_enforces_the_allowlist() {
         "docker.io/library/alpine:3.21",
         "sh",
         "-c",
-        "while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok' | nc -l -p 8080; done",
+        // busybox httpd, not an `nc -l` loop: the loop answers one connection
+        // and is deaf until it relistens, and a request that landed in that gap
+        // came back from the proxy as 502 (#115, CI run 37160221148).
+        "mkdir -p /w && printf ok > /w/index.html && exec httpd -f -p 8080 -h /w",
     ]);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1111,6 +1152,9 @@ fn main() {
         }),
         ("podman_runs_the_pinned_image", || {
             Box::pin(podman_runs_the_pinned_image())
+        }),
+        ("egress_proxy_that_dies_reports_its_exit", || {
+            Box::pin(egress_proxy_that_dies_reports_its_exit())
         }),
         ("egress_proxy_enforces_the_allowlist", || {
             Box::pin(egress_proxy_enforces_the_allowlist())

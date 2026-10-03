@@ -81,7 +81,9 @@ impl PodmanLauncher {
         let mut args: Vec<String> = vec![
             s("run"),
             s("--detach"),
-            s("--rm"),
+            // No --rm: a proxy that dies before listening must still be there
+            // for wait_for_proxy to read its logs and exit code (#115).
+            // stop_egress removes it on every path, this one included.
             s("--name"),
             spec.proxy_container_name(),
             // On the run's internal network so the harness can reach it by
@@ -137,7 +139,13 @@ impl PodmanLauncher {
                 String::from_utf8_lossy(&out.stderr).trim()
             )));
         }
-        self.wait_for_proxy(spec).await
+        if let Err(e) = self.wait_for_proxy(spec).await {
+            // Read what we need, then clear up: without --rm a dead proxy and
+            // its network would otherwise outlive a run that never started.
+            let _ = self.stop_egress(spec).await;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Blocks until the proxy logs that it is listening.
@@ -164,8 +172,23 @@ impl PodmanLauncher {
                             + &String::from_utf8_lossy(&o.stderr)
                     })
                     .unwrap_or_default();
+                let code = self
+                    .command(&[
+                        "inspect".into(),
+                        "--type".into(),
+                        "container".into(),
+                        "--format".into(),
+                        "{{.State.ExitCode}}".into(),
+                        name.clone(),
+                    ])
+                    .output()
+                    .await
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| "unknown".into());
                 return Err(RunError::Launcher(format!(
-                    "egress proxy exited before listening: {}",
+                    "egress proxy exited before listening (exit code {code}): {}",
                     text.trim()
                 )));
             }

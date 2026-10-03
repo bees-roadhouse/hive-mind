@@ -703,6 +703,57 @@ async fn egress_proxy_refuses_without_an_image() {
 
 // --- container tier ----------------------------------------------------------------
 
+/// A proxy that dies before it listens must say why. With `--rm` on the proxy,
+/// podman removed it before its logs could be read and the error carried
+/// "no such container" instead (#115). The real proxy, handed a DNS server it
+/// cannot parse, starts and then exits: the failure shape, made on purpose.
+async fn egress_proxy_that_dies_reports_its_exit() {
+    const T: &str = "egress_proxy_that_dies_reports_its_exit";
+    if !podman_ok(&["version"]) {
+        return skip_or_fail(T, "podman not on PATH");
+    }
+    let egress_pin = match EgressPin::load(repo_path(hive_harness::DEFAULT_EGRESS_PIN_PATH)) {
+        Ok(p) => p,
+        Err(e) => {
+            return skip_or_fail(
+                T,
+                &format!("no egress pin ({e}); run scripts/egress-build.sh"),
+            );
+        }
+    };
+    if !podman_ok(&["image", "exists", &egress_pin.reference()]) {
+        return skip_or_fail(
+            T,
+            &format!(
+                "{} not in local storage; run scripts/egress-build.sh",
+                egress_pin.reference()
+            ),
+        );
+    }
+    let ws = tempfile::tempdir().unwrap();
+    let mut spec = test_spec(&format!("egressdies{}", uuid_suffix()), &ws);
+    spec.network = NetworkMode::Proxied;
+    spec.egress_allow = vec!["example.com".into()];
+    let sup = Supervisor::new(Arc::new(PodmanLauncher {
+        egress_image: egress_pin.reference(),
+        egress_dns: vec!["not-an-address".into()],
+        ..Default::default()
+    }));
+    let (_, err) = run(&sup, spec.clone(), None).await;
+    let err = err.expect("a proxy that exited at once was treated as listening");
+    let msg = err.to_string();
+    assert!(msg.contains("exited before listening"), "error = {msg}");
+    assert!(msg.contains("exit code"), "error = {msg}");
+    assert!(
+        msg.contains("--egress-dns"),
+        "the proxy's own words are missing: {msg}"
+    );
+    assert!(
+        !container_exists(&spec.proxy_container_name()),
+        "the dead proxy was left behind"
+    );
+}
+
 const REQUIRE_ENV: &str = "HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS";
 
 /// A skip is right on a laptop that never built a harness and wrong in the one
@@ -902,7 +953,14 @@ async fn egress_proxy_enforces_the_allowlist() {
         "docker.io/library/alpine:3.21",
         "sh",
         "-c",
-        "while true; do printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok' | nc -l -p 8080; done",
+        // `nc -lk -e`, a server per connection, not an `nc -l` loop: the loop
+        // answers one connection and is deaf until it relistens, and a request
+        // in that gap came back from the proxy as 502 (#115, CI run
+        // 37160221148). Forty concurrent requests: the loop failed 38, this 0.
+        // Alpine's busybox has no httpd.
+        "printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok' > /body \
+         && printf '#!/bin/sh\\ncat /body\\n' > /r.sh && chmod +x /r.sh \
+         && exec nc -lk -p 8080 -e /r.sh",
     ]);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1111,6 +1169,9 @@ fn main() {
         }),
         ("podman_runs_the_pinned_image", || {
             Box::pin(podman_runs_the_pinned_image())
+        }),
+        ("egress_proxy_that_dies_reports_its_exit", || {
+            Box::pin(egress_proxy_that_dies_reports_its_exit())
         }),
         ("egress_proxy_enforces_the_allowlist", || {
             Box::pin(egress_proxy_enforces_the_allowlist())

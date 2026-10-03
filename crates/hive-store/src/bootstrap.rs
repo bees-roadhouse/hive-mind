@@ -1,6 +1,8 @@
 use hive_db::{Connection, query};
+use hive_identity::{Credential, Owner, PrincipalKind};
 use uuid::Uuid;
 
+use crate::core::ensure_core_install;
 use crate::{Result, StoreError};
 
 /// Read from config or environment at first boot, never from a request. D19.1:
@@ -84,6 +86,12 @@ pub async fn bootstrap(conn: &Connection, cfg: &BootstrapConfig) -> Result<Boots
         }
     }
 
+    // The root's core install (D32): every principal gets one when it is
+    // created, and the root is created here. Idempotent, so a second boot
+    // finds it rather than making another.
+    let as_root = Credential::new(res.root_actor_id, PrincipalKind::User, res.root_actor_id);
+    ensure_core_install(conn, Owner::user(res.root_actor_id), &as_root).await?;
+
     if cfg.org_handle.is_empty() {
         return Ok(res);
     }
@@ -108,7 +116,14 @@ pub async fn bootstrap(conn: &Connection, cfg: &BootstrapConfig) -> Result<Boots
                 cfg.org_handle
             )));
         }
-        res.org_actor_id = Some(row.get("id"));
+        let org_id: Uuid = row.get("id");
+        res.org_actor_id = Some(org_id);
+        ensure_core_install(
+            conn,
+            Owner::new(PrincipalKind::Org, org_id),
+            &Credential::new(res.root_actor_id, PrincipalKind::Org, org_id),
+        )
+        .await?;
         return Ok(res);
     }
 
@@ -132,6 +147,13 @@ pub async fn bootstrap(conn: &Connection, cfg: &BootstrapConfig) -> Result<Boots
         .map_err(|e| StoreError::db("seat root as org admin", e))?;
     res.org_actor_id = Some(org_id);
     res.created = true;
+    // The org's core install, activated by the root acting as its admin.
+    ensure_core_install(
+        conn,
+        Owner::new(PrincipalKind::Org, org_id),
+        &Credential::new(res.root_actor_id, PrincipalKind::Org, org_id),
+    )
+    .await?;
     Ok(res)
 }
 

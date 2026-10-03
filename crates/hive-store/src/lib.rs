@@ -40,6 +40,7 @@ mod appschema;
 mod bootstrap;
 mod builds;
 mod chat;
+mod core;
 mod credentials;
 mod docblobs;
 mod events;
@@ -60,6 +61,7 @@ pub use chat::{
     Chat, ClaimedTurn, Conversation, Message, RunEvent, TURN_CLAIMED, TURN_DONE, TURN_FAILED,
     TURN_PENDING, Turn, TurnState,
 };
+pub use core::{core_install_id, ensure_core_install};
 pub use credentials::{
     CredentialDetail, credential_detail_by_token, ensure_bootstrap_credential, hash_token,
     issue_credential, new_token, resolve_credential,
@@ -72,6 +74,7 @@ pub use events::{
 pub use grants::{
     Access, ActingInstall, GrantSource, GrantSpec, Guard, Reason, Subject, SubjectKind,
     UnshareResult, enter_break_glass, materialize_inherited, revoke_grant, unshare, write_grant,
+    write_install_grant,
 };
 pub use guestblobs::GuestBlobs;
 pub use guestevents::{GuestEvents, platform_kind, visible_to};

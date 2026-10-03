@@ -166,6 +166,13 @@ async fn replay_filters_with_current_permissions() {
 /// Ported from `TestAppendEventsNotifiesOncePerCall` (D4.11). The bell is a
 /// hint and a burst is one hint; ringing it per row would make a bus wake
 /// per row for no information.
+///
+/// The counter is process-wide and every other test in this binary rings
+/// it, so an exact "before + 1" cannot be asserted without serialising the
+/// suite (it was, and it went red the day bootstrap grew slower). What CAN
+/// be asserted at any interleaving is the shape of the failure: a bell rung
+/// per row adds at least as many rings as rows, and the fixture is sized so
+/// that no plausible interference reaches it.
 #[tokio::test]
 async fn append_events_rings_once_per_call() {
     let w = World::new("append_events_rings_once").await;
@@ -173,25 +180,27 @@ async fn append_events_rings_once_per_call() {
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let wake = hive_store::event_wake();
 
-    let mut events: Vec<Event> = (0..5)
+    const ROWS: usize = 200;
+    let mut events: Vec<Event> = (0..ROWS)
         .map(|_| Event::new("test.event", &alice_cred, b"{}".to_vec()))
         .collect();
     let conn = w.conn().await;
-    // Other tests in this process ring the same bell, so count what THIS
-    // call added rather than reading the total.
     let before = wake.rings();
     append_events(&conn, &mut events).await.expect("append");
-    let after = wake.rings();
-    assert_eq!(
-        after - before,
-        1,
-        "one append_events call rang {} times",
-        after - before
+    let rang = wake.rings() - before;
+    assert!(rang >= 1, "one append_events call rang nothing");
+    assert!(
+        (rang as usize) < ROWS / 2,
+        "one append_events call of {ROWS} rows rang {rang} times: a bell per row"
     );
 
-    // And an empty call rings nothing: there is nothing to tell.
-    append_events(&conn, &mut []).await.expect("append nothing");
-    assert_eq!(wake.rings(), after);
+    // And an empty call rings nothing: there is nothing to tell. Twenty of
+    // them ring fewer than twenty times whatever else is running.
+    let before = wake.rings();
+    for _ in 0..20 {
+        append_events(&conn, &mut []).await.expect("append nothing");
+    }
+    assert!(wake.rings() - before < 20, "an empty append rang the bell");
 }
 
 /// Ported from `TestResolveCredentialDeniesOnAbsence`.

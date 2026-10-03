@@ -705,25 +705,38 @@ async fn egress_proxy_refuses_without_an_image() {
 
 /// A proxy that dies before it listens must say why. With `--rm` on the proxy,
 /// podman removed it before its logs could be read and the error carried
-/// "no such container" instead (#115). Any image that is not the proxy will do:
-/// alpine handed the proxy's arguments exits at once.
+/// "no such container" instead (#115). The real proxy, handed a DNS server it
+/// cannot parse, starts and then exits: the failure shape, made on purpose.
 async fn egress_proxy_that_dies_reports_its_exit() {
     const T: &str = "egress_proxy_that_dies_reports_its_exit";
     if !podman_ok(&["version"]) {
         return skip_or_fail(T, "podman not on PATH");
     }
-    if !podman_ok(&["image", "exists", "docker.io/library/alpine:3.21"])
-        && !podman_ok(&["pull", "-q", "docker.io/library/alpine:3.21"])
-    {
-        return skip_or_fail(T, "cannot pull alpine:3.21");
+    let egress_pin = match EgressPin::load(repo_path(hive_harness::DEFAULT_EGRESS_PIN_PATH)) {
+        Ok(p) => p,
+        Err(e) => {
+            return skip_or_fail(
+                T,
+                &format!("no egress pin ({e}); run scripts/egress-build.sh"),
+            );
+        }
+    };
+    if !podman_ok(&["image", "exists", &egress_pin.reference()]) {
+        return skip_or_fail(
+            T,
+            &format!(
+                "{} not in local storage; run scripts/egress-build.sh",
+                egress_pin.reference()
+            ),
+        );
     }
     let ws = tempfile::tempdir().unwrap();
     let mut spec = test_spec(&format!("egressdies{}", uuid_suffix()), &ws);
     spec.network = NetworkMode::Proxied;
     spec.egress_allow = vec!["example.com".into()];
     let sup = Supervisor::new(Arc::new(PodmanLauncher {
-        egress_image: "docker.io/library/alpine:3.21".into(),
-        egress_dns: vec!["192.0.2.1".into()],
+        egress_image: egress_pin.reference(),
+        egress_dns: vec!["not-an-address".into()],
         ..Default::default()
     }));
     let (_, err) = run(&sup, spec.clone(), None).await;
@@ -731,10 +744,7 @@ async fn egress_proxy_that_dies_reports_its_exit() {
     let msg = err.to_string();
     assert!(msg.contains("exited before listening"), "error = {msg}");
     assert!(msg.contains("exit code"), "error = {msg}");
-    assert!(
-        !msg.to_ascii_lowercase().contains("no such container"),
-        "the proxy was gone before its logs were read: {msg}"
-    );
+    assert!(msg.contains("--egress-dns"), "the proxy's own words are missing: {msg}");
     assert!(
         !container_exists(&spec.proxy_container_name()),
         "the dead proxy was left behind"
@@ -940,10 +950,14 @@ async fn egress_proxy_enforces_the_allowlist() {
         "docker.io/library/alpine:3.21",
         "sh",
         "-c",
-        // busybox httpd, not an `nc -l` loop: the loop answers one connection
-        // and is deaf until it relistens, and a request that landed in that gap
-        // came back from the proxy as 502 (#115, CI run 37160221148).
-        "mkdir -p /w && printf ok > /w/index.html && exec httpd -f -p 8080 -h /w",
+        // `nc -lk -e`, a server per connection, not an `nc -l` loop: the loop
+        // answers one connection and is deaf until it relistens, and a request
+        // in that gap came back from the proxy as 502 (#115, CI run
+        // 37160221148). Forty concurrent requests: the loop failed 38, this 0.
+        // Alpine's busybox has no httpd.
+        "printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\n\\r\\nok' > /body \
+         && printf '#!/bin/sh\\ncat /body\\n' > /r.sh && chmod +x /r.sh \
+         && exec nc -lk -p 8080 -e /r.sh",
     ]);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {

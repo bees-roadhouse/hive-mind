@@ -37,9 +37,15 @@ hive-httpauth = { path = "../hive-httpauth" }
 hive-sse = { path = "../hive-sse" }
 hive-mcp = { path = "../hive-mcp" }
 hive-webui = { path = "../hive-webui" }
+hive-wasmhost = { path = "../hive-wasmhost" }
+hive-registry = { path = "../hive-registry" }
+hive-manifest = { path = "../hive-manifest" }
 
 [dev-dependencies]
 reqwest.workspace = true
+tempfile.workspace = true
+sha2.workspace = true
+hex.workspace = true
 parking_lot.workspace = true
 hive-manifest = { path = "../hive-manifest" }
 hive-testdb = { path = "../hive-testdb" }

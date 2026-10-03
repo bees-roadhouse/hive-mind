@@ -61,9 +61,12 @@ publishes a replica whose stream resumes from a watermark it never established.
 
 Chat is built end to end: `docs/chat.md` covers the turn worker, the stream,
 and the browser client at `/`, which the daemon renders and htmx swaps (D32). The tool surface and app routes are served:
-`docs/surfaces.md` covers `POST /mcp` and `/apps/{app}/...`. What is still
-ahead: the workflow runner, app installs over the API, a container test that a
-real `claude` run resumes its session, and the journal app.
+`docs/surfaces.md` covers `POST /mcp`, `/apps/{app}/...`, and the two routes
+that put a file and an app in: `POST /blobs` and `POST /apps`. Every
+principal has a core install (entries, tasks, lists, contacts, decisions) and
+an app's manifest `uses` becomes grants at activation. What is still ahead:
+the workflow runner, a container test that a real `claude` run resumes its
+session, and the journal app.
 [Issue #29](https://github.com/bees-roadhouse/hive-mind/issues/29)
 tracks the lot.
 

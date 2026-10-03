@@ -304,7 +304,7 @@ crates/hive-chat/      a message becomes one hosted agent run. The turn worker, 
 crates/hive-sse/       the SSE frame writer, shared by /events and the chat stream
 crates/hive-httpauth/  request-to-credential resolution and THE one 401 shape
 crates/hive-httpapi/   the daemon's HTTP surface: healthz, readyz, events, whoami, device
-                       enrollment, blob reads, session, chat
+                       enrollment, blob reads and uploads, installs, session, chat
 crates/hive-webui/     the browser client's static assets under /assets/, embedded, under the strict
                        CSP every HTML response also carries; the pages themselves are hive-httpapi's
 crates/hive-identity/  the credential every layer passes around. Types and validation only

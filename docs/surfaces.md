@@ -50,6 +50,36 @@ the manifest did not mount, or not yours. `400` is the caller's mistake on a
 route they may call; `502 {"error":"app_failed"}` is the app's own failure, with
 its message.
 
+## `POST /blobs`, `GET /apps`, `POST /apps`
+
+The two routes a person needs to put a file and an app into the platform,
+served by `crates/hive-httpapi` rather than by the surfaces crate, because
+neither is a tool or a route an app declared.
+
+`POST /blobs` takes the raw body with its `Content-Type`, streams it to the
+blob driver, and writes the caller a reference to the sealed bytes
+(`source_kind = 'upload'`, trusted, class original). The answer is the
+content address: `{hash, size, mime, trust}`. A second upload of the same
+bytes by anyone costs no storage and gets its own reference; a stranger who
+learns the hash reads nothing (invariant 3), the same way the guest
+capability refuses.
+
+`POST /apps` takes `{manifest, module?}`: a manifest as JSON and, for an app
+with guest code, the content address of a module the caller uploaded. The
+module is read through the caller's own references, never the global hash
+space, and its exports are what the registry checks the manifest's claims
+against. Then `register_build`, `stage_install` and `activate_install`, in
+one transaction, for the caller's own principal. The store answers who may
+activate (D19.4: a person; an AI acting for them gets 403) and what the app
+may reach (its `uses`, derived into install grants, #86). Refusals: 422
+`invalid_manifest` or `invalid_module`, 404 for a module the caller does
+not hold, 409 `unmet_uses` for a use of an app the owner has not installed,
+403 for an actor that may not activate.
+
+`GET /apps` lists the caller's principal's installs in every state. It is
+what a settings page shows; the candidate set a caller may *reach* is the
+predicate's and is served by `tools/list`.
+
 ## Who may call what
 
 Both surfaces go through the store's predicate and nothing else.

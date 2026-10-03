@@ -28,6 +28,7 @@ pub struct Api {
     pub woken: Arc<AtomicUsize>,
     cancel: CancellationToken,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    _blob_dir: Option<tempfile::TempDir>,
 }
 
 #[derive(Default)]
@@ -43,6 +44,9 @@ pub struct Setup {
     pub mcp: Option<Arc<hive_mcp::Server>>,
     /// Mounts /apps/{app}/... over this router.
     pub apps: Option<Arc<dyn hive_httpapi::AppRouter>>,
+    /// A blob catalogue on a temp directory and a wasm host over it, so
+    /// `POST /blobs` and `POST /apps` are mounted.
+    pub host: bool,
 }
 
 impl Api {
@@ -92,11 +96,31 @@ impl Api {
         let hub = Hub::default();
         let woken = Arc::new(AtomicUsize::new(0));
         let w = woken.clone();
+        let (blobs, host, blob_dir) = if setup.host {
+            let dir = tempfile::tempdir().unwrap();
+            let cat = Arc::new(hive_blob::Catalog::new(
+                db.db().clone(),
+                Box::new(hive_blob::DiskDriver::new(dir.path()).await.unwrap()),
+            ));
+            let deps = hive_wasmhost::Deps {
+                storage: Arc::new(hive_store::AppData::new(store.clone(), cat.clone())),
+                blob: Arc::new(hive_store::GuestBlobs::new(store.clone(), cat.clone())),
+                events: Arc::new(hive_store::GuestEvents::new(store.clone())),
+                ..Default::default()
+            };
+            let host = hive_wasmhost::Host::new(hive_wasmhost::Config::default(), deps)
+                .await
+                .expect("wasm host");
+            (Some(cat), Some(host), Some(dir))
+        } else {
+            (None, None, None)
+        };
         let app = hive_httpapi::router(
             Some(store.clone()),
             bus.clone(),
             Options {
                 version: "test-v1".into(),
+                blobs,
                 chat: chat.clone(),
                 hub: Some(hub.clone()),
                 wake: Some(Arc::new(move || {
@@ -105,7 +129,7 @@ impl Api {
                 plain_http: setup.plain_http,
                 mcp: setup.mcp.clone(),
                 apps: setup.apps.clone(),
-                ..Default::default()
+                host,
             },
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -128,6 +152,7 @@ impl Api {
             woken,
             cancel,
             tasks,
+            _blob_dir: blob_dir,
         }
     }
 

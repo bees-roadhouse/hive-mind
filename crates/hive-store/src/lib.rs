@@ -85,8 +85,8 @@ pub use hive_schema::{
     migrate_audit, migrate_owner,
 };
 pub use installs::{
-    CAPABILITY_ACTIVATE, InstallSpec, activate_install, grant_install_authority,
-    revoke_install_authority, stage_install,
+    CAPABILITY_ACTIVATE, InstallSpec, InstallSummary, activate_install, grant_install_authority,
+    installs_of, revoke_install_authority, stage_install,
 };
 pub use owners::{
     OWNERS_DIR_SUFFIX, attach_owner, owner_alias, owner_file, owner_table, owners_dir,

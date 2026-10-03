@@ -331,6 +331,7 @@ async fn run() -> anyhow::Result<()> {
                 plain_http: args.plain_http,
                 mcp: mcp.clone(),
                 apps: apps.clone(),
+                host: host.clone(),
             },
         )
         // The browser client, at the root. Two patterns that no API route

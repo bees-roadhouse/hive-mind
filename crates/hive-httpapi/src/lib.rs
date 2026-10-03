@@ -12,6 +12,7 @@ mod blobs;
 mod chat;
 mod chatstream;
 mod credentials;
+mod installs;
 pub mod mcp;
 mod readyz;
 mod session;
@@ -28,6 +29,7 @@ use hive_bus::Bus;
 use hive_chat::Hub;
 use hive_httpauth::Auth;
 use hive_store::{Chat, Store};
+use hive_wasmhost::Host;
 use http::{HeaderMap, StatusCode, Uri, header};
 
 pub use apps::{AppError, AppRequest, AppResponse, AppRouter};
@@ -59,6 +61,9 @@ pub struct Options {
     pub mcp: Option<Arc<hive_mcp::Server>>,
     /// Enables `/apps/{app}/...`. Same rule.
     pub apps: Option<Arc<dyn AppRouter>>,
+    /// Enables `POST /apps`, which reads a module's exports before the
+    /// registry checks a manifest against them. Needs `blobs` too.
+    pub host: Option<Host>,
 }
 
 #[derive(Clone)]
@@ -74,6 +79,7 @@ pub struct AppState {
     pub(crate) version: String,
     pub(crate) mcp: Option<Arc<hive_mcp::Server>>,
     pub(crate) apps: Option<Arc<dyn AppRouter>>,
+    pub(crate) host: Option<Host>,
 }
 
 impl FromRef<AppState> for Auth {
@@ -110,6 +116,7 @@ pub fn router(store: Option<Store>, bus: Option<Bus>, opts: Options) -> Router {
         version: opts.version,
         mcp: opts.mcp,
         apps: opts.apps,
+        host: opts.host,
     };
     // Liveness only, and deliberately so: see readyz for why this one must
     // not learn to check dependencies.
@@ -134,9 +141,20 @@ pub fn router(store: Option<Store>, bus: Option<Bus>, opts: Options) -> Router {
         if state.blobs.is_some() {
             // Reads resolve through the caller's refs, exactly as the guest
             // capability does. HEAD shares the handler so a client can size an
-            // object before pulling it.
-            app = app.route("/blobs/{hash}", get(blobs::read).head(blobs::read));
+            // object before pulling it. An upload writes the caller a
+            // reference, which is what makes the bytes theirs.
+            app = app
+                .route("/blobs", post(installs::upload))
+                .route("/blobs/{hash}", get(blobs::read).head(blobs::read));
         }
+        // What is installed for the caller's principal, and installing more.
+        // `POST /apps` needs the host to read a module's exports; without one
+        // the route is not mounted rather than refusing every module.
+        app = if state.blobs.is_some() && state.host.is_some() {
+            app.route("/apps", get(installs::list).post(installs::install))
+        } else {
+            app.route("/apps", get(installs::list))
+        };
         if state.mcp.is_some() {
             // Stateless JSON-RPC. No GET: this server keeps no per-client
             // stream, so there is nothing to subscribe to.

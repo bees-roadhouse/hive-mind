@@ -51,6 +51,40 @@ async fn acts_for(conn: &Connection, by: &Credential, principal: Owner) -> Resul
     Ok(kind.is_some())
 }
 
+/// One row of [`installs_of`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallSummary {
+    pub id: Uuid,
+    pub slug: String,
+    pub state: String,
+    pub schema_name: String,
+}
+
+/// Every install an owner has, in every state, oldest first. A listing for
+/// the owner's own eyes; the candidate set a caller may reach is the
+/// predicate's (`hive-surfaces`), not this.
+pub async fn installs_of(conn: &Connection, owner: Owner) -> Result<Vec<InstallSummary>> {
+    let rows = query(
+        "SELECT id, slug, state, schema_name FROM installs
+          WHERE owner_kind = ?1 AND owner_id = ?2
+          ORDER BY created_at, id",
+    )
+    .bind(owner.kind.as_str())
+    .bind(owner.id)
+    .fetch_all(conn)
+    .await
+    .map_err(|e| StoreError::db("list installs", e))?;
+    Ok(rows
+        .iter()
+        .map(|r| InstallSummary {
+            id: r.get("id"),
+            slug: r.get("slug"),
+            state: r.get("state"),
+            schema_name: r.get("schema_name"),
+        })
+        .collect())
+}
+
 /// Records an install without turning it on. Any actor that may act for the
 /// owning principal may do this, including an AI.
 pub async fn stage_install(conn: &Connection, spec: &InstallSpec, by: &Credential) -> Result<Uuid> {

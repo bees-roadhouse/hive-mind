@@ -112,8 +112,8 @@ async fn fetch_ranged_returns_partial_content() {
     assert_eq!(read_all(body).await, b"56789");
 }
 
-/// Garage returns 400 on an expired signature; AWS returns 403. Refresh logic
-/// keyed on 403 alone never fires against Garage.
+/// Some S3-compatible stores return 400 on an expired signature; AWS returns
+/// 403. Refresh logic keyed on 403 alone never fires against the former.
 #[tokio::test]
 async fn stale_url_retry_is_not_keyed_on_403() {
     for expiry in [

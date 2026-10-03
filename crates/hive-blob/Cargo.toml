@@ -26,9 +26,6 @@ futures.workspace = true
 async-trait.workspace = true
 mime.workspace = true
 reqwest.workspace = true
-aws-sdk-s3.workspace = true
-aws-config.workspace = true
-aws-credential-types.workspace = true
 tempfile.workspace = true
 hive-identity = { path = "../hive-identity" }
 hive-trust = { path = "../hive-trust" }

@@ -87,9 +87,6 @@ serde_urlencoded = "0.7"
 socket2 = "0.6"
 wasmtime = { version = "48", default-features = false, features = ["cranelift", "runtime", "async", "std", "parallel-compilation", "cache", "wat"] }
 wasmtime-wasi = { version = "48", default-features = false, features = ["p1"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
-aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
-aws-credential-types = "1"
 hickory-resolver = { version = "0.25", default-features = false, features = ["tokio"] }
 
 [workspace.lints.rust]

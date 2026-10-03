@@ -10,7 +10,7 @@
 #
 # Nothing has to be running first. The store is SQLite (D38) and every
 # database test makes its own files under the temp directory; the tiers that
-# still need a backend (Podman, Garage, chromium) skip by name without one.
+# still need a backend (Podman, chromium) skip by name without one.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

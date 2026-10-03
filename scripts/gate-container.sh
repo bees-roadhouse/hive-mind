@@ -49,9 +49,9 @@ if [ "$rebuild" -eq 1 ] || ! podman image exists "$image"; then
   fi
 fi
 
-# --network=host so 127.0.0.1:53900 (Garage, for the blob driver tier) means
-# the same thing inside the container as outside it. The store needs no
-# network at all: it is SQLite files under the container's temp directory.
+# --network=host so anything a test reaches on loopback means the same thing
+# inside the container as outside it. The store needs no network at all: it
+# is SQLite files under the container's temp directory.
 #
 # --security-opt label=disable rather than a :z/:Z mount: SELinux is enforcing
 # on the maintainer's box, and relabelling somebody's git checkout as a side

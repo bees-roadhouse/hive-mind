@@ -53,7 +53,7 @@ mod predicate;
 
 pub use actors::{Actor, actor_by_id};
 pub use agentruns::{AgentRunStore, RunWriter, reclaim_abandoned_runs};
-pub use appdata::{AppData, InstallInfo, resolve_active_install};
+pub use appdata::{AppData, IndexDecl, InstallInfo, resolve_active_install};
 pub use appschema::{apply_schema_plan, drop_schema_plan};
 pub use bootstrap::{BootstrapConfig, BootstrapResult, bootstrap};
 pub use builds::{BuildSpec, RegisteredBuild, register_build};

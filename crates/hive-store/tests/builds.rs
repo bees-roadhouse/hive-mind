@@ -596,16 +596,22 @@ async fn column_exists(w: &World, schema: &str, table: &str, col: &str) -> bool 
     n > 0
 }
 
-/// The names of every index on a collection table, the autoindex behind the
-/// primary key included.
+/// The names of everything an index provisions for a collection table: the
+/// indexes on it (the autoindex behind the primary key included), and the
+/// virtual tables and triggers named under it (D41).
 async fn index_names(w: &World, schema: &str, table: &str) -> Vec<String> {
     let conn = w.conn().await;
     let alias = attach_owner(&conn, bare_owner()).await.unwrap();
+    let base = format!("{schema}__{table}");
     query(&format!(
-        "SELECT name FROM {}.sqlite_master WHERE type = 'index' AND tbl_name = ?1 ORDER BY name",
+        "SELECT name FROM {}.sqlite_master
+          WHERE (type = 'index' AND tbl_name = ?1)
+             OR (type IN ('table', 'trigger') AND name GLOB ?2)
+          ORDER BY name",
         hive_db::quote_ident(&alias)
     ))
-    .bind(format!("{schema}__{table}"))
+    .bind(&base)
+    .bind(format!("{base}_[0-9]*_[fv]*"))
     .fetch_scalars(&conn)
     .await
     .unwrap()
@@ -838,24 +844,27 @@ async fn drop_schema_plan_removes_everything() {
     );
 }
 
-/// Ported from `TestVectorIndexIsRefusedRatherThanSkipped`.
+/// Ported from `TestVectorIndexIsRefusedRatherThanSkipped`, and inverted by
+/// D41: a vector index provisions a vec0 table of the declared dimension
+/// beside the collection, with the triggers that keep it in step.
 #[tokio::test]
-async fn vector_index_is_refused_rather_than_skipped() {
-    let w = World::bare("vector_index_refused").await;
+async fn vector_index_provisions_a_vec_table() {
+    let w = World::bare("vector_index_provisions").await;
     let plan = plan_for(
         &unique_app(),
         vec![coll("entries", &["vector(embedding, 1536)"])],
     );
-    let tx = w.store.begin().await.unwrap();
-    let err = apply_schema_plan(&tx, bare_owner(), &plan)
-        .await
-        .expect_err("a vector index was silently accepted");
-    assert!(matches!(err, StoreError::NotImplemented(_)), "{err}");
-    assert!(
-        err.to_string().contains("vector"),
-        "the error should name what is missing: {err}"
-    );
-    tx.rollback().await.unwrap();
+    apply(&w, &plan).await.expect("apply");
+    let names = index_names(&w, &plan.schema, "entries").await;
+    let vec_table = format!("{}__entries_0_vec", plan.schema);
+    assert!(names.contains(&vec_table), "no vec0 table: {names:?}");
+    for suffix in ["_ai", "_au", "_ad"] {
+        assert!(
+            names.contains(&format!("{vec_table}{suffix}")),
+            "no {suffix} trigger: {names:?}"
+        );
+    }
+    drop_plan(&w, bare_owner(), &plan).await;
 }
 
 /// Ported from `TestApplySchemaPlanRefusesUnsafeIdentifiers`: the check at the

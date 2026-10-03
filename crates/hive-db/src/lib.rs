@@ -39,6 +39,8 @@
 //!   outlives a checkout, because one mid-transaction is closed rather than
 //!   returned.
 
+mod vec;
+
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -146,6 +148,8 @@ pub struct Connection {
 
 impl Connection {
     fn open(path: &Path) -> Result<Connection> {
+        // Before the first connection in this process, and a no-op after.
+        vec::register();
         let c = rusqlite::Connection::open(path)?;
         c.busy_timeout(BUSY_TIMEOUT)?;
         // Foreign keys are per connection in SQLite and default to off, so a
@@ -1043,6 +1047,33 @@ mod tests {
         }
         drop(held);
         assert!(db.inner.idle.lock().len() <= MAX_IDLE);
+    }
+
+    /// sqlite-vec is in every connection this process opens (D41).
+    #[tokio::test]
+    async fn the_vector_extension_is_registered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Db::open(dir.path().join("vec.db")).await.unwrap();
+        let c = db.conn().await.unwrap();
+        let v: String = query("SELECT vec_version()")
+            .fetch_scalar(&c)
+            .await
+            .unwrap();
+        assert!(v.starts_with('v'), "vec_version() = {v}");
+        query("CREATE VIRTUAL TABLE probe USING vec0(id TEXT PRIMARY KEY, e float[2])")
+            .execute(&c)
+            .await
+            .unwrap();
+        query("INSERT INTO probe (id, e) VALUES ('a', vec_f32('[1,0]')), ('b', vec_f32('[0,1]'))")
+            .execute(&c)
+            .await
+            .unwrap();
+        let nearest: String =
+            query("SELECT id FROM probe WHERE e MATCH vec_f32('[0.9,0.1]') AND k = 1")
+                .fetch_scalar(&c)
+                .await
+                .unwrap();
+        assert_eq!(nearest, "a");
     }
 
     /// An attachment made on a checkout is gone by the next checkout, and a

@@ -107,7 +107,7 @@ pub struct Route {
 ///       rather than `null`, and `impl` is a word rather than a number. Every
 ///       surface hash persisted by the Go tree was produced by deriver 1 and
 ///       stays attributable to it.
-pub const DERIVE_VERSION: i32 = 2;
+pub const DERIVE_VERSION: i32 = 3;
 
 /// Everything derived from a manifest: what this app exposes, before anybody
 /// asks who is connecting.
@@ -385,6 +385,16 @@ fn crud_schema(op: Op) -> serde_json::Map<String, serde_json::Value> {
         Op::List => obj(
             json!({
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                "search": {"type": "string", "description": "words to find in the collection's full-text index"},
+                "near": {
+                    "type": "object",
+                    "description": "rank by distance from a vector in the index declared at path; limit is k",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "vector": {"type": "array", "items": {"type": "number"}}
+                    },
+                    "required": ["path", "vector"]
+                },
                 "cursor": {"type": "string", "description": "Opaque page cursor."},
             }),
             &[],

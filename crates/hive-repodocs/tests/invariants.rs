@@ -51,3 +51,62 @@ fn required_guidance_survives() {
         );
     }
 }
+
+/// `unsafe_code` is `deny` at the workspace rather than `forbid` so that
+/// hive-db can carry the one block the engine needs (sqlite-vec's
+/// registration, D41 §3). This is what keeps that from spreading: no other
+/// crate contains an `unsafe` block, function, impl or extern, or lifts the
+/// lint. Adding one means editing this test and saying why.
+#[test]
+fn unsafe_is_confined_to_hive_db() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut offenders = Vec::new();
+    for entry in std::fs::read_dir(&crates).expect("crates/") {
+        let dir = entry.expect("entry").path();
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        // hive-db is the named exception; hive-repodocs is this file, whose
+        // string literals spell the very tokens it looks for.
+        if !dir.is_dir() || name == "hive-db" || name == "hive-repodocs" {
+            continue;
+        }
+        scan(&dir.join("src"), &mut offenders);
+        scan(&dir.join("tests"), &mut offenders);
+    }
+    assert!(
+        offenders.is_empty(),
+        "unsafe outside hive-db:\n{}",
+        offenders.join("\n")
+    );
+}
+
+fn scan(dir: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            scan(&path, out);
+            continue;
+        }
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source");
+        for (n, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            let is_unsafe = code.contains("allow(unsafe_code)")
+                || code
+                    .split_whitespace()
+                    .zip(code.split_whitespace().skip(1))
+                    .any(|(a, b)| {
+                        a == "unsafe"
+                            && (b.starts_with('{') || b == "fn" || b == "impl" || b == "extern")
+                    })
+                || code.contains("unsafe{");
+            if is_unsafe {
+                out.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+            }
+        }
+    }
+}

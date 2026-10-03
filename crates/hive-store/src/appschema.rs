@@ -63,16 +63,27 @@ pub async fn drop_schema_plan(tx: &Connection, owner: Owner, plan: &SchemaPlan) 
     check_ident(&plan.schema)?;
     let alias = attach_owner(tx, owner).await?;
     let prefix = format!("{}__", plan.schema);
-    let tables: Vec<String> = query(&format!(
-        "SELECT name FROM {}.sqlite_master
+    // Virtual tables first: dropping one takes its shadow tables with it,
+    // and a shadow table cannot be dropped on its own (D41 measurement 6).
+    // The listing is taken once, so a shadow already gone is IF EXISTS.
+    let rows = query(&format!(
+        "SELECT name, sql FROM {}.sqlite_master
           WHERE type = 'table' AND substr(name, 1, length(?1)) = ?1",
         quote_ident(&alias)
     ))
     .bind(&prefix)
-    .fetch_scalars(tx)
+    .fetch_all(tx)
     .await
     .map_err(|e| StoreError::db(format!("list tables of {}", plan.schema), e))?;
-    for t in tables {
+    let mut tables: Vec<(String, bool)> = rows
+        .iter()
+        .map(|r| {
+            let sql: Option<String> = r.get("sql");
+            (r.get("name"), sql.as_deref().is_some_and(is_virtual))
+        })
+        .collect();
+    tables.sort_by_key(|(_, virt)| !virt);
+    for (t, _) in tables {
         query(&format!("DROP TABLE IF EXISTS {}", owner_table(&alias, &t)))
             .execute(tx)
             .await
@@ -170,48 +181,166 @@ async fn apply_index(
     idx: &Index,
 ) -> Result<()> {
     let expr = doc_path(idx)?;
-    // The index name is derived rather than taken from the manifest, so two
-    // apps cannot argue about it and an app cannot name one after something
-    // that already exists. It is created in the owner's file, where the
-    // table is; `table` is the bare name, which the engine resolves there.
-    let name = derived_ident(
-        &format!("{schema}__{collection}"),
-        &format!("_{}_{ordinal}_idx", idx.method),
-    )?;
-    let name = format!("{}.{name}", quote_ident(alias));
-    let stmt = match idx.method {
-        // An expression index over the JSON path: what an equality or a range
-        // on that path uses.
-        IndexMethod::BTree => format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({expr})"),
-        // There is no inverted index in the engine. A gin index asked for
-        // containment on an array; the query path decides containment in the
-        // host (see `appdata`), so what is indexed here is the array's text,
-        // which serves equality and nothing more. Honest, and named as such.
-        IndexMethod::Gin => format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({expr})"),
-        // Full text proper is an FTS5 virtual table kept in step with the
-        // document, and that shape (tokenizer, which paths, how a write
-        // updates it) is phase-2 work nobody has chosen yet. Until then the
-        // path is indexed as text, which serves equality and prefix lookups
-        // and is declared here as exactly that rather than as search: nothing
-        // in the platform queries full text yet, so there is no query path to
-        // quietly fall back to a scan.
-        IndexMethod::Fts => format!("CREATE INDEX IF NOT EXISTS {name} ON {table} ({expr})"),
-        // Vector wants a typed F32_BLOB column with a dimension, and the
-        // manifest has no way to declare one (D38 open items). Refused for the
-        // same reason as full text.
-        IndexMethod::Vector => {
-            return Err(StoreError::NotImplemented(format!(
-                "vector indexes need a typed column with a declared dimension ({schema}.{collection}: {idx})"
-            )));
-        }
-    };
-    query(&stmt).execute(tx).await.map_err(|e| {
+    let base = format!("{schema}__{collection}");
+    let fail = |what: &str, e: hive_db::Error| {
         StoreError::db(
-            format!("create {} index on {schema}.{collection}", idx.method),
+            format!("{what} {} index on {schema}.{collection}", idx.method),
             e,
         )
-    })?;
+    };
+    match idx.method {
+        // An expression index over the JSON path: what an equality or a range
+        // on that path uses.
+        IndexMethod::BTree | IndexMethod::Gin => {
+            // The index name is derived rather than taken from the manifest,
+            // so two apps cannot argue about it and an app cannot name one
+            // after something that already exists. It is created in the
+            // owner's file, where the table is; `table` is the bare name,
+            // which the engine resolves there. There is no inverted index
+            // in the engine: a gin index asked for containment on an array,
+            // the query path decides containment in the host (see
+            // `appdata`), and what is indexed here is the array's text,
+            // which serves equality and nothing more.
+            let name = derived_ident(&base, &format!("_{}_{ordinal}_idx", idx.method))?;
+            let name = format!("{}.{name}", quote_ident(alias));
+            query(&format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON {table} ({expr})"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("create", e))?;
+        }
+        // Full text: an FTS5 table beside the collection, kept in step by
+        // triggers that mirror the text at the path (D41 §1). A document with
+        // nothing at the path is not in it.
+        IndexMethod::Fts => {
+            let vt = virtual_table_name(&base, ordinal, "fts")?;
+            let qvt = owner_table(alias, &vt);
+            let bare = quote_ident(&vt);
+            query(&format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS {qvt} USING fts5(id UNINDEXED, body)"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("create", e))?;
+            // Inside a trigger the row is NEW, not the table.
+            let expr = in_trigger(&expr);
+            let value = format!("CAST(({expr}) AS TEXT)");
+            mirror_triggers(
+                tx,
+                alias,
+                &vt,
+                table,
+                &format!("INSERT INTO {bare} (id, body) VALUES (NEW.id, {value});"),
+                &format!("DELETE FROM {bare} WHERE id = OLD.id;"),
+                &format!("({expr}) IS NOT NULL"),
+            )
+            .await
+            .map_err(|e| fail("mirror", e))?;
+        }
+        // Semantic recall: a vec0 table beside the collection, keyed by the
+        // document id, with the manifest's dimension. The engine refuses a
+        // vector of any other size at the insert.
+        IndexMethod::Vector => {
+            let vt = virtual_table_name(&base, ordinal, "vec")?;
+            let qvt = owner_table(alias, &vt);
+            let bare = quote_ident(&vt);
+            query(&format!(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS {qvt} USING vec0(id TEXT PRIMARY KEY, embedding float[{}])",
+                idx.dim
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("create", e))?;
+            // `->` rather than `->>` for the array: the mirror wants the JSON
+            // text of the array, which vec_f32 parses.
+            let json = in_trigger(&doc_json_path(idx)?);
+            mirror_triggers(
+                tx,
+                alias,
+                &vt,
+                table,
+                &format!("INSERT INTO {bare} (id, embedding) VALUES (NEW.id, vec_f32({json}));"),
+                &format!("DELETE FROM {bare} WHERE id = OLD.id;"),
+                &format!("({json}) IS NOT NULL"),
+            )
+            .await
+            .map_err(|e| fail("mirror", e))?;
+        }
+    }
     Ok(())
+}
+
+/// The three triggers that keep a virtual table in step with its collection
+/// table: insert, update (as delete then insert) and delete. Recreated on
+/// every apply, so a changed path is a changed mirror.
+async fn mirror_triggers(
+    tx: &Connection,
+    alias: &str,
+    vt: &str,
+    table: &str,
+    insert: &str,
+    delete: &str,
+    present: &str,
+) -> hive_db::Result<()> {
+    let q = quote_ident(alias);
+    for suffix in ["_ai", "_au", "_ad"] {
+        let name = quote_ident(&format!("{vt}{suffix}"));
+        query(&format!("DROP TRIGGER IF EXISTS {q}.{name}"))
+            .execute(tx)
+            .await?;
+        // The insert mirrors only when the path has a value: the WHEN clause
+        // carries that for an insert, and an update guards its own insert
+        // inside the body after removing the old row, so a value that went
+        // away leaves no mirror row behind.
+        let stmt = match suffix {
+            "_ai" => format!(
+                "CREATE TRIGGER {q}.{name} AFTER INSERT ON {table} WHEN {present} BEGIN {insert} END"
+            ),
+            "_au" => format!(
+                "CREATE TRIGGER {q}.{name} AFTER UPDATE OF doc ON {table} BEGIN {delete} {} END",
+                guarded_insert(insert, present)
+            ),
+            _ => format!("CREATE TRIGGER {q}.{name} AFTER DELETE ON {table} BEGIN {delete} END"),
+        };
+        query(&stmt).execute(tx).await?;
+    }
+    Ok(())
+}
+
+/// `INSERT ... VALUES (...)` becomes `INSERT ... SELECT ... WHERE present`,
+/// so an update that removes the value removes the mirror row and adds none.
+fn guarded_insert(insert: &str, present: &str) -> String {
+    let (head, values) = insert
+        .split_once(" VALUES ")
+        .expect("mirror insert has a VALUES clause");
+    let values = values.trim_end_matches(';').trim();
+    let values = values
+        .strip_prefix('(')
+        .and_then(|v| v.strip_suffix(')'))
+        .expect("mirror values are parenthesised");
+    format!("{head} SELECT {values} WHERE {present};")
+}
+
+/// The name of an index's virtual table: `<schema>__<collection>_<n>_<kind>`.
+fn virtual_table_name(base: &str, ordinal: usize, kind: &str) -> Result<String> {
+    let name = format!("{base}_{ordinal}_{kind}");
+    if name.len() > MAX_IDENTIFIER * 2 + 2 {
+        return Err(StoreError::UnsafeIdentifier(format!(
+            "{name:?} is {} characters, past the bound derived names are held to",
+            name.len()
+        )));
+    }
+    Ok(name)
+}
+
+/// Whether a table under an install's prefix is one of the virtual tables
+/// an index provisions, by its sql: those are dropped first, by name, and
+/// take their shadow tables with them (D41 measurement 6).
+pub(crate) fn is_virtual(sql: &str) -> bool {
+    sql.trim_start()
+        .get(..21)
+        .is_some_and(|s| s.eq_ignore_ascii_case("CREATE VIRTUAL TABLE "))
 }
 
 /// The qualified, quoted table name for a collection in the owner's file:
@@ -247,6 +376,27 @@ fn doc_path(idx: &Index) -> Result<String> {
             " -> "
         };
         expr.push_str(op);
+        expr.push_str(&quote_literal(seg));
+    }
+    Ok(expr)
+}
+
+/// A `doc`-rooted accessor as a trigger body sees it: the row being
+/// written is `NEW`, and a bare column name there is the table's.
+fn in_trigger(expr: &str) -> String {
+    expr.replacen("doc", "NEW.doc", 1)
+}
+
+/// The accessor that yields the JSON at the path rather than the SQL value
+/// at its last hop: what `vec_f32` wants for an array.
+fn doc_json_path(idx: &Index) -> Result<String> {
+    if idx.path.is_empty() {
+        return Err(StoreError::UnsafeIdentifier("index with no path".into()));
+    }
+    let mut expr = String::from("doc");
+    for seg in &idx.path {
+        check_ident(seg)?;
+        expr.push_str(" -> ");
         expr.push_str(&quote_literal(seg));
     }
     Ok(expr)

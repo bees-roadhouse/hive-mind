@@ -47,6 +47,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # connections per process (hive-db's docs have the reproduction). hive-db is
 # the seam; the engine swaps there when the fork is fixed or phase 3 needs it.
 rusqlite = { version = "0.37", features = ["bundled"] }
+sqlite-vec = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
@@ -91,7 +92,10 @@ hickory-resolver = { version = "0.25", default-features = false, features = ["to
 
 [workspace.lints.rust]
 # The Go host had no CGo anywhere. This is that rule in the new language.
-unsafe_code = "forbid"
+# `deny`, not `forbid`: hive-db carries the one `unsafe` the engine needs
+# (registering sqlite-vec, D41) under its own allow, and hive-repodocs holds
+# every other crate to none. A forbid could not be lifted for that one.
+unsafe_code = "deny"
 
 [profile.release]
 lto = true

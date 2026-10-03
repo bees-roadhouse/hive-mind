@@ -41,9 +41,10 @@ use crate::appschema::{check_ident, table_name};
 use crate::docblobs::descriptors_in;
 use crate::events::{Event, append_events};
 use crate::grants::{Access, ActingInstall, Reason, Subject};
-use crate::owners::attach_owner;
+use crate::owners::{attach_owner, owner_table};
 use crate::predicate::{self, Args};
 use crate::{Result, Store, StoreError};
+use hive_manifest::IndexMethod;
 
 /// The host-mediated data layer over a store and a blob catalog.
 ///
@@ -75,6 +76,17 @@ struct DocRequest {
     r#match: Option<serde_json::Value>,
     limit: i64,
     after: String,
+    /// Words to find in a full-text index of the collection. Words, not a
+    /// query: every token is quoted before it reaches the engine (D41 §2).
+    search: String,
+    /// Rank by distance in the vector index declared at `path`.
+    near: Option<Near>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Near {
+    path: String,
+    vector: Vec<f32>,
 }
 
 /// What a read returns.
@@ -87,6 +99,9 @@ struct DocRow {
     trust: Level,
     #[serde(skip_serializing_if = "String::is_empty")]
     tainted_by: String,
+    /// Present on a `near` query: the distance the ranking used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distance: Option<f64>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -102,6 +117,18 @@ pub struct InstallInfo {
     /// the same joined row for free, and splitting it out would cost a second
     /// round trip on the storage hot path.
     pub collections: Vec<String>,
+    /// The indexes each collection declares, with their ordinals, which is
+    /// how a `search` or a `near` finds the virtual table to ask (D41). Read
+    /// off the build row, never off the request (invariant 11).
+    pub indexes: Vec<IndexDecl>,
+}
+
+/// One declared index of one collection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexDecl {
+    pub collection: String,
+    pub ordinal: usize,
+    pub index: hive_manifest::Index,
 }
 
 /// Looks up an install and refuses anything but an active one. It is the ONE
@@ -115,8 +142,7 @@ pub struct InstallInfo {
 pub async fn resolve_active_install(db: &Connection, install_id: Uuid) -> Result<InstallInfo> {
     let row = query(
         "SELECT i.id, i.slug, i.schema_name, i.owner_kind, i.owner_id, i.state,
-                (SELECT json_group_array(json_extract(c.value, '$.name'))
-                   FROM json_each(b.manifest, '$.storage.collections') AS c) AS collections
+                coalesce(json_extract(b.manifest, '$.storage.collections'), '[]') AS collections
            FROM installs i
            JOIN app_builds b ON b.id = i.build_id
           WHERE i.id = ?1",
@@ -137,15 +163,30 @@ pub async fn resolve_active_install(db: &Connection, install_id: Uuid) -> Result
         ))));
     }
     let owner_kind: String = row.get("owner_kind");
-    let collections: serde_json::Value = row.get("collections");
-    let collections = collections
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let declared: serde_json::Value = row.get("collections");
+    // The manifest was validated when the build was registered, so an index
+    // that does not parse here is corruption rather than a caller error.
+    let declared: Vec<hive_manifest::Collection> =
+        serde_json::from_value(declared).map_err(|e| {
+            StoreError::Other(format!(
+                "install {install_id}: collections do not parse: {e}"
+            ))
+        })?;
+    let mut collections = Vec::with_capacity(declared.len());
+    let mut indexes = Vec::new();
+    for c in &declared {
+        collections.push(c.name.clone());
+        for (ordinal, decl) in c.indexes.iter().enumerate() {
+            let index = hive_manifest::parse_index(decl).map_err(|e| {
+                StoreError::Other(format!("install {install_id}: index {decl:?}: {e}"))
+            })?;
+            indexes.push(IndexDecl {
+                collection: c.name.clone(),
+                ordinal,
+                index,
+            });
+        }
+    }
     Ok(InstallInfo {
         id: row.get("id"),
         slug: row.get("slug"),
@@ -156,6 +197,7 @@ pub async fn resolve_active_install(db: &Connection, install_id: Uuid) -> Result
             row.get("owner_id"),
         ),
         collections,
+        indexes,
     })
 }
 
@@ -399,6 +441,30 @@ impl Target {
     }
 }
 
+/// A write the engine refused on the document's own account. A vector of
+/// the wrong dimension is the one case the mirror trigger raises for, and it
+/// is the caller's mistake, not the host's failure.
+fn doc_write_error(what: &str, e: hive_db::Error) -> StoreError {
+    let msg = e.message();
+    if msg.contains("Dimension mismatch") {
+        return StoreError::Host(HostError::invalid(
+            "a vector in the document has the wrong dimension for its index",
+        ));
+    }
+    StoreError::db(what, e)
+}
+
+/// FTS5 is given words, never a query: every whitespace-separated token is
+/// quoted as a phrase, with the one character a phrase cannot contain
+/// doubled, so `OR`, `NOT`, `*`, `:` and parentheses mean nothing (D41 §2).
+fn fts_words(search: &str) -> String {
+    search
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// JSON containment, the rule Postgres's `@>` applied and the one the guest
 /// API promises: every key of `needle` is present in `hay` with a value that
 /// itself contains the needle's; an array contains another when every element
@@ -516,7 +582,7 @@ impl AppData {
         .bind(created)
         .execute(&tx)
         .await
-        .map_err(|e| StoreError::db("insert document", e))?;
+        .map_err(|e| doc_write_error("insert document", e))?;
 
         // Same transaction as the document, which is the whole requirement: a
         // window where the row exists and its references do not is a window
@@ -696,7 +762,7 @@ impl AppData {
         .bind(updated)
         .fetch_scalar_optional(&tx)
         .await
-        .map_err(|e| StoreError::db("update document", e))?;
+        .map_err(|e| doc_write_error("update document", e))?;
         let updated =
             touched.ok_or_else(|| StoreError::Host(HostError::not_found("no such document")))?;
         query(
@@ -894,19 +960,101 @@ impl AppData {
             now: "?6",
             acting_install: "NULL",
         });
+
+        // The virtual tables a `search` or a `near` consults, resolved from
+        // the install's declared indexes (D41 §2). The id sets they produce
+        // are filters on the same statement the predicate governs.
+        let base = format!("{}__{}", target.info.schema, target.collection);
+        let mut search_clause = String::new();
+        let mut words: Option<String> = None;
+        if !d.search.trim().is_empty() {
+            let fts: Vec<String> = target
+                .info
+                .indexes
+                .iter()
+                .filter(|i| i.collection == target.collection && i.index.method == IndexMethod::Fts)
+                .map(|i| format!("{base}_{}_fts", i.ordinal))
+                .collect();
+            if fts.is_empty() {
+                return Err(StoreError::Host(HostError::invalid(format!(
+                    "collection {:?} declares no full-text index",
+                    target.collection
+                ))));
+            }
+            let arms: Vec<String> = fts
+                .iter()
+                .map(|vt| {
+                    format!(
+                        "SELECT id FROM {} WHERE {} MATCH ?8",
+                        owner_table(&target.alias, vt),
+                        hive_db::quote_ident(vt)
+                    )
+                })
+                .collect();
+            search_clause = format!("AND t.id IN ({})", arms.join(" UNION "));
+            words = Some(fts_words(&d.search));
+        }
+        let mut near_join = String::new();
+        let mut near_vector: Option<String> = None;
+        let mut order = "ORDER BY t.created_at DESC, t.id DESC".to_string();
+        let mut distance_col = "NULL AS distance".to_string();
+        if let Some(near) = &d.near {
+            let wanted: Vec<String> = near.path.split('.').map(String::from).collect();
+            let decl = target
+                .info
+                .indexes
+                .iter()
+                .find(|i| {
+                    i.collection == target.collection
+                        && i.index.method == IndexMethod::Vector
+                        && i.index.path == wanted
+                })
+                .ok_or_else(|| {
+                    StoreError::Host(HostError::invalid(format!(
+                        "collection {:?} declares no vector index at {:?}",
+                        target.collection, near.path
+                    )))
+                })?;
+            if near.vector.len() as u32 != decl.index.dim {
+                return Err(StoreError::Host(HostError::invalid(format!(
+                    "vector has {} dimensions; the index at {:?} has {}",
+                    near.vector.len(),
+                    near.path,
+                    decl.index.dim
+                ))));
+            }
+            let vt = owner_table(&target.alias, &format!("{base}_{}_vec", decl.ordinal));
+            near_join = format!(
+                "JOIN (SELECT id, distance FROM {vt} WHERE embedding MATCH vec_f32(?9) AND k = ?7) v ON v.id = t.id"
+            );
+            near_vector = Some(serde_json::to_string(&near.vector)?);
+            order = "ORDER BY v.distance, t.id".to_string();
+            distance_col = "v.distance AS distance".to_string();
+        }
+
         let sql = format!(
-            "SELECT t.id, e.ref, e.kind, t.doc, t.trust, t.tainted_by, t.created_at, t.updated_at
+            "SELECT t.id, e.ref, e.kind, t.doc, t.trust, t.tainted_by, t.created_at, t.updated_at,
+                    {distance_col}
                FROM {} t
                JOIN main.entities e ON e.id = t.id
+               {near_join}
               WHERE e.deleted_at IS NULL
                 AND (?1 = '' OR e.kind = ?1)
                 AND (?2 IS NULL OR (t.created_at, t.id) < (
                         (SELECT created_at FROM entities WHERE id = ?2), ?2))
                 AND {reason} IS NOT NULL
-              ORDER BY t.created_at DESC, t.id DESC
+                {search_clause}
+                AND coalesce(?8, ?9, '') IS NOT NULL
+              {order}
               LIMIT ?7",
             target.table()
         );
+        // The words and the vector are bound on every query; the `coalesce`
+        // above references them so a statement with neither still has every
+        // numbered placeholder it is handed. A `near` is one ranked read of
+        // k rows, not a page through a log: the cursor does not apply and
+        // the batch is the answer.
+        let ranked = d.near.is_some();
 
         // A batch containing untrusted content taints the invocation that read
         // it. Anything weaker would let a guest launder by reading in bulk.
@@ -916,18 +1064,21 @@ impl AppData {
         // means the collection is exhausted.
         let mut exhausted = false;
         while (out.len() as i64) < limit && !exhausted {
+            let batch = if ranked { limit } else { QUERY_BATCH };
             let rows = query(&sql)
                 .bind(&d.kind)
-                .bind(after)
+                .bind(if ranked { None } else { after })
                 .bind(req.caller.cred.principal_kind.as_str())
                 .bind(req.caller.cred.principal_id)
                 .bind(req.caller.cred.actor_id)
                 .bind(hive_db::now())
-                .bind(QUERY_BATCH)
+                .bind(batch)
+                .bind(words.as_deref())
+                .bind(near_vector.as_deref())
                 .fetch_all(&conn)
                 .await
                 .map_err(|e| StoreError::db("query documents", e))?;
-            exhausted = (rows.len() as i64) < QUERY_BATCH;
+            exhausted = ranked || (rows.len() as i64) < QUERY_BATCH;
             for r in &rows {
                 let row = scan_doc(r);
                 after = Some(row.id);
@@ -1112,6 +1263,7 @@ impl AppData {
 }
 
 fn scan_doc(r: &Row) -> DocRow {
+    let distance: Option<f64> = r.try_get("distance").ok().flatten();
     let trust: String = r.get("trust");
     DocRow {
         id: r.get("id"),
@@ -1119,6 +1271,7 @@ fn scan_doc(r: &Row) -> DocRow {
         kind: r.get("kind"),
         doc: r.get("doc"),
         trust: Level::from_db(&trust),
+        distance,
         tainted_by: r.get::<Option<String>>("tainted_by").unwrap_or_default(),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),

@@ -385,6 +385,12 @@ fn crud_body(collection: &str, op: Op, args: &serde_json::Value) -> serde_json::
             if let Some(c) = take("cursor") {
                 body.insert("after".into(), c);
             }
+            if let Some(q) = take("search") {
+                body.insert("search".into(), q);
+            }
+            if let Some(n) = take("near") {
+                body.insert("near".into(), n);
+            }
         }
         Op::Get | Op::Delete => {
             if let Some(id) = take("id") {

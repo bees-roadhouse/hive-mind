@@ -23,7 +23,7 @@ Phase 0, and honest about the gap. What exists:
 | `crates/hive-schema` | the forward-only migrations, applied in one write transaction, with the checksum |
 | `crates/hive-store` | the data layer, the grant predicate, install authority, credentials, chat, the guest-facing storage |
 | `crates/hive-wasmhost` | guest apps on wasmtime behind the JSON ABI, with trust structural in the ABI |
-| `crates/hive-blob` | the driver seam — disk and S3-compatible (Garage) drivers — and the reference layer |
+| `crates/hive-blob` | content-addressed bytes on a mounted path, and the reference layer where ownership and trust live |
 | `crates/hive-bus` | the events table as transport, an in-process bell as wakeup, SSE fan-out |
 | `crates/hive-mcp` | the tools tier: what `tools/list` shows is what `tools/call` accepts |
 | `crates/hive-surfaces` | hive-mcp's collaborators over the store and the wasm host, and the app routes |
@@ -136,9 +136,6 @@ gate; `docs/chat.md` says how the pieces fit.
 
 ```bash
 ./scripts/gate-rust.sh       # fmt, clippy, build, test, named skips; nothing to start first
-
-./scripts/garage-up.sh       # S3 on 127.0.0.1:53900, for the blob driver tests
-./scripts/garage-down.sh
 
 ./scripts/gate-container.sh  # the same gate, inside a Podman-built toolchain image
 ```

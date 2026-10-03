@@ -1,4 +1,5 @@
-//! Where bytes physically live. Disk today, S3-compatible beside it.
+//! Where bytes physically live. Disk, on a mounted path (D40); the seam stays
+//! so a second backend is a config-time choice and never a catalogue change.
 //!
 //! The split that makes crashes recoverable: **the catalog is the authority on
 //! what exists; the driver is the authority on what the bytes are.** Neither is
@@ -52,8 +53,9 @@ pub trait Driver: Send + Sync {
 /// What a backend supports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Caps {
-    /// Whether `deliver` can return a signed URL. Disk cannot; S3-compatible
-    /// backends can.
+    /// Whether `deliver` can return a signed URL. Disk cannot; an object
+    /// store behind a signing endpoint could, and the rule in
+    /// `plan_delivery` is what such a driver would have to obey.
     pub presign: bool,
     /// Bounds how long a signed URL stays valid.
     pub max_presign_ttl: Duration,

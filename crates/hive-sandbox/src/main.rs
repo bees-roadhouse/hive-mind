@@ -69,10 +69,7 @@ struct Args {
     /// Apply pending migrations at boot.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     migrate: bool,
-    /// Blob backend: disk or s3.
-    #[arg(long, env = "HIVE_SANDBOX_BLOB_DRIVER", default_value = "disk")]
-    blob_driver: String,
-    /// Blob root for the disk driver.
+    /// Where blobs live: a path, on whatever is mounted there (D40).
     #[arg(
         long,
         env = "HIVE_SANDBOX_BLOB_ROOT",
@@ -235,7 +232,6 @@ async fn run() -> anyhow::Result<()> {
         // at first guest call that it has no blob backend has already told an
         // orchestrator it was ready.
         let driver = blob_driver(&BlobConfig {
-            driver: args.blob_driver.clone(),
             root: args.blob_root.clone(),
         })
         .await

@@ -183,7 +183,7 @@ database-backed test in the repo skipped itself** ... the whole grant
 predicate suite included ... and the gate still printed `GATE GREEN` in about
 the same wall time, because skipping is fast. A fix to a live cross-principal
 leak was reported as gate-green over a reproduction that had never executed.
-The tiers that still need a backend (Podman, Garage, chromium) are the ones
+The tiers that still need a backend (Podman, chromium) are the ones
 that rule now guards.
 
 The gate also NAMES every test that skipped, every run. A skip is a test saying
@@ -211,16 +211,15 @@ A single test needs nothing running. `hive_testdb::TestDb` hands every test a
 private store (two files under the temp directory, plus the owner files a
 test creates beside them) and deletes them on the way out, so there is no
 shared mutable fixture and no ordering between tests: run one, run them in
-parallel, run them in any order.
+parallel, run them in any order. Blobs in tests go to a temp directory too.
 
-There are four test tiers and three of them are invisible to `cargo test` on
+There are three test tiers and two of them are invisible to `cargo test` on
 a bare machine:
 
 | tier | needs | brought up by |
 |---|---|---|
 | unit + integration | nothing | `cargo test` |
 | container (harness, egress) | Podman, both images | `./scripts/harness-build.sh`, `./scripts/egress-build.sh` |
-| blob store (S3 driver) | Garage, four `HIVE_SANDBOX_TEST_S3_*` | `./scripts/garage-up.sh` |
 | end-to-end | a daemon and chromium | `cd test/e2e && npm install && npm run browsers && npm test` |
 
 **`HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS=1` turns a skip into a failure.** It is
@@ -290,8 +289,8 @@ crates/hive-registry/  manifest + module + the store = an installed app. Where a
                        evidence. Everything decidable at install is decided at install
 crates/hive-wasmhost/  wasmtime runtime, compiled-module cache, instance pool, the ABI, the
                        capability host modules, taint. The guest contract is in its lib.rs doc
-crates/hive-blob/      the driver seam: disk and S3-compatible (Garage) drivers, chosen at config
-                       time (D11), and the catalog where refs, ownership and trust live
+crates/hive-blob/      content-addressed bytes on the path mounted at --blob-root (D11's seam,
+                       one driver, D40), and the catalog where refs, ownership and trust live
 crates/hive-bus/       events table + the in-process bell + the backstop poll + SSE fan-out
 crates/hive-harness/   hosted agent runs (claude / codex / opencode), rootless Podman, the
                        supervisor that drains, deadlines and terminates

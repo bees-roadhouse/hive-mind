@@ -1,6 +1,6 @@
 //! The one seam between hive-sandbox and wherever object bytes physically live
-//! (D11). Local disk today, S3-compatible (Garage) at config time, with nothing
-//! above the seam changing.
+//! (D11). One driver, local disk, on whatever is mounted at the blob root;
+//! replication is the mount's job (D40), and nothing above the seam knows.
 //!
 //! Every byte in the platform goes here: uploads, screenshots, compiled guest
 //! modules, guest source, harness transcripts, stream spools, oversized workflow
@@ -41,7 +41,6 @@ mod download;
 mod driver;
 mod hash;
 mod relocate;
-mod s3;
 
 pub use catalog::{Catalog, Provenance, Ref, RefSpec, SourceKind, State};
 pub use disk::DiskDriver;
@@ -55,7 +54,6 @@ pub use driver::{
 };
 pub use hash::{Class, Descriptor, Hash, Hasher};
 pub use relocate::Relocator;
-pub use s3::{DEFAULT_MAX_PRESIGN_TTL, S3Config, S3Driver};
 
 /// Errors the seam defines. Drivers map their backend's failures onto these
 /// rather than inventing their own, so a caller can branch on the condition

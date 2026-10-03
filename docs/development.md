@@ -8,7 +8,7 @@ From nothing to a passing test suite. Assumes you have none of this installed.
 | ------------------- | -------------------------------------------- | -------------------------------------- | ------------------------------------------ |
 | **Rust** via rustup | the daemon; `rust-toolchain.toml` pins 1.98 with clippy and rustfmt, rustup installs it on first `cargo` | https://rustup.rs | `winget install Rustlang.Rustup` |
 | **`wasm32-wasip1`** | building guests (`rustup target add wasm32-wasip1`); not needed to run the tests, the built guests are checked in | same | same |
-| **Podman 5+**       | the harness, egress and blob-store tiers only (Docker works too); the store is SQLite files and needs nothing | `brew install podman` / your package manager | `winget install RedHat.Podman-Desktop` |
+| **Podman 5+**       | the harness and egress tiers only (Docker works too); the store is SQLite files and blobs are a path | `brew install podman` / your package manager | `winget install RedHat.Podman-Desktop` |
 | **Node 20+**        | the Playwright suite only | `brew install node` / nvm | `winget install OpenJS.NodeJS.LTS` |
 
 One PATH note that has already bitten someone: rustup installs to
@@ -35,7 +35,7 @@ temp directory and deletes them on the way out. `HIVE_SANDBOX_TEST_DB_DIR` moves
 the wrong place (a RAM disk, a slower disk you want to keep off).
 
 `cargo test --workspace` therefore runs every database test on a bare machine.
-The tiers that still skip without a backend (Podman, Garage, chromium) print
+The tiers that still skip without a backend (Podman, chromium) print
 `SKIPPED: <name> <why>` so the gate can name them.
 
 ## Run the gate

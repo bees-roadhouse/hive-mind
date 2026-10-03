@@ -63,10 +63,11 @@ pub fn range_header(r: Range) -> String {
 /// Whether a status might mean the URL has expired.
 ///
 /// **Not 403 alone.** The obvious implementation keys stale-URL retry on 403
-/// because that is what AWS returns, and Garage returns **400** on an expired
-/// signature. AWS-shaped refresh logic therefore never fires against Garage,
-/// and the failure looks like a permanent permission error on a URL that would
-/// work if it were reminted.
+/// because that is what AWS returns, and some S3-compatible stores (Garage,
+/// measured when the platform still had an S3 driver) return **400** on an
+/// expired signature. Refresh logic keyed on 403 never fires there, and the
+/// failure looks like a permanent permission error on a URL that would work
+/// if it were reminted.
 ///
 /// So the set is deliberately wider than one status, and the retry is bounded
 /// to one attempt instead ... a URL rejected twice is wrong rather than stale.

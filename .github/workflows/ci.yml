@@ -172,7 +172,7 @@ jobs:
       - name: container tests, where a skip is a failure
         env:
           HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS: "1"
-        run: cargo test -p hive-harness --test supervisor -- podman_runs_the_pinned_image egress_proxy_enforces_the_allowlist
+        run: cargo test -p hive-harness --test supervisor -- podman_runs_the_pinned_image egress_proxy_enforces_the_allowlist egress_proxy_that_dies_reports_its_exit
 
       - name: nothing outlived the run
         if: ${{ always() }}

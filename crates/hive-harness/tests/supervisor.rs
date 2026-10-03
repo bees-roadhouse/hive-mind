@@ -744,7 +744,10 @@ async fn egress_proxy_that_dies_reports_its_exit() {
     let msg = err.to_string();
     assert!(msg.contains("exited before listening"), "error = {msg}");
     assert!(msg.contains("exit code"), "error = {msg}");
-    assert!(msg.contains("--egress-dns"), "the proxy's own words are missing: {msg}");
+    assert!(
+        msg.contains("--egress-dns"),
+        "the proxy's own words are missing: {msg}"
+    );
     assert!(
         !container_exists(&spec.proxy_container_name()),
         "the dead proxy was left behind"

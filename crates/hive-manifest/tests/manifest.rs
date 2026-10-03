@@ -909,7 +909,7 @@ fn golden_manifest() -> Manifest {
 /// DECISION: this fails, you look, and either the change was unintended or you
 /// bump DERIVE_VERSION so that every persisted surface hash stays attributable
 /// to the deriver that produced it.
-const GOLDEN_HASH: &str = "8484945fa1ec2e5c430030996406b966c1db12be3ff1c22ac2824326f37da765";
+const GOLDEN_HASH: &str = "77800d44f427b373e830c0e09b797ec457b77059c55fb3f95a9c8fe146c6e881";
 
 #[test]
 fn derived_surface_is_golden() {

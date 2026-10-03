@@ -304,6 +304,5 @@ Until then the only replica is the daemon's own.
 - (Closed the same day.) Whether `hive-db` keeps a connection pool: it
   does, bounded, checkout semantics, a connection mid-transaction closed
   rather than returned. See §1 for what measured it.
-- The vector index method for app collections (`IndexMethod::Vector`
-  still refuses, now for a different reason: the manifest has no way to
-  declare a dimension, and `F32_BLOB` needs one).
+- The vector index method for app collections: closed by D41, sqlite-vec
+  in the engine with the manifest's `vector(path, dim)`.

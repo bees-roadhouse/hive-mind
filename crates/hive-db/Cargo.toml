@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 rusqlite.workspace = true
+sqlite-vec.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 serde_json.workspace = true

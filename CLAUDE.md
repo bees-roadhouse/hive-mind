@@ -264,7 +264,8 @@ guidance, never fewer.
 ## Layout
 
 ```
-Cargo.toml             the host workspace: crates/*, unsafe forbidden at the workspace, toolchain
+Cargo.toml             the host workspace: crates/*, unsafe denied at the workspace (one named
+                       exception in hive-db, D41), toolchain
                        pinned in rust-toolchain.toml. guest/ and apps/* are excluded: they are
                        the guest workspace and only build for wasm32-wasip1
 crates/hive-sandbox/   the daemon binary. Roles are flags, one process serves all of them (D7):
@@ -328,7 +329,7 @@ and has tests.
 ## Conventions
 
 - **Rust, 1.98**, pinned in `rust-toolchain.toml` with clippy and rustfmt;
-  edition 2024; `unsafe_code = "forbid"` at the workspace, which is the no-CGo
+  edition 2024; `unsafe_code = "deny"` at the workspace, which is the no-CGo
   rule in the new language ... a host with no `unsafe` cannot smuggle a native
   library in. `rusqlite` with the bundled engine (D38): the store is a file,
   so the gate builds and tests on a machine with nothing running, and the
@@ -336,8 +337,11 @@ and has tests.
   smuggled past the rule; `axum` 0.8; `wasmtime`, WASI preview 1 only;
   `tokio`. The reason behind each pick is in D24 and D38 and outlives the
   pick.
-- **`unsafe` is allowed in `guest/` and `apps/*` and nowhere else.** The SDK
-  calls the host's imports, which are `extern "C"`. That is why the guests are
+- **`unsafe` is allowed in `guest/`, `apps/*`, and one module of `hive-db`,
+  and nowhere else.** The SDK calls the host's imports, which are `extern
+  "C"`; `hive-db` registers sqlite-vec with the engine once per process
+  (D41), and `hive-repodocs` asserts no other crate has an `unsafe` block or
+  lifts the lint. That is why the guests are
   their own workspace rather than members with an allow attribute. ONE
   workspace for the SDK and every app, rooted at `guest/`: cargo hashes a path
   dependency's location into every symbol name unless it sits inside the

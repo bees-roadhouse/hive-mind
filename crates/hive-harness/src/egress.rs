@@ -81,6 +81,7 @@ impl PodmanLauncher {
         let mut args: Vec<String> = vec![
             s("run"),
             s("--detach"),
+            s("--rm"),
             // No --rm: a proxy that dies before listening must still be there
             // for wait_for_proxy to read its logs and exit code (#115).
             // stop_egress removes it on every path, this one included.

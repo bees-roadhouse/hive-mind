@@ -217,18 +217,16 @@ impl Subject {
 /// subject outright and `authorize_collection` is the only way to decide one.
 /// That is a runtime refusal with a test behind it, not a type-level barrier,
 /// and it is written down as such rather than dressed up as one.
-/// **Nothing in the platform writes an install grant yet, and that is
-/// intended.** `write_grant` binds `target_kind` and `target_id` and no
-/// `target_install_id`, so it cannot produce one ... and the
-/// `grants_target_shape` CHECK would refuse it if it tried. The registry will
-/// write them when it derives an app's manifest `uses` at activation, which is
-/// the rest of #86.
+/// **Only `activate_install` writes an install grant**, deriving them from
+/// the manifest's `uses` when a human owner activates (#86). `write_grant`
+/// binds `target_kind` and `target_id` and no `target_install_id`, so it
+/// cannot produce one, and `write_install_grant` is the one writer that can.
 ///
-/// Until then a cross-install collection read denies, always, and **that
-/// denial is the feature working**. This note exists because the failure looks
-/// identical to a bug: an app declares what it needs, the install activates,
-/// and every read is refused with nothing in the logs to say why. Someone will
-/// lose an afternoon to it otherwise.
+/// A cross-install collection read with no such grant denies, and **that
+/// denial is the feature working**. This note stays because the failure
+/// looks identical to a bug: an app declares what it needs, somebody flips
+/// the install to active by hand, and every read is refused with nothing in
+/// the logs to say why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ActingInstall(pub Uuid);
 
@@ -778,6 +776,66 @@ pub async fn write_grant(db: &Connection, spec: &GrantSpec) -> Result<Uuid> {
     .fetch_scalar(db)
     .await
     .map_err(|e| StoreError::db("write grant", e))
+}
+
+/// Inserts a grant whose target is an INSTALL (D33): the subject collection
+/// may be reached by `target_install` on behalf of the principal who owns
+/// both. Returns the id, or the id of the identical live grant if one already
+/// exists, so deriving an app's `uses` at every activation is idempotent.
+///
+/// The trigger still decides who may write it: the granting credential must
+/// act for the subject's owner and be human (an AI-authored install grant
+/// crosses the boundary D13.14 guards). There is no `inherited` or
+/// `override` form of an install grant; the schema refuses the latter.
+pub async fn write_install_grant(
+    db: &Connection,
+    subject: &Subject,
+    target_install: Uuid,
+    access: Access,
+    by: &Credential,
+    reason: &str,
+) -> Result<Uuid> {
+    let existing: Option<Uuid> = query(
+        "SELECT id FROM grants
+          WHERE subject_kind = ?1 AND subject_id = ?2 AND subject_name IS ?3
+            AND target_kind = 'install' AND target_install_id = ?4
+            AND access = ?5 AND source = 'direct' AND revoked_at IS NULL
+          LIMIT 1",
+    )
+    .bind(subject.kind.as_str())
+    .bind(subject.id)
+    .bind(subject.name())
+    .bind(target_install)
+    .bind(access.as_str())
+    .fetch_scalar_optional(db)
+    .await
+    .map_err(|e| StoreError::db("look up install grant", e))?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    query(
+        "INSERT INTO grants (
+             id, subject_kind, subject_id, subject_name,
+             target_kind, target_install_id, access, source,
+             granted_by_actor, granted_by_principal_kind, granted_by_principal_id,
+             reason, created_at)
+         VALUES (?1,?2,?3,?4,'install',?5,?6,'direct',?7,?8,?9,?10,?11)
+         RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(subject.kind.as_str())
+    .bind(subject.id)
+    .bind(subject.name())
+    .bind(target_install)
+    .bind(access.as_str())
+    .bind(by.actor_id)
+    .bind(by.principal_kind.as_str())
+    .bind(by.principal_id)
+    .bind(reason)
+    .bind(hive_db::now())
+    .fetch_scalar(db)
+    .await
+    .map_err(|e| StoreError::db("write install grant", e))
 }
 
 /// Deletes a grant. Deleting rather than flagging is deliberate: every

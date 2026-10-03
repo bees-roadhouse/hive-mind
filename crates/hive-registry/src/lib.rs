@@ -227,3 +227,60 @@ impl Prepared {
         })
     }
 }
+
+/// The slug of the built-in app every principal gets an install of (D32).
+pub const CORE_APP: &str = "core";
+
+/// The core app: the five core kinds as generated-CRUD collections, no
+/// functions, no module, no capabilities. It is an app like any other so
+/// that `core/contacts` resolves through the same predicate as everything
+/// else, and so that a custom kind is one more collection in a manifest
+/// rather than a special case anywhere.
+pub fn core_manifest() -> Manifest {
+    let coll = |name: &str| hive_manifest::Collection {
+        name: name.into(),
+        crud: true,
+        indexes: vec![],
+    };
+    Manifest {
+        kind: Some(hive_manifest::Kind::App),
+        name: CORE_APP.into(),
+        version: 1,
+        storage: hive_manifest::Storage {
+            collections: vec![
+                coll("entries"),
+                coll("tasks"),
+                coll("lists"),
+                coll("contacts"),
+                coll("decisions"),
+            ],
+            uses: vec![],
+        },
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+
+    /// The core manifest is a valid app with no guest code, so it prepares
+    /// against no exports and its kinds are the five D32 names.
+    #[test]
+    fn the_core_manifest_prepares_without_a_module() {
+        let m = core_manifest();
+        let p = prepare(&m, &Exports::none()).expect("prepare core");
+        assert!(!p.needs_module());
+        let names: Vec<&str> = m
+            .storage
+            .collections
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["entries", "tasks", "lists", "contacts", "decisions"]
+        );
+        assert!(m.capabilities.is_empty(), "core declares no capabilities");
+    }
+}

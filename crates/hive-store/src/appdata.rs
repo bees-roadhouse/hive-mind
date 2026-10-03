@@ -217,7 +217,7 @@ struct QualifiedName<'a> {
 
 /// The reserved qualifier for the per-owner core install that holds the
 /// platform kinds (entries, tasks, lists, contacts, decisions).
-const CORE_APP: &str = "core";
+use hive_registry::CORE_APP;
 
 impl<'a> QualifiedName<'a> {
     fn parse(raw: &'a str) -> Result<QualifiedName<'a>> {

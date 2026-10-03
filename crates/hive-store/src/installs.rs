@@ -3,6 +3,7 @@ use hive_db::{Connection, query};
 use hive_identity::{Credential, Owner, PrincipalKind};
 use uuid::Uuid;
 
+use crate::grants::{Access, Subject, write_install_grant};
 use crate::predicate;
 use crate::{Result, StoreError};
 
@@ -214,7 +215,14 @@ pub async fn activate_install(conn: &Connection, install_id: Uuid, by: &Credenti
     // An AI acting for the owner falls through to the standing route, which is
     // the whole point of D19.4.
     let is_owner = acts_for(conn, by, owner).await?;
+    let uses = declared_uses(conn, install_id).await?;
     if kind == "human" && is_owner {
+        // The grants BEFORE the flip, in the same unit of work: an install
+        // that is active with its declaration unmet is the shape #86 exists
+        // to prevent, and a use that resolves to nothing refuses the whole
+        // activation rather than activating an app whose every cross-app
+        // read would then deny with nothing to say why.
+        derive_use_grants(conn, install_id, owner, &uses, by).await?;
         return activate(
             conn,
             install_id,
@@ -224,6 +232,16 @@ pub async fn activate_install(conn: &Connection, install_id: Uuid, by: &Credenti
             None,
         )
         .await;
+    }
+    // The standing-authority route cannot write what the app asks for: an
+    // install grant is a share across apps on the owner's behalf, and only
+    // the owning principal in person may make one (D13.14, the trigger).
+    // Activating anyway would leave the declaration meaning nothing.
+    if !uses.is_empty() {
+        return Err(StoreError::NotHuman(format!(
+            "this app uses {} other app collection(s); activating it needs the owning principal in person, because those grants are theirs to make (D19, D13.14)",
+            uses.len()
+        )));
     }
 
     // Otherwise: a standing authority a human delegated on this specific
@@ -265,6 +283,77 @@ pub async fn activate_install(conn: &Connection, install_id: Uuid, by: &Credenti
         Some(authority),
     )
     .await
+}
+
+/// What the install's manifest declares it uses, read back off the build
+/// row rather than carried in by the caller (invariant 11).
+async fn declared_uses(conn: &Connection, install_id: Uuid) -> Result<Vec<hive_manifest::Use>> {
+    let raw: Option<String> = query(
+        "SELECT coalesce(json_extract(b.manifest, '$.storage.uses'), '[]')
+           FROM installs i JOIN app_builds b ON b.id = i.build_id
+          WHERE i.id = ?1",
+    )
+    .bind(install_id)
+    .fetch_scalar_optional(conn)
+    .await
+    .map_err(|e| StoreError::db("read declared uses", e))?;
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str(&raw).map_err(|e| {
+        StoreError::Other(format!(
+            "install {install_id}: manifest uses do not parse: {e}"
+        ))
+    })
+}
+
+/// Writes the collection grants the manifest's `uses` ask for, each against
+/// the OWNER's install of the used app, resolved by (slug, owner): a slug
+/// alone is not a key (invariant 14). `core` is the owner's core install.
+async fn derive_use_grants(
+    conn: &Connection,
+    install_id: Uuid,
+    owner: Owner,
+    uses: &[hive_manifest::Use],
+    by: &Credential,
+) -> Result<()> {
+    for u in uses {
+        let used: Option<Uuid> = query(
+            "SELECT id FROM installs
+              WHERE slug = ?1 AND owner_kind = ?2 AND owner_id = ?3 AND state = 'active'
+              ORDER BY created_at LIMIT 1",
+        )
+        .bind(&u.app)
+        .bind(owner.kind.as_str())
+        .bind(owner.id)
+        .fetch_scalar_optional(conn)
+        .await
+        .map_err(|e| StoreError::db("resolve used app", e))?;
+        let used = used.ok_or_else(|| {
+            StoreError::Other(format!(
+                "this app uses {}/{} and {} {} has no active install of {:?}; install that first",
+                u.app,
+                u.collection,
+                owner.kind.as_str(),
+                owner.id,
+                u.app
+            ))
+        })?;
+        let access = match u.access {
+            hive_manifest::UseAccess::Read => Access::Read,
+            hive_manifest::UseAccess::Write => Access::Write,
+        };
+        write_install_grant(
+            conn,
+            &Subject::collection(used, &u.collection),
+            install_id,
+            access,
+            by,
+            "derived from the manifest's uses at activation",
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// The second half of the promotion seam: what is being promoted.

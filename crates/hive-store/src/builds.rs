@@ -5,7 +5,7 @@
 //! second and third is a human or a standing authority (D19.4). The registry
 //! decides WHAT gets written; this writes it.
 
-use hive_db::{Transaction, query};
+use hive_db::{Connection, query};
 use hive_identity::{Credential, Owner};
 use hive_registry::InstallSpec;
 use sha2::{Digest, Sha256};
@@ -53,7 +53,7 @@ pub struct RegisteredBuild {
 /// manifest ... nothing here reads an owner or an author out of the manifest,
 /// so one that tried to name its own would be ignored (invariant 11).
 pub async fn register_build(
-    tx: &Transaction,
+    tx: &Connection,
     spec: &BuildSpec,
     by: &Credential,
 ) -> Result<RegisteredBuild> {

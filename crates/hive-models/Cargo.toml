@@ -1,0 +1,35 @@
+[package]
+name = "hive-models"
+description = "The local model seam (D42): the daemon role that claims model jobs and answers them through OpenAI-shaped endpoints; read, transcribe, generate, embed"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+base64.workspace = true
+hive-blob = { path = "../hive-blob" }
+hive-store = { path = "../hive-store" }
+
+[dev-dependencies]
+axum.workspace = true
+http.workspace = true
+tempfile.workspace = true
+hive-db = { path = "../hive-db" }
+hive-identity = { path = "../hive-identity" }
+hive-manifest = { path = "../hive-manifest" }
+hive-registry = { path = "../hive-registry" }
+hive-testdb = { path = "../hive-testdb" }
+hive-trust = { path = "../hive-trust" }
+hive-wasmhost = { path = "../hive-wasmhost" }

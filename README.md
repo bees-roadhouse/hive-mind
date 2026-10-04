@@ -33,6 +33,7 @@ Phase 0, and honest about the gap. What exists:
 | `crates/hive-egress` | the allowlisting proxy a run reaches the internet through |
 | `crates/hive-httpapi` | liveness, readiness, events, enrollment, blob reads, session and chat |
 | `crates/hive-chat` | a message becomes one hosted agent run; the worker, its heartbeat and the reclaimers |
+| `crates/hive-models` | the local model seam: read, transcribe, generate and embed jobs answered through OpenAI-shaped endpoints (D42) |
 | `crates/hive-webui` | the browser client's static assets: stylesheet, vendored htmx, two scripts |
 | `crates/hive-sandbox` | the daemon: every role in one process, on a port and a unix socket |
 | `guest/`, `apps/hello` | the guest SDK and the reference guest |
@@ -100,7 +101,7 @@ curl localhost:7979/healthz
 ```
 
 One process serves every role (D7). `--serve-api`, `--run-workflows`,
-`--run-chat` and `--run-egress-proxy` (an allowlisting forward proxy, HTTP and
+`--run-chat`, `--run-models` and `--run-egress-proxy` (an allowlisting forward proxy, HTTP and
 CONNECT, on :3128) can each be turned off (`--run-chat=false`) or split across
 processes without a code change. `--plain-http` is for a deployment with no TLS
 in front: without it the session cookie is `Secure` and a browser on plain HTTP

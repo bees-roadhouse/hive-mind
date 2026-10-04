@@ -19,7 +19,7 @@ use hive_httpapi::Options;
 #[cfg(unix)]
 use hive_sandbox::unix_listener;
 use hive_sandbox::{BlobConfig, blob_driver};
-use hive_store::{AppData, BootstrapConfig, Chat, GuestBlobs, GuestEvents, Store};
+use hive_store::{AppData, BootstrapConfig, Chat, GuestBlobs, GuestEvents, GuestModels, Store};
 use hive_wasmhost::{Deps, Host};
 use tokio_util::sync::CancellationToken;
 
@@ -83,6 +83,10 @@ struct Args {
     /// Answer chat turns with hosted agent runs.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     run_chat: bool,
+    /// Answer model jobs through the endpoints HIVE_SANDBOX_MODELS_* name
+    /// (D42). With none named the role logs and stays idle.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    run_models: bool,
     /// The image lockfile scripts/harness-build.sh writes.
     #[arg(long, env = "HIVE_SANDBOX_HARNESS_PINS", default_value = hive_harness::DEFAULT_PINS_PATH)]
     harness_pins: String,
@@ -137,7 +141,7 @@ impl Args {
     /// would make every run depend on the store being present in order to be
     /// DENIED network access, which is backwards.
     fn needs_database(&self) -> bool {
-        self.serve_api || self.run_workflows || self.run_chat
+        self.serve_api || self.run_workflows || self.run_chat || self.run_models
     }
 }
 
@@ -184,9 +188,14 @@ async fn run() -> anyhow::Result<()> {
     let egress_allow = split_list(&args.egress_allow);
     let egress_dns = split_list(&args.egress_dns);
 
-    if !args.serve_api && !args.run_workflows && !args.run_chat && !args.run_egress_proxy {
+    if !args.serve_api
+        && !args.run_workflows
+        && !args.run_chat
+        && !args.run_models
+        && !args.run_egress_proxy
+    {
         bail!(
-            "no role enabled: pass --serve-api, --run-workflows, --run-chat, --run-egress-proxy, or a combination"
+            "no role enabled: pass --serve-api, --run-workflows, --run-chat, --run-models, --run-egress-proxy, or a combination"
         );
     }
     if args.needs_database() && args.data_dir.as_deref().unwrap_or("").is_empty() {
@@ -242,6 +251,7 @@ async fn run() -> anyhow::Result<()> {
             storage: Arc::new(AppData::new(st.clone(), cat.clone())),
             blob: Arc::new(GuestBlobs::new(st.clone(), cat.clone())),
             events: Arc::new(GuestEvents::new(st.clone())),
+            models: Arc::new(GuestModels::new(st.clone(), cat.clone())),
             // KV and Sanitizer stay stubbed: both are unbuilt, and the stub
             // answers Unimplemented rather than crashing.
             ..Deps::default()
@@ -291,6 +301,30 @@ async fn run() -> anyhow::Result<()> {
             tasks.push(tokio::spawn(async move { worker.run(c).await }));
         }
         chat = Some(chat_layer);
+
+        // The models worker (D42): claims jobs and answers them through the
+        // configured endpoints. With none configured it stays idle and says
+        // so once, like the chat worker without its image pins.
+        if args.run_models {
+            let endpoints = hive_models::Endpoints::from_env();
+            if endpoints.is_empty() {
+                tracing::warn!("models worker idle: no HIVE_SANDBOX_MODELS_*_MODEL is set");
+            }
+            let worker = Arc::new(hive_models::Worker::new(
+                st.clone(),
+                cat.clone(),
+                hive_models::Config {
+                    name: format!("{}/{}", hostname(), std::process::id()),
+                    endpoints,
+                    call_timeout: Duration::ZERO,
+                    poll_interval: Duration::ZERO,
+                    concurrency: 1,
+                },
+            )?);
+            tracing::info!(capabilities = ?worker.status().capabilities, "models worker ready");
+            let c = cancel.clone();
+            tasks.push(tokio::spawn(async move { worker.run(c).await }));
+        }
         catalog = Some(cat);
         store = Some(st);
     }

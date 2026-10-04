@@ -269,7 +269,7 @@ Cargo.toml             the host workspace: crates/*, unsafe denied at the worksp
                        pinned in rust-toolchain.toml. guest/ and apps/* are excluded: they are
                        the guest workspace and only build for wasm32-wasip1
 crates/hive-sandbox/   the daemon binary. Roles are flags, one process serves all of them (D7):
-                       --serve-api, --run-workflows, --run-chat, --run-egress-proxy. Every role
+                       --serve-api, --run-workflows, --run-chat, --run-models, --run-egress-proxy. Every role
                        defaults on except the proxy, so a single-role image turns the others off
                        by name. --addr defaults to :7979. Also the unix socket (invariant 13)
                        and the blob driver chosen from config
@@ -302,6 +302,8 @@ crates/hive-surfaces/  hive-mcp's three collaborators over the store and the was
                        daemon composes it; nothing here listens
 crates/hive-chat/      a message becomes one hosted agent run. The turn worker, its heartbeat,
                        the reclaimers, and the in-process hub a stream subscribes to
+crates/hive-models/    the local model seam (D42): the --run-models worker that answers read,
+                       transcribe, generate and embed jobs through OpenAI-shaped endpoints
 crates/hive-sse/       the SSE frame writer, shared by /events and the chat stream
 crates/hive-httpauth/  request-to-credential resolution and THE one 401 shape
 crates/hive-httpapi/   the daemon's HTTP surface: healthz, readyz, events, whoami, device

@@ -1391,6 +1391,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-models"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64",
+ "hive-blob",
+ "hive-db",
+ "hive-identity",
+ "hive-manifest",
+ "hive-registry",
+ "hive-store",
+ "hive-testdb",
+ "hive-trust",
+ "hive-wasmhost",
+ "http 1.5.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "hive-registry"
 version = "0.1.0"
 dependencies = [
@@ -1429,6 +1456,7 @@ dependencies = [
  "hive-httpapi",
  "hive-identity",
  "hive-mcp",
+ "hive-models",
  "hive-store",
  "hive-surfaces",
  "hive-testdb",
@@ -2474,6 +2502,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",

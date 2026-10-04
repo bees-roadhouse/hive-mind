@@ -48,6 +48,7 @@ mod grants;
 mod guestblobs;
 mod guestevents;
 mod installs;
+mod models;
 mod owners;
 mod predicate;
 
@@ -87,6 +88,10 @@ pub use hive_schema::{
 pub use installs::{
     CAPABILITY_ACTIVATE, InstallSpec, InstallSummary, activate_install, grant_install_authority,
     installs_of, revoke_install_authority, stage_install,
+};
+pub use models::{
+    ClaimedJob, GuestModels, JOB_CLAIMED, JOB_DONE, JOB_FAILED, JOB_FINISHED_EVENT, JOB_PENDING,
+    JobInput, JobSpec, JobView, MAX_ATTEMPTS, MODEL_CAPABILITIES, ModelJobs, job_wake,
 };
 pub use owners::{
     OWNERS_DIR_SUFFIX, attach_owner, owner_alias, owner_file, owner_table, owners_dir,

@@ -110,3 +110,45 @@ fn scan(dir: &std::path::Path, out: &mut Vec<String>) {
         }
     }
 }
+
+/// Fails when hive-sandbox gains a role that is on by default and the egress
+/// image does not switch it off. The image names its roles one by one, so a new
+/// default-on role starts inside the proxy too; D42's `--run-models` did, asked
+/// for a store the proxy does not have, and the proxy died before listening
+/// (#115 is what made that readable).
+#[test]
+fn the_egress_image_switches_off_every_default_role() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let main = std::fs::read_to_string(format!("{root}/crates/hive-sandbox/src/main.rs"))
+        .expect("read hive-sandbox main.rs");
+    let image = std::fs::read_to_string(format!("{root}/docker/egress/Containerfile"))
+        .expect("read docker/egress/Containerfile");
+    let mut roles = Vec::new();
+    let mut default_on = false;
+    for line in main.lines().map(str::trim) {
+        if line.starts_with("#[arg(") {
+            default_on = line.contains("default_value_t = true");
+            continue;
+        }
+        if line.starts_with("///") || line.is_empty() {
+            continue;
+        }
+        if default_on
+            && let Some(name) = line.strip_suffix(": bool,")
+            && (name == "serve_api" || name.starts_with("run_"))
+        {
+            roles.push(name.replace('_', "-"));
+        }
+        default_on = false;
+    }
+    assert!(
+        roles.len() >= 4,
+        "found only {roles:?}; the scan of main.rs has stopped matching"
+    );
+    for role in &roles {
+        assert!(
+            image.contains(&format!("\"--{role}=false\"")),
+            "docker/egress/Containerfile does not pass --{role}=false; the proxy would start that role too"
+        );
+    }
+}

@@ -167,6 +167,45 @@ harness, D35/D37) run on the server. They **cannot read a person's journal
 or private items** unless that person unlocks for the session. The person's
 own AI features over private data run on the device, or with that unlock.
 
+### 3a. Attaching a file to a journal entry runs the personal pipeline; promoting to an org comes after
+
+Nate, 2026-10-05: "journal entries with documents added as attached files
+dragged or using the option to attach / embed file should trigger the user
+pipeline automatically, with the option to promote/move to org after
+everything is stored already".
+
+- **Attaching is the trigger.** Dragging a file onto an entry, or using
+  attach or embed, stores the blob (tier a, §4) and links it to the entry.
+  It then **queues the personal pipeline** on the device without a second
+  action: text extraction or OCR, then embedding. "Embed" and "attach"
+  differ only in how the entry displays the file, not in what is
+  processed.
+- **Stored first, processed second.** The blob and the link are committed
+  to the device store (and the op log) before any processing starts, so a
+  pipeline that fails or is interrupted never costs the file. The queue is
+  in the device store, resumes after a restart, and works offline. Each
+  document shows its state: queued, extracting, embedding, done, or
+  failed with a reason and a retry.
+- **The device decides when to run it**, not whether: heavy steps wait for
+  power or an idle CPU on a phone, and a person can run them now. Another
+  device of the same person does not redo finished work, because the
+  results sync encrypted (§3).
+- **Promote to org is offered once the document is done** (stored,
+  extracted, embedded), from the document or from the entry. It is §1's
+  share step with its warning: the blob, its extracted text and the
+  document's metadata **move** into the org's context, decrypted on the
+  device and sent as org data. **The journal entry stays personal** and
+  keeps a link to the document, now in the org.
+- **On promotion the org re-embeds and keeps the text.** The extracted text
+  moves with the document, so OCR is not paid twice, and its trust level
+  goes with it (invariant 12). The device's vectors are not moved: the
+  org's search compares vectors from the org's model on the server (D42,
+  pgvector), and vectors from two models are not comparable (§3's
+  same-model criterion). The server embeds the promoted text with the org
+  model. The personal vectors are deleted along with the personal copy.
+- Promoting before processing is done is allowed and says so: the server
+  then runs the org pipeline (D42) from the blob.
+
 ## 4. Dedupe for encrypted blobs
 
 A personal blob is sealed under `HKDF(user data key, plaintext hash)`, so
@@ -199,8 +238,8 @@ two people hold the same file. The server addresses personal blobs by the
    associated data, device approval and rotation. **A test first that a
    ciphertext moved to another row or field fails to open.**
 4. The share step (private to org) with its warning.
-5. Personal document OCR and embeddings on the device. Org documents on the
-   D42 worker.
+5. Personal document OCR and embeddings on the device, triggered by
+   attaching (§3a), then promote-to-org. Org documents on the D42 worker.
 6. Tier (b): per-org backup and blob keys.
 
 ## What lost

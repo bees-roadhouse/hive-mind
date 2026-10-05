@@ -329,13 +329,24 @@ backends.
 - *Dropping SQLite.* The test loop, the single box and the offline client
   all want it, and the price (§5) is a suite run twice.
 
-## Infra (asks to Pia, not done here)
+## Infra (Pia's side; state as of 2026-10-04)
 
-- pgvector in the CNPG image for `data/data`.
-- The registry database and its role on `data/data`.
-- A provisioning role with `CREATEDB` and `CREATEROLE` for the daemon,
-  its secret in 1Password, delivered as a file.
-- Network policy letting the hive-mind daemon reach `data/data`.
+- **Done.** `data/data` runs Postgres 17 with `vector` available.
+  pgvector is pre-installed in `template1`, because it is not a trusted
+  extension and an org role cannot create it. Every database the
+  provisioner creates inherits it.
+- **Done.** The registry database is `hive_registry`, owned by the role
+  `hive_registry` (LOGIN only, PUBLIC connect revoked). The provisioning
+  role is `hive_provisioner` (LOGIN, `CREATEDB`, `CREATEROLE`, nothing
+  else). Since Postgres 16, `CREATEROLE` grants admin only over roles that
+  role itself created, so the provisioner cannot reach any other
+  application's roles: the least privilege §6 asks for is the engine's
+  default, not a convention. Both credentials are in 1Password and are
+  read at run time, never written down.
+- **Later.** A network policy and sealed secrets for the daemon's
+  namespace, when the daemon is deployed on the cluster. Today the host is
+  in-cluster only, so a daemon running off the cluster needs an exposed
+  route first.
 
 ## Open
 

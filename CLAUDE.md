@@ -22,7 +22,9 @@ pick and was measured out). **D43 (2026-10-04) reverses that for the
 server**: Postgres, one database per organization behind a registry, SQLite
 kept behind `hive-db`; until its phases land, the code is still D38's. The browser client is a
 server-rendered by the daemon and swapped by htmx (D32); its static assets are
-embedded by `crates/hive-webui`, and apps contribute UI as HTML fragments. The guest SDK and the reference guest
+embedded by `crates/hive-webui`. **D44 and D45 (2026-10-04/05) amend that**: app
+UI moves to sandboxed frames on per-install origins, and the shell becomes a
+Solid.js client with an offline device store; no new htmx shell UI is built. The guest SDK and the reference guest
 are Rust too, built for `wasm32-wasip1`. The reasons and the picks are in
 `docs/design/D24-rust-rewrite.md`; what the removal of the Go tree changed and
 what it deliberately kept is in `docs/design/D31-go-removed.md`.

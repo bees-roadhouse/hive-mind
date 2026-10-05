@@ -222,6 +222,75 @@ picked again: its macros wanted a database at build time, and the
 rule stays regardless (CLAUDE.md, *Await a store or migration future on
 the calling task*).
 
+### 8. An org may bring its own Postgres
+
+Nate, the same evening: "i want to allow self-hosted databases too." The
+registry already makes location irrelevant; what a self-hosted database
+changes is **who else holds the keys**, so this section is mostly about
+the trust boundary.
+
+- **Registering is a check, not a form.** `hive-sandbox org attach <slug>
+  --dsn-secret <ref>` connects and refuses with the specific reason if any
+  of these fails: the Postgres major-version floor (16, for `SET LOCAL`
+  semantics and the RLS features §2 uses; the number lives in code and
+  this record names the criterion), the extensions D41 needs when the org
+  declares vector or full-text collections (`vector`), a TLS connection
+  verified in full against the CA the org supplies, and the privileges:
+  the migration role can `CREATE` in the database and create functions
+  and triggers; the app role is not the owner, has no `BYPASSRLS`, and is
+  not a superuser. An app role that could bypass the second wall is
+  refused, because the second wall is what that role exists to sit
+  behind. Superuser is never required of either role.
+- **Two roles, two secrets, both references.** The registry stores a
+  reference to each secret, never a value; until the vault (#87) lands,
+  the reference resolves to a file the daemon reads and the value is
+  encrypted at rest under the daemon's boot key where it has to be stored
+  at all. Rotation is a new secret reference plus a generation bump (§1),
+  so the old pool drains instead of failing in place.
+- **Migrations run from here**, as the migration role, on upgrade. The
+  registry's `orgs.schema_version` is the per-org record, and an org can
+  be **held** (`orgs.migrate_hold`, with a reason): a held org keeps being
+  served at its version as long as the binary still supports that version,
+  and the daemon refuses to start a binary whose minimum supported version
+  is above a held org's, rather than serving it wrongly.
+- **Connectivity is per org and visible.** TLS `verify-full` always,
+  connect and statement timeouts, the pool keyed as in §1, and a health
+  state per org database (`ok` / `degraded` / `unreachable` /
+  `refused`, with the last reason) in the registry, surfaced to that
+  org's admins and the operator. An unreachable org is that org's outage
+  and nobody else's: no request for another org waits on it.
+- **The trust boundary.** A self-hosted org's administrator has superuser
+  on their own database, so the triggers and both walls are advisory
+  **for their own org's data**. That is accepted: it is their data. What
+  is not accepted is anyone else relying on that database's word. So:
+  - A credential is resolved to its org by the registry's
+    `credential_index` before any org database is read. A forged
+    credential row in a self-hosted database can authenticate only into
+    that database.
+  - A link exists when the **registry** says so, and its state lives
+    there. A `peer_orgs` row in an org's database is that org's
+    bookkeeping, never evidence.
+  - The link credential that carries A's acting principal to B is minted
+    and signed by the registry's key for (link, principal, actor), and B
+    verifies the signature, not A's database's opinion. B's answer comes
+    back `untrusted` to A (§4), so a self-hosted B that lies about its own
+    rows can mislead only a reader who chose to link to it, and is marked
+    as untrusted when it does.
+  - No hosted org's data is ever written to, or read from, a self-hosted
+    database. Everything that crosses goes through the federation route,
+    as §4 already requires.
+- **Backups are the owner's.** A hosted org is in CNPG's backups and its
+  PITR (brh-infra #297). A self-hosted org owns its own; the registry
+  records which is which so nobody assumes otherwise. Registering a
+  reachable self-hosted database as an extra backup source is possible
+  later and is not in this record.
+- **Moving in or out** is a dump and restore under a suspended org: suspend
+  in the registry, drain pools, `pg_dump` with the schema version
+  recorded, restore at the target, run the requirements check, write the
+  new `org_stores` row with the next generation, resume. Logical
+  replication for a move without downtime is a later option; the
+  generation key is what makes either one safe.
+
 ## Phases
 
 Each is a PR, in this order, and each leaves the gate green on both
@@ -236,8 +305,11 @@ backends.
 2. **The registry and the per-org pool.** `org_stores`, the generation-keyed
    pools, `credential_index`, provisioning; a daemon serves several orgs.
 3. **Row-level security**, with a mutation test per wall.
-4. **Links and federation**, with the loopback test above.
-5. **D39's owner files go** from the SQLite backend, once nothing reads
+4. **Links and federation**, with the loopback test above and the
+   registry-signed link credential (§8).
+5. **Self-hosted orgs**: `org attach`, the requirements check, migration
+   holds, per-org health.
+6. **D39's owner files go** from the SQLite backend, once nothing reads
    through them.
 
 ## What lost

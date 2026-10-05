@@ -1,5 +1,7 @@
 # D39: an owner's documents live in the owner's file; the control plane, the index rows and the events stay central
 
+**Superseded by D43** (2026-10-04): the tenant is an organization's Postgres database; the owner files go from the SQLite backend in D43's phase 5.
+
 **Status:** decided 2026-10-02, the same day D38 landed. This is D38's phase
 2, made as its own record because the measurements below changed what phase
 2 could be.

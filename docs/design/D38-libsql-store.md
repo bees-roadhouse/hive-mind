@@ -1,5 +1,7 @@
 # D38: the store is SQLite, one file per daemon now and one per owner next; the client stays htmx
 
+**Superseded for the server by D43** (2026-10-04): Postgres, one database per organization. SQLite stays behind `hive-db` for a single box, tests and offline clients.
+
 **Decided** 2026-10-02 by Nate: "forget postgres ... the sqlite stuff i want
 to do with libsql", against a design note he brought that day: Turso/libSQL
 as the engine ("millions of databases, one per tenant"), native replication

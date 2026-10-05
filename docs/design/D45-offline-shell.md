@@ -1,9 +1,12 @@
-# D45: the shell is a Solid.js client with an offline device store and a cache of recent blobs; apps stay framed; the server stays authoritative
+# D45: the daemon serves APIs only; one Solid.js client does everything, with a full offline replica of the person's data and a budgeted blob cache; apps stay framed; the server stays authoritative
 
 **Decided** 2026-10-05 by Nate, on Pia's recommendation: "i like that. but
 yes we want offline capabilities of hive mind, including recent blobs."
-Shape by Propolis. **Amends D32 §1 for the shell**, as D44 amended it for
-app UI. D32 said offline was "a later decision, not a lost one"; this is
+Amended the same day: "i rather make everything except the server side
+admin api and client app" (no server-rendered UI at all), and "i want the
+full amount of a users data to be available offline always, except for
+maybe blobs ... priortize the database over blobs". Shape by Propolis.
+**Supersedes D32 §1**: htmx is dropped entirely. D32 said offline was "a later decision, not a lost one"; this is
 that decision. D38 §6's reasoning that a browser tab cannot hold a database
 is superseded by OPFS (below), which is what makes it possible now.
 
@@ -19,26 +22,47 @@ real client loop; Solid.js does.
 
 ## The decision
 
-### 1. What moves and what stays
+### 1. APIs on the server, one client for everything
 
-- **The shell** (navigation, the core entities' views, chat, the frame host
-  for apps) is a Solid.js client, built to static assets that `hive-webui`
-  embeds and serves under the same CSP. There is no Node at runtime; Node is
-  a build tool only.
-- **Admin and settings pages** may stay server-rendered htmx. They are
-  online by nature, and D44 §1's capability tokens protect them.
+- **The daemon renders no HTML.** It serves the user and data API and an
+  admin API, both authenticated by credential and scoped by capability
+  (D44 §1's tokens become plain API authorization). The askama templates,
+  the `/ui/` routes, `require_htmx` and the vendored htmx are removed
+  once the client covers what they did. The `HX-Request` CSRF path goes
+  with them: an API that takes a bearer credential in a header has
+  nothing for a cross-site form to ride.
+- **One Solid.js client** does the shell, the core entities, chat, and the
+  admin screens. It is built to static assets that `hive-webui` embeds and
+  serves under the same CSP. Node is a build tool only. Admin screens may
+  require being online; everything else follows the offline rules below.
+- **Nothing on the admin side needs server rendering.** Checked against
+  the one candidate reason, first-run bootstrap before any credential
+  exists: enrollment is already an API (`/device` enrollment), so the
+  client can do it.
 - **Apps** stay in D44's frames, in any stack, online-only. An app may later
   opt into an offline contract of its own. That is out of scope here, except
   for one rule: it would reach data through the same sync API, never
-  through the shell's store.
+  through the client's store.
+- **The e2e suite moves to the client**, and stays the acceptance test for
+  the browser (the `e2e` CI job).
 
-### 2. The device store is a partial replica, and the server is the authority
+### 2. The device store is a complete replica of the person's data, and the server is the authority
 
 Each device holds **SQLite in the browser** (the official WASM build, on the
 OPFS SyncAccessHandle-pool VFS, in a worker). A native client later uses the
-same schema on a real file. It holds a **partial, per-user, per-org
-replica** of the core entities (journal entries, tasks, lists, contacts,
-decisions) and their links.
+same schema on a real file. It holds a **per-person replica that is complete for that person**: every row they can read, in
+every entity, in each context they belong to (their own space and each
+org, D43), with no time window and no recency cut. The predicate decides
+visibility; volume does not.
+
+- **The database is never evicted to make room for blobs.** The client
+  requests persistent storage (`navigator.storage.persist()`) and shows
+  whether it was granted, because without it the browser may evict OPFS.
+  If the database alone will not fit the device's quota, the client says
+  so loudly and stops syncing that context. It never silently goes partial.
+- **The first sync of a large account resumes** from a cursor per entity
+  type per context, and shows progress.
+- The client shows local usage: database, blobs, and the limit.
 
 - **What syncs down is what the predicate releases**, read through the same
   API every other client uses, under the device's credential. Under D43,
@@ -89,16 +113,17 @@ place a merge would matter. A CRDT body for one entity type can come later
 behind this rule if real use shows conflicting text edits are common. That
 would be measured, not assumed.
 
-### 4. Recent blobs live on the device too
+### 4. Blobs are the only budgeted part
 
-A device keeps a **bounded cache of blob bytes** (attachments, images,
-voice notes) in OPFS, beside the store.
+A device keeps blob bytes (attachments, images, voice notes) in OPFS, beside
+the store, under **one local storage limit per device**, which the person can
+adjust. The default is half of the quota the browser grants, capped at
+10 GiB.
 
-- **"Recent"** means used or created on this device in the last **30
-  days**, within a budget of **1 GiB per device**, both adjustable per
-  device in settings. Eviction is least recently used once the budget is
-  reached, and the time window is only a ceiling. The person can pin a blob
-  to keep it regardless.
+- **Blobs fill whatever the database leaves** within the limit. When the
+  space is needed, the least recently used blob is evicted first. Use or
+  creation in the last 30 days is a priority hint inside the budget, not a
+  cap. The person can pin a blob to keep it regardless.
 - **A blob created offline is never evicted until it has uploaded.** If
   the budget fills with unuploaded blobs, the device says so and refuses
   new ones rather than lose data.
@@ -134,22 +159,25 @@ voice notes) in OPFS, beside the store.
    under the credential, and the operation replay endpoint with idempotency
    keys. Built against the store D43 phase 1 produces, and tested on both
    engines.
-2. **The Solid shell, online-only**, replacing the htmx shell route by
-   route, and the e2e suite carried across.
+2. **The Solid client, online-only**, replacing the htmx shell and admin
+   pages route by route, and the e2e suite carried across. The server's
+   HTML code goes when the last route has moved.
 3. **The device store and the operation log**, then offline writes.
 4. **The blob cache**, with the invariant 3 test first.
 5. **Offline auth, encryption at rest and remote wipe.**
 
-No more htmx shell UI is built from today. Admin pages are the exception
-in §1.
+No more htmx UI is built from today, admin pages included.
 
 ## What lost
 
 - *Keep htmx with a service worker caching pages.* Cached HTML can be read
   offline but not written to, and the ask is to work offline.
 - *A CRDT per entity.* §3.
-- *The device store as a full replica of the org.* It is per user, decided
-  by the predicate. A full replica would put other people's rows on a laptop.
+- *A partial or recency-windowed replica.* Nate asked for all of a person's
+  data, always. The replica is still per person, decided by the predicate,
+  so other people's rows never reach the laptop.
+- *Server-rendered admin pages.* There is no reason for them that the API
+  does not cover (§1), and two UI stacks is one too many.
 - *Writes that sync as rows.* Rows would bypass the triggers and the
   author-pinning writer; operations go through them.
 - *IndexedDB as the store.* No SQL, no shared schema with a future native

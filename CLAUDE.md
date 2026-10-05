@@ -18,7 +18,9 @@ removed 2026-09-05, D31). A Cargo workspace at `crates/*`, wasmtime for the
 guests, axum for the HTTP surface, SQLite through `rusqlite` for the store
 (D38, decided 2026-10-02: a control plane file per daemon, and an owner's
 documents in a file per owner beside it, D39; the libSQL fork was the first
-pick and was measured out). The browser client is a
+pick and was measured out). **D43 (2026-10-04) reverses that for the
+server**: Postgres, one database per organization behind a registry, SQLite
+kept behind `hive-db`; until its phases land, the code is still D38's. The browser client is a
 server-rendered by the daemon and swapped by htmx (D32); its static assets are
 embedded by `crates/hive-webui`, and apps contribute UI as HTML fragments. The guest SDK and the reference guest
 are Rust too, built for `wasm32-wasip1`. The reasons and the picks are in

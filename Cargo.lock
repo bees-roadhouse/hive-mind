@@ -1405,7 +1405,7 @@ dependencies = [
  "hive-testdb",
  "hive-trust",
  "hive-wasmhost",
- "http 1.5.0",
+ "http",
  "reqwest",
  "serde",
  "serde_json",

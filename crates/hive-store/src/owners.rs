@@ -80,7 +80,17 @@ pub async fn attach_owner(conn: &Connection, owner: Owner) -> Result<String> {
     if conn.attached().iter().any(|a| a == &alias) {
         return Ok(alias);
     }
-    let path = owner_file(&owners_dir(conn.path()), owner);
+    // An owner file is a SQLite file beside the control plane file. Under
+    // Postgres there is no file to be beside (D43 §5: the org's database is
+    // the tenant), and D43's phase 6 removes this layer; until then the
+    // refusal is explicit rather than a path that does not exist.
+    let Some(control_plane) = conn.path() else {
+        return Err(StoreError::Other(format!(
+            "owner files exist only on the sqlite engine; this connection is {}",
+            conn.engine()
+        )));
+    };
+    let path = owner_file(&owners_dir(control_plane), owner);
     initialise(&path, owner).await?;
     conn.attach(&path, &alias)
         .map_err(|e| StoreError::db(format!("attach {}", path.display()), e))?;

@@ -71,7 +71,7 @@ async fn provisioned_tables_land_in_the_owners_file() {
     let schema_a = register(&w, "journal", user(alice), alice).await;
     let schema_b = register(&w, "journal", user(bob), bob).await;
 
-    let dir = owners_dir(w.db().path());
+    let dir = owners_dir(w.db().path().expect("the sqlite engine has a path"));
     assert!(owner_file(&dir, user(alice)).is_file(), "alice has no file");
     assert!(owner_file(&dir, user(bob)).is_file(), "bob has no file");
 
@@ -196,7 +196,7 @@ async fn a_file_that_names_another_owner_is_refused() {
         attach_owner(&conn, user(alice)).await.unwrap();
     }
     // Rename alice's file to bob's, the way a careless restore would.
-    let dir = owners_dir(w.db().path());
+    let dir = owners_dir(w.db().path().expect("the sqlite engine has a path"));
     let alices = owner_file(&dir, user(alice));
     let bobs = owner_file(&dir, user(bob));
     for suffix in ["", "-wal", "-shm"] {
@@ -325,7 +325,11 @@ async fn a_grantees_read_attaches_the_owners_file() {
     let doc: serde_json::Value = serde_json::from_slice(&got.data).unwrap();
     assert_eq!(doc["doc"]["title"], "mine");
     assert!(
-        !owner_file(&owners_dir(w.db().path()), user(bob)).exists(),
+        !owner_file(
+            &owners_dir(w.db().path().expect("the sqlite engine has a path")),
+            user(bob)
+        )
+        .exists(),
         "reading alice's document created a file for bob"
     );
 }

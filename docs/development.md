@@ -8,7 +8,7 @@ From nothing to a passing test suite. Assumes you have none of this installed.
 | ------------------- | -------------------------------------------- | -------------------------------------- | ------------------------------------------ |
 | **Rust** via rustup | the daemon; `rust-toolchain.toml` pins 1.98 with clippy and rustfmt, rustup installs it on first `cargo` | https://rustup.rs | `winget install Rustlang.Rustup` |
 | **`wasm32-wasip1`** | building guests (`rustup target add wasm32-wasip1`); not needed to run the tests, the built guests are checked in | same | same |
-| **Podman 5+**       | the harness and egress tiers only (Docker works too); the store is SQLite files and blobs are a path | `brew install podman` / your package manager | `winget install RedHat.Podman-Desktop` |
+| **Podman 5+**       | the harness and egress tiers, and the local Postgres for the D43 engine tests (Docker works too); the SQLite store is files and blobs are a path | `brew install podman` / your package manager | `winget install RedHat.Podman-Desktop` |
 | **Node 20+**        | the Playwright suite only | `brew install node` / nvm | `winget install OpenJS.NodeJS.LTS` |
 
 One PATH note that has already bitten someone: rustup installs to
@@ -35,8 +35,37 @@ temp directory and deletes them on the way out. `HIVE_SANDBOX_TEST_DB_DIR` moves
 the wrong place (a RAM disk, a slower disk you want to keep off).
 
 `cargo test --workspace` therefore runs every database test on a bare machine.
-The tiers that still skip without a backend (Podman, chromium) print
-`SKIPPED: <name> <why>` so the gate can name them.
+The tiers that still skip without a backend (Podman, chromium, and the
+Postgres engine below) print `SKIPPED: <name> <why>` so the gate can name
+them.
+
+### The Postgres engine
+
+The server store is moving to Postgres, one database per organization (D43);
+`hive-db` speaks both engines behind one API and the migration runner knows
+which it is on. A test that only makes sense on Postgres reads
+`HIVE_SANDBOX_TEST_DATABASE_URL` and skips, by name, without it. To run them
+locally:
+
+```bash
+./scripts/db-up.sh                      # one podman container, pgvector/pgvector:pg17, 127.0.0.1:55434
+export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
+cargo test -p hive-db -p hive-schema
+podman stop hive-mind-pg-rust           # when you are done
+```
+
+(`.\scripts\db-up.ps1 -Quiet` on Windows.) The script is one `podman run`
+with no compose, because the compose-resolving version picked `podman
+compose` whenever podman existed and never noticed there was no provider
+behind it (#106). The password is generated once at creation and lives in the
+container's environment; the script reads it back from there and never writes
+it anywhere else.
+
+CI's `postgres` job runs the ported crates against a real server with
+`HIVE_SANDBOX_REQUIRE_DATABASE_TESTS=1`, which turns that skip into a
+failure: the job promised a server, so a test skipping for want of one is a
+test that never ran. The crate list in that job is the list of what has been
+ported (#127 tracks the rest); a crate not in it still runs on SQLite only.
 
 ## Run the gate
 
@@ -133,9 +162,10 @@ memory:
 
 - Rust lives at `~/.cargo/bin`, which a Claude shell does not have on `PATH`.
   `export PATH="$HOME/.cargo/bin:$PATH"` first.
-- There is no test database to start any more (D38): the tests write their
-  store files under the temp directory. The `hive-sandbox-pg-rust` container
-  from the Postgres era can be removed.
+- The SQLite tests need nothing running (D38). The Postgres-only tests want
+  `./scripts/db-up.ps1` (the `hive-mind-pg-rust` container on 55434), which
+  stops with `podman stop hive-mind-pg-rust`; the podman machine itself
+  stops between sessions and needs `podman machine start` first.
 - **The box dies on disk, not CPU.** Three sessions linking Rust at once on the
   single LUKS NVMe froze the desktop with the CPU half idle. Pinning cargo to
   four cores was the wrong dimension. The rule: one cargo at a time across

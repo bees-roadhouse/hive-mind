@@ -1,94 +1,142 @@
-//! The one way the host opens a database file (D38).
+//! The one way the host opens a database (D38, D43).
 //!
-//! SQLite, bundled and vanilla, through `rusqlite`. This crate wraps it just
-//! enough that the rest of the workspace speaks one shape: a [`Db`] is a
-//! file, a [`Conn`] is a checked-out connection on it with the pragmas the
-//! schema assumes already set, a [`Transaction`] is `BEGIN IMMEDIATE` on one,
-//! and [`query`] binds typed values and reads typed columns by name. There is
+//! Two engines behind one shape. A [`Db`] is a SQLite file or a Postgres
+//! database; a [`Conn`] is a checked-out connection on it; a [`Transaction`]
+//! is `BEGIN IMMEDIATE` on the file or `BEGIN` on the server; and [`query`]
+//! binds typed values and reads typed columns by name on either. There is
 //! deliberately no query helper that knows about grants: the predicate lives
 //! in `hive-store`, and nothing here reads policy.
 //!
-//! The engine is vanilla SQLite rather than the libSQL fork D38 first named,
-//! and that is a measured change rather than a preference: the fork's crate
+//! The SQLite engine is vanilla, bundled, through `rusqlite`, and that is a
+//! measured change rather than a preference: the libSQL fork's crate
 //! (0.9.30 and 0.10.0-pre.4, MSVC and GNU builds) corrupts the heap on
-//! Windows once roughly ten connections are open in one process, and the
-//! process dies in `sqlite3_close_v2` reading a handle that was already
-//! freed. The same open-and-close pattern against this crate's bundled
-//! SQLite ran 600 connections at a time without incident. The API below is
-//! the seam: when the fork is fixed, or when phase 3 wants its replicas, the
-//! swap is this file.
+//! Windows once roughly ten connections are open in one process. The
+//! Postgres engine is `tokio-postgres` behind `deadpool-postgres` (D43 §7);
+//! `postgres.rs` says what the seam translates and what it cannot. Which
+//! engine a `Db` is comes off how it was opened: [`Db::open`] takes a path,
+//! [`Db::connect`] a URL, and [`Db::engine`] says which, for the few callers
+//! that have to compose engine-specific SQL ([`Engine::now_sql`]).
 //!
 //! Three facts every caller relies on and should know it relies on:
 //!
-//! - **One writer at a time per file.** A write transaction is `BEGIN
-//!   IMMEDIATE`, so two writers serialise in the engine rather than racing;
-//!   `busy_timeout` makes the loser wait rather than fail. The claim patterns
-//!   the Postgres tree wrote with `SKIP LOCKED` are `UPDATE ... RETURNING`
-//!   here and are correct for that reason alone.
-//! - **Time is an integer.** Every timestamp column is microseconds since the
-//!   Unix epoch, UTC. [`now`] is the clock the host binds; [`NOW_SQL`] is the
-//!   expression a column default or a trigger uses. They read the same clock
-//!   at different resolutions (microseconds and milliseconds), and nothing
-//!   orders rows across the two.
-//! - **Connections are pooled and few, and every call on one blocks.** The
-//!   engine is in-process and synchronous; a statement runs on the calling
-//!   thread, which is what the async-shaped libSQL API did underneath too.
-//!   A [`Conn`] goes back to its file's pool when dropped, and the number
-//!   open at once is capped. A connection is keyed on nothing a caller could
-//!   forget (invariant 14): every one has the same pragmas and no state
-//!   outlives a checkout, because one mid-transaction is closed rather than
-//!   returned.
+//! - **A connection mid-transaction is never pooled.** On both engines a
+//!   checkout that goes back with a transaction open is closed instead
+//!   (invariant 14: the next caller did not ask for that state). On SQLite a
+//!   write transaction is `BEGIN IMMEDIATE`, one writer at a time per file,
+//!   `busy_timeout` making the loser wait rather than fail. On Postgres
+//!   writers run concurrently and a failed statement aborts the transaction
+//!   it is in, which SQLite does not do; `postgres.rs` names that.
+//! - **Time is a timestamp.** Every timestamp column holds microseconds since
+//!   the Unix epoch, UTC: as an integer on SQLite, as `timestamptz` on
+//!   Postgres. [`now`] is the clock the host binds, truncated to the
+//!   microsecond so a value that went through a column comes back equal;
+//!   [`Engine::now_sql`] is the expression a column default or a trigger
+//!   uses. A `DateTime` binds and reads as one on either engine.
+//! - **Connections are pooled and few.** SQLite's are in-process and every
+//!   call blocks the calling thread; Postgres's are sockets and every call
+//!   awaits. A [`Conn`] goes back to its pool when dropped and the number
+//!   open at once is capped per `Db`.
 
+mod postgres;
+mod sqlite;
 mod vec;
 
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use parking_lot::Mutex;
-pub use rusqlite::types::Value;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
-/// The SQL expression for "now" in the schema's unit. Millisecond resolution,
-/// which is what `julianday('now')` gives; a host write binds [`now`] instead.
+/// The SQLite expression for "now" in the schema's unit. Millisecond
+/// resolution, which is what `julianday('now')` gives; a host write binds
+/// [`now`] instead. [`Engine::now_sql`] is what a caller composing DDL for
+/// either engine should use; this constant is the SQLite text it returns.
 pub const NOW_SQL: &str = "(CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER))";
 
-/// The SQL expression that mints a v4 UUID as lowercase hyphenated text, for
-/// column defaults. The host binds [`Uuid::new_v4`] on its own inserts; this
-/// exists so a raw insert from a test or a `sqlite3` session gets a real id.
+/// The SQLite expression that mints a v4 UUID as lowercase hyphenated text,
+/// for column defaults. The host binds [`Uuid::new_v4`] on its own inserts;
+/// this exists so a raw insert from a test or a `sqlite3` session gets a
+/// real id. [`Engine::uuid_sql`] is the engine-neutral way to ask for it.
 pub const UUID_SQL: &str = "(lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' \
     || substr(hex(randomblob(2)), 2) || '-' || substr('89ab', 1 + (abs(random()) % 4), 1) \
     || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))))";
 
-/// How long a connection waits on the write lock before `SQLITE_BUSY`. Long
-/// enough that a migration or a batch of events in another process is waited
-/// out rather than reported; short enough that a wedged writer is noticed.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Which engine a [`Db`] is. Most callers never ask; the ones that compose
+/// engine-specific SQL (a column default, a trigger body) ask once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    Sqlite,
+    Postgres,
+}
 
-/// How many connections one file may have open at once, counting the ones
-/// checked out. Past this a caller waits for a return.
-const MAX_OPEN: usize = 32;
+impl Engine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Engine::Sqlite => "sqlite",
+            Engine::Postgres => "postgres",
+        }
+    }
 
-/// How many idle connections the pool keeps. More than this and a returned
-/// connection is closed instead.
-const MAX_IDLE: usize = 8;
+    /// The expression for "now" in the engine's timestamp representation.
+    pub fn now_sql(self) -> &'static str {
+        match self {
+            Engine::Sqlite => NOW_SQL,
+            Engine::Postgres => "now()",
+        }
+    }
+
+    /// The expression that mints a v4 UUID in the engine's uuid
+    /// representation.
+    pub fn uuid_sql(self) -> &'static str {
+        match self {
+            Engine::Sqlite => UUID_SQL,
+            Engine::Postgres => "gen_random_uuid()",
+        }
+    }
+
+    /// The statement [`Db::begin`] runs. SQLite takes the write lock up front
+    /// so two writers queue instead of one failing mid-transaction; Postgres
+    /// has no such mode and does not need one.
+    pub fn begin_sql(self) -> &'static str {
+        match self {
+            Engine::Sqlite => "BEGIN IMMEDIATE",
+            Engine::Postgres => "BEGIN",
+        }
+    }
+}
+
+impl std::fmt::Display for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Everything this crate can fail with.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// The driver's error prints only its outer layer ("error serializing
+    /// parameter 0"); the cause, a bind conversion refused with the target
+    /// type named, is its source, so the text here walks the chain.
+    #[error("{}", postgres::describe_error(.0))]
+    Postgres(#[from] tokio_postgres::Error),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Pool(String),
     #[error("no rows")]
     NoRows,
     #[error("no such column {0:?}")]
     NoColumn(String),
     #[error("column {0:?}: {1}")]
     Decode(String, String),
+    /// An operation one engine has and the other does not, asked of the
+    /// wrong one: `ATTACH` on Postgres, say.
+    #[error("{1} is not available on the {0} engine")]
+    Unsupported(Engine, &'static str),
     #[error("{0}")]
     Other(String),
 }
@@ -96,15 +144,20 @@ pub enum Error {
 impl Error {
     /// The engine's message, for callers that match on which trigger or
     /// constraint refused a write. Tests assert on these; the daemon never
-    /// shows one to a client.
+    /// shows one to a client. A Postgres trigger's `RAISE EXCEPTION` text
+    /// and a SQLite trigger's `RAISE(ABORT, ...)` text both come back here.
     pub fn message(&self) -> String {
         match self {
             Error::Sqlite(rusqlite::Error::SqliteFailure(_, Some(msg))) => msg.clone(),
+            Error::Postgres(e) => match postgres::db_error(e) {
+                Some((_, msg)) => msg,
+                None => e.to_string(),
+            },
             other => other.to_string(),
         }
     }
 
-    /// The primary SQLite result code, when the engine produced one.
+    /// The primary SQLite result code, when the SQLite engine produced one.
     pub fn sqlite_code(&self) -> Option<i32> {
         match self {
             Error::Sqlite(rusqlite::Error::SqliteFailure(e, _)) => Some(e.extended_code & 0xff),
@@ -112,215 +165,251 @@ impl Error {
         }
     }
 
-    /// Whether a constraint, a `RAISE(ABORT)` in a trigger included, refused
-    /// the write. Both are `SQLITE_CONSTRAINT`; the message says which.
+    /// The SQLSTATE, when the Postgres server produced one.
+    pub fn sqlstate(&self) -> Option<String> {
+        match self {
+            Error::Postgres(e) => postgres::db_error(e).map(|(code, _)| code),
+            _ => None,
+        }
+    }
+
+    /// Whether a constraint, a trigger's refusal included, refused the write.
+    /// SQLite reports both as `SQLITE_CONSTRAINT`; Postgres reports a
+    /// constraint as class 23 and a trigger's `RAISE EXCEPTION` as `P0001`.
     pub fn is_constraint(&self) -> bool {
-        self.sqlite_code() == Some(19)
+        if self.sqlite_code() == Some(19) {
+            return true;
+        }
+        match self.sqlstate() {
+            Some(code) => code.starts_with("23") || code == "P0001",
+            None => false,
+        }
     }
 
     /// Whether a `UNIQUE` or primary-key constraint specifically refused it.
     pub fn is_unique_violation(&self) -> bool {
-        self.is_constraint() && self.message().contains("UNIQUE constraint failed")
+        (self.sqlite_code() == Some(19) && self.message().contains("UNIQUE constraint failed"))
+            || self.sqlstate().as_deref() == Some("23505")
     }
 
-    /// Whether the engine reported `SQLITE_BUSY`: the write lock was held past
-    /// the busy timeout.
+    /// Whether the engine reported the write lock held past the busy
+    /// timeout (`SQLITE_BUSY`), or a lock the server would not wait for.
     pub fn is_busy(&self) -> bool {
         self.sqlite_code() == Some(5)
+            || matches!(
+                self.sqlstate().as_deref(),
+                Some("55P03" | "40001" | "40P01")
+            )
+    }
+
+    /// Whether the pool refused the checkout because [`Db::close`] ran.
+    pub fn is_pool_closed(&self) -> bool {
+        matches!(self, Error::Pool(m) if m == "connection pool closed")
     }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// One engine connection, behind a lock so a reference to it can cross an
-/// await point. A statement takes the lock for exactly its own duration;
-/// nothing holds it across a wait, so two tasks sharing one `Connection`
-/// interleave statements rather than deadlock. Transactions are statements
-/// too (`BEGIN IMMEDIATE`, `COMMIT`), which is why a checked-out [`Conn`] is
-/// never shared: the pool hands each one to one holder at a time.
+/// One engine connection. Statements run on it through [`Query`]; a
+/// checked-out [`Conn`] is never shared, the pool hands each one to one
+/// holder at a time.
 pub struct Connection {
-    inner: Mutex<rusqlite::Connection>,
-    path: PathBuf,
-    /// The aliases attached on this connection, in attach order. What the
-    /// pool detaches before reusing it; what a caller reads to attach once.
-    attached: Mutex<Vec<String>>,
+    backend: Backend,
+}
+
+enum Backend {
+    Sqlite(sqlite::SqliteConn),
+    Postgres(postgres::PgConn),
 }
 
 impl Connection {
-    fn open(path: &Path) -> Result<Connection> {
-        // Before the first connection in this process, and a no-op after.
-        vec::register();
-        let c = rusqlite::Connection::open(path)?;
-        c.busy_timeout(BUSY_TIMEOUT)?;
-        // Foreign keys are per connection in SQLite and default to off, so a
-        // connection that skipped this would silently ignore every
-        // `REFERENCES` in the schema; that is why there is no other way to
-        // open one.
-        c.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
-        Ok(Connection {
-            inner: Mutex::new(c),
-            path: path.to_path_buf(),
-            attached: Mutex::new(Vec::new()),
-        })
+    pub fn engine(&self) -> Engine {
+        match self.backend {
+            Backend::Sqlite(_) => Engine::Sqlite,
+            Backend::Postgres(_) => Engine::Postgres,
+        }
     }
 
-    /// The file this connection is `main` on.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// The file this connection is `main` on. `None` on Postgres, where a
+    /// connection has no path; the callers that need one (the D39 owner
+    /// files) exist only for the SQLite engine.
+    pub fn path(&self) -> Option<&Path> {
+        match &self.backend {
+            Backend::Sqlite(c) => Some(c.path()),
+            Backend::Postgres(_) => None,
+        }
     }
 
-    /// `ATTACH DATABASE <path> AS <alias>`. Allowed inside a transaction,
-    /// where the attached file joins it. Attaching an alias this connection
-    /// already has is a no-op when it is the same file and an error when it
-    /// is not: an alias is a name for one file at a time.
+    /// `ATTACH DATABASE <path> AS <alias>` (SQLite). Allowed inside a
+    /// transaction, where the attached file joins it. Attaching an alias
+    /// this connection already has is a no-op when it is the same file and
+    /// an error when it is not: an alias is a name for one file at a time.
     pub fn attach(&self, path: &Path, alias: &str) -> Result<()> {
-        if !is_identifier(alias) {
-            return Err(Error::Other(format!("{alias:?} is not an identifier")));
+        match &self.backend {
+            Backend::Sqlite(c) => c.attach(path, alias),
+            Backend::Postgres(_) => Err(Error::Unsupported(Engine::Postgres, "ATTACH")),
         }
-        {
-            let held = self.attached.lock();
-            if held.iter().any(|a| a == alias) {
-                return Ok(());
-            }
-        }
-        let sql = format!("ATTACH DATABASE ?1 AS {}", quote_ident(alias));
-        self.inner
-            .lock()
-            .execute(&sql, [path.to_string_lossy().as_ref()])?;
-        self.attached.lock().push(alias.to_string());
-        Ok(())
     }
 
-    /// The aliases currently attached, in attach order.
+    /// The aliases currently attached, in attach order. Always empty on
+    /// Postgres.
     pub fn attached(&self) -> Vec<String> {
-        self.attached.lock().clone()
+        match &self.backend {
+            Backend::Sqlite(c) => c.attached(),
+            Backend::Postgres(_) => Vec::new(),
+        }
     }
 
-    /// `DETACH` one alias. Refused by the engine while an open transaction
-    /// holds the file; the alias then stays recorded, so the pool knows the
-    /// connection is not clean.
+    /// `DETACH` one alias (SQLite). Refused by the engine while an open
+    /// transaction holds the file; the alias then stays recorded, so the
+    /// pool knows the connection is not clean.
     pub fn detach(&self, alias: &str) -> Result<()> {
-        let sql = format!("DETACH DATABASE {}", quote_ident(alias));
-        self.inner.lock().execute_batch(&sql)?;
-        self.attached.lock().retain(|a| a != alias);
-        Ok(())
+        match &self.backend {
+            Backend::Sqlite(c) => c.detach(alias),
+            Backend::Postgres(_) => Err(Error::Unsupported(Engine::Postgres, "DETACH")),
+        }
     }
 
     /// `DETACH` everything this connection attached. Stops at the first
     /// refusal, which is why the pool closes a connection it cannot clean
-    /// rather than returning it.
+    /// rather than returning it. A no-op on Postgres.
     pub fn detach_all(&self) -> Result<()> {
-        for a in self.attached() {
-            self.detach(&a)?;
+        match &self.backend {
+            Backend::Sqlite(c) => c.detach_all(),
+            Backend::Postgres(_) => Ok(()),
         }
-        Ok(())
     }
 
-    /// Whether no transaction is open on this connection.
+    /// Whether no transaction is open on this connection. SQLite answers
+    /// from the engine; Postgres from what this connection has been asked
+    /// to run, so open transactions through [`Db::begin`].
     pub fn is_autocommit(&self) -> bool {
-        self.inner.lock().is_autocommit()
+        match &self.backend {
+            Backend::Sqlite(c) => c.is_autocommit(),
+            Backend::Postgres(c) => c.is_autocommit(),
+        }
     }
 
     /// Runs many statements. Migrations and DDL only; nothing here binds.
-    pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.inner.lock().execute_batch(sql)?;
-        Ok(())
+    pub async fn execute_batch(&self, sql: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Sqlite(c) => c.execute_batch(sql),
+            Backend::Postgres(c) => c.execute_batch(sql).await,
+        }
+    }
+
+    async fn execute(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        match &self.backend {
+            Backend::Sqlite(c) => c.execute(sql, params),
+            Backend::Postgres(c) => c.execute(sql, params).await,
+        }
+    }
+
+    async fn fetch(&self, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Row>> {
+        match &self.backend {
+            Backend::Sqlite(c) => c.fetch(sql, params, limit),
+            Backend::Postgres(c) => c.fetch(sql, params, limit).await,
+        }
     }
 }
 
-struct Inner {
-    path: PathBuf,
-    idle: Mutex<Vec<Connection>>,
-    slots: Arc<Semaphore>,
+enum DbInner {
+    Sqlite(sqlite::Pool),
+    Postgres(postgres::Pool),
 }
 
-/// One database file. Cheap to clone; every clone is the same file and the
-/// same pool.
+/// One database: a SQLite file or a Postgres database. Cheap to clone; every
+/// clone is the same database and the same pool.
 #[derive(Clone)]
 pub struct Db {
-    inner: Arc<Inner>,
+    inner: Arc<DbInner>,
 }
 
 impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Db")
-            .field("path", &self.inner.path)
-            .finish()
+        match &*self.inner {
+            DbInner::Sqlite(p) => f.debug_struct("Db").field("path", &p.path()).finish(),
+            DbInner::Postgres(p) => f.debug_struct("Db").field("url", &p.describe()).finish(),
+        }
     }
 }
 
 impl Db {
-    /// Opens (creating if needed) the file at `path`, creating its parent
-    /// directory, and switches it to WAL so readers never block the writer.
-    /// WAL is a property of the file and persists; the per-connection pragmas
-    /// are set when a connection is opened for the pool.
+    /// Opens (creating if needed) the SQLite file at `path`, creating its
+    /// parent directory, and switches it to WAL so readers never block the
+    /// writer.
     pub async fn open(path: impl AsRef<Path>) -> Result<Db> {
-        let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let db = Db {
-            inner: Arc::new(Inner {
-                path,
-                idle: Mutex::new(Vec::new()),
-                slots: Arc::new(Semaphore::new(MAX_OPEN)),
-            }),
-        };
-        let c = db.conn().await?;
-        // PRAGMA journal_mode returns a row, so it is a query rather than an
-        // execute; the row says which mode the file ended up in.
-        let mode: String = query("PRAGMA journal_mode = WAL").fetch_scalar(&c).await?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(Error::Other(format!(
-                "{}: journal_mode is {mode:?}, wanted wal",
-                db.inner.path.display()
-            )));
-        }
-        Ok(db)
-    }
-
-    /// The file this is.
-    pub fn path(&self) -> &Path {
-        &self.inner.path
-    }
-
-    /// A connection from the pool, or a fresh one. Waits when the file's cap
-    /// of open connections is reached.
-    pub async fn conn(&self) -> Result<Conn> {
-        let permit = self
-            .inner
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Other("connection pool closed".into()))?;
-        let reused = self.inner.idle.lock().pop();
-        let c = match reused {
-            Some(c) => c,
-            None => Connection::open(&self.inner.path)?,
-        };
-        Ok(Conn {
-            c: Some(c),
-            pool: self.inner.clone(),
-            _permit: permit,
+        let pool = sqlite::Pool::open(path.as_ref().to_path_buf()).await?;
+        Ok(Db {
+            inner: Arc::new(DbInner::Sqlite(pool)),
         })
     }
 
-    /// A write transaction on a pooled connection: `BEGIN IMMEDIATE`, so the
-    /// write lock is taken now rather than at the first write, and two writers
-    /// queue in the engine instead of one failing mid-transaction with BUSY.
+    /// Connects to the Postgres database at `url`
+    /// (`postgres://user:password@host:port/database?sslmode=...`), and
+    /// proves one connection answers before returning. `sslrootcert=<pem>`
+    /// names the CA the server must chain to; without it the public roots
+    /// are trusted; `sslmode=disable` is the only plaintext.
+    pub async fn connect(url: &str) -> Result<Db> {
+        let pool = postgres::Pool::connect(url).await?;
+        Ok(Db {
+            inner: Arc::new(DbInner::Postgres(pool)),
+        })
+    }
+
+    pub fn engine(&self) -> Engine {
+        match &*self.inner {
+            DbInner::Sqlite(_) => Engine::Sqlite,
+            DbInner::Postgres(_) => Engine::Postgres,
+        }
+    }
+
+    /// The file this is, on SQLite. `None` on Postgres.
+    pub fn path(&self) -> Option<&Path> {
+        match &*self.inner {
+            DbInner::Sqlite(p) => Some(p.path()),
+            DbInner::Postgres(_) => None,
+        }
+    }
+
+    /// A connection from the pool, or a fresh one. Waits when the cap of
+    /// open connections is reached.
+    pub async fn conn(&self) -> Result<Conn> {
+        match &*self.inner {
+            DbInner::Sqlite(p) => {
+                let (c, permit) = p.checkout().await?;
+                Ok(Conn {
+                    c: Some(Connection {
+                        backend: Backend::Sqlite(c),
+                    }),
+                    db: self.inner.clone(),
+                    _permit: Some(permit),
+                })
+            }
+            DbInner::Postgres(p) => {
+                let c = p.checkout().await?;
+                Ok(Conn {
+                    c: Some(Connection {
+                        backend: Backend::Postgres(c),
+                    }),
+                    db: self.inner.clone(),
+                    _permit: None,
+                })
+            }
+        }
+    }
+
+    /// A write transaction on a pooled connection: [`Engine::begin_sql`].
     /// Dropping the transaction without committing rolls it back.
     pub async fn begin(&self) -> Result<Transaction> {
         let conn = self.conn().await?;
-        conn.execute_batch("BEGIN IMMEDIATE")?;
+        conn.execute_batch(self.engine().begin_sql()).await?;
         Ok(Transaction { open: true, conn })
     }
 
     /// Runs many statements. Migrations and DDL only; nothing here binds.
     pub async fn batch(c: &Connection, sql: &str) -> Result<()> {
-        c.execute_batch(sql)
+        c.execute_batch(sql).await
     }
 
     /// Refuses every later checkout and drops the idle connections. What a
@@ -329,8 +418,10 @@ impl Db {
     /// closed", which is the failure the readiness probe and the credential
     /// resolver have to turn into "not ready" and 401.
     pub fn close(&self) {
-        self.inner.slots.close();
-        self.inner.idle.lock().clear();
+        match &*self.inner {
+            DbInner::Sqlite(p) => p.close(),
+            DbInner::Postgres(p) => p.close(),
+        }
     }
 }
 
@@ -339,8 +430,8 @@ impl Db {
 /// because a connection with state is not interchangeable with one without.
 pub struct Conn {
     c: Option<Connection>,
-    pool: Arc<Inner>,
-    _permit: OwnedSemaphorePermit,
+    db: Arc<DbInner>,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Deref for Conn {
@@ -350,30 +441,65 @@ impl Deref for Conn {
     }
 }
 
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Connection")
+            .field("engine", &self.engine())
+            .field("path", &self.path())
+            .field("autocommit", &self.is_autocommit())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Conn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Conn").field(&self.c).finish()
+    }
+}
+
+impl std::fmt::Debug for Transaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Transaction")
+            .field("open", &self.open)
+            .field("conn", &self.conn)
+            .finish()
+    }
+}
+
 impl Drop for Conn {
     fn drop(&mut self) {
         let Some(c) = self.c.take() else {
             return;
         };
-        if !c.is_autocommit() {
-            return;
-        }
-        // An attachment is state a checkout must not inherit: the next
-        // caller did not ask for that file (invariant 14). A connection that
-        // cannot shed it is closed instead of pooled.
-        if c.detach_all().is_err() {
-            return;
-        }
-        let mut idle = self.pool.idle.lock();
-        if idle.len() < MAX_IDLE {
-            idle.push(c);
+        match (c.backend, &*self.db) {
+            (Backend::Sqlite(c), DbInner::Sqlite(pool)) => {
+                if !c.is_autocommit() {
+                    return;
+                }
+                // An attachment is state a checkout must not inherit: the
+                // next caller did not ask for that file (invariant 14). A
+                // connection that cannot shed it is closed instead of pooled.
+                if c.detach_all().is_err() {
+                    return;
+                }
+                pool.put_back(c);
+            }
+            (Backend::Postgres(mut c), DbInner::Postgres(_)) => {
+                if !c.is_autocommit() {
+                    c.close_now();
+                }
+                // Otherwise the pooled object drops here and the pool takes
+                // it back.
+            }
+            _ => unreachable!("a connection belongs to the pool that made it"),
         }
     }
 }
 
-/// `BEGIN IMMEDIATE` on a pooled connection. Derefs to the connection so
+/// A transaction on a pooled connection. Derefs to the connection so
 /// statements run inside it; `commit` ends it; dropping it rolls it back and
-/// returns the connection to the pool afterwards.
+/// returns the connection to the pool afterwards (SQLite) or closes the
+/// connection, which rolls it back server-side (Postgres).
 pub struct Transaction {
     open: bool,
     conn: Conn,
@@ -390,7 +516,7 @@ impl Transaction {
     pub async fn commit(mut self) -> Result<()> {
         if self.open {
             self.open = false;
-            self.conn.execute_batch("COMMIT")?;
+            self.conn.execute_batch("COMMIT").await?;
         }
         Ok(())
     }
@@ -398,7 +524,7 @@ impl Transaction {
     pub async fn rollback(mut self) -> Result<()> {
         if self.open {
             self.open = false;
-            self.conn.execute_batch("ROLLBACK")?;
+            self.conn.execute_batch("ROLLBACK").await?;
         }
         Ok(())
     }
@@ -406,11 +532,21 @@ impl Transaction {
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        if self.open && !self.conn.is_autocommit() {
-            // Best effort: a rollback that fails leaves the connection
-            // mid-transaction, and `Conn::drop` then closes it rather than
-            // returning it, so the failure cannot leak into another caller.
-            let _ = self.conn.execute_batch("ROLLBACK");
+        if !self.open {
+            return;
+        }
+        // Best effort on SQLite, where a rollback is a synchronous call: one
+        // that fails leaves the connection mid-transaction, and `Conn::drop`
+        // then closes it rather than returning it, so the failure cannot
+        // leak into another caller. On Postgres nothing can be awaited here;
+        // the connection is still marked in-transaction, so `Conn::drop`
+        // closes it and the server rolls the transaction back.
+        if let Some(Connection {
+            backend: Backend::Sqlite(c),
+        }) = self.conn.c.as_ref()
+            && !c.is_autocommit()
+        {
+            let _ = c.execute_batch("ROLLBACK");
         }
     }
 }
@@ -428,7 +564,7 @@ pub fn now() -> DateTime<Utc> {
         .unwrap_or(t)
 }
 
-/// Microseconds since the epoch, the column representation.
+/// Microseconds since the epoch, the SQLite column representation.
 pub fn micros(t: DateTime<Utc>) -> i64 {
     t.timestamp_micros()
 }
@@ -437,6 +573,46 @@ pub fn micros(t: DateTime<Utc>) -> i64 {
 /// chrono's range, which no clock produces.
 pub fn from_micros(us: i64) -> Option<DateTime<Utc>> {
     Utc.timestamp_micros(us).single()
+}
+
+// ---------------------------------------------------------------------------
+// Values.
+// ---------------------------------------------------------------------------
+
+/// A value bound to a placeholder or read from a column. The first five are
+/// SQLite's storage classes and are what a SQLite read produces; the typed
+/// four are what the host binds and what a Postgres read produces for a
+/// typed column. Each backend maps between them at the bind and the read,
+/// so a caller sees the same `Value` whichever engine answered, up to the
+/// SQLite shape of the typed ones (a uuid read from SQLite is `Text`), which
+/// the typed [`FromSql`] impls accept.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+    Bool(bool),
+    Uuid(Uuid),
+    Timestamp(DateTime<Utc>),
+    Json(serde_json::Value),
+}
+
+impl Value {
+    fn describe(&self) -> &'static str {
+        match self {
+            Value::Null => "NULL",
+            Value::Integer(_) => "an integer",
+            Value::Real(_) => "a real",
+            Value::Text(_) => "text",
+            Value::Blob(_) => "a blob",
+            Value::Bool(_) => "a bool",
+            Value::Uuid(_) => "a uuid",
+            Value::Timestamp(_) => "a timestamp",
+            Value::Json(_) => "json",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,37 +681,37 @@ impl ToSql for f64 {
 }
 impl ToSql for bool {
     fn to_sql(self) -> Value {
-        Value::Integer(self as i64)
+        Value::Bool(self)
     }
 }
 impl ToSql for Uuid {
     fn to_sql(self) -> Value {
-        Value::Text(self.to_string())
+        Value::Uuid(self)
     }
 }
 impl ToSql for &Uuid {
     fn to_sql(self) -> Value {
-        Value::Text(self.to_string())
+        Value::Uuid(*self)
     }
 }
 impl ToSql for DateTime<Utc> {
     fn to_sql(self) -> Value {
-        Value::Integer(micros(self))
+        Value::Timestamp(self)
     }
 }
 impl ToSql for &DateTime<Utc> {
     fn to_sql(self) -> Value {
-        Value::Integer(micros(*self))
+        Value::Timestamp(*self)
     }
 }
 impl ToSql for serde_json::Value {
     fn to_sql(self) -> Value {
-        Value::Text(self.to_string())
+        Value::Json(self)
     }
 }
 impl ToSql for &serde_json::Value {
     fn to_sql(self) -> Value {
-        Value::Text(self.to_string())
+        Value::Json(self.clone())
     }
 }
 impl ToSql for Vec<u8> {
@@ -574,20 +750,15 @@ impl<T: ToSql + Clone> ToSql for &Option<T> {
 // Reading.
 // ---------------------------------------------------------------------------
 
-/// A value read out of a column.
+/// A value read out of a column. Each typed impl accepts the SQLite shape
+/// (text, integer) beside the typed one, because a column is the same column
+/// whichever engine it came from.
 pub trait FromSql: Sized {
     fn from_sql(v: &Value) -> std::result::Result<Self, String>;
 }
 
 fn wrong(expected: &str, v: &Value) -> String {
-    let got = match v {
-        Value::Null => "NULL",
-        Value::Integer(_) => "an integer",
-        Value::Real(_) => "a real",
-        Value::Text(_) => "text",
-        Value::Blob(_) => "a blob",
-    };
-    format!("expected {expected}, got {got}")
+    format!("expected {expected}, got {}", v.describe())
 }
 
 impl FromSql for Value {
@@ -633,8 +804,9 @@ impl FromSql for f64 {
 impl FromSql for bool {
     fn from_sql(v: &Value) -> std::result::Result<Self, String> {
         match v {
+            Value::Bool(b) => Ok(*b),
             Value::Integer(i) => Ok(*i != 0),
-            other => Err(wrong("a 0/1 integer", other)),
+            other => Err(wrong("a bool or a 0/1 integer", other)),
         }
     }
 }
@@ -642,6 +814,10 @@ impl FromSql for String {
     fn from_sql(v: &Value) -> std::result::Result<Self, String> {
         match v {
             Value::Text(s) => Ok(s.clone()),
+            // A uuid column read as text is the SQLite shape of the same
+            // column; a caller comparing ids as strings gets the same text
+            // from either engine.
+            Value::Uuid(u) => Ok(u.to_string()),
             other => Err(wrong("text", other)),
         }
     }
@@ -651,28 +827,38 @@ impl FromSql for Vec<u8> {
         match v {
             Value::Blob(b) => Ok(b.clone()),
             Value::Text(s) => Ok(s.as_bytes().to_vec()),
+            Value::Json(j) => Ok(j.to_string().into_bytes()),
             other => Err(wrong("a blob", other)),
         }
     }
 }
 impl FromSql for Uuid {
     fn from_sql(v: &Value) -> std::result::Result<Self, String> {
-        let s = String::from_sql(v)?;
-        Uuid::parse_str(&s).map_err(|e| format!("{s:?} is not a uuid: {e}"))
+        match v {
+            Value::Uuid(u) => Ok(*u),
+            Value::Text(s) => Uuid::parse_str(s).map_err(|e| format!("{s:?} is not a uuid: {e}")),
+            other => Err(wrong("a uuid", other)),
+        }
     }
 }
 impl FromSql for DateTime<Utc> {
     fn from_sql(v: &Value) -> std::result::Result<Self, String> {
-        let us = i64::from_sql(v)?;
-        from_micros(us).ok_or_else(|| format!("{us} is not a timestamp"))
+        match v {
+            Value::Timestamp(t) => Ok(*t),
+            Value::Integer(us) => {
+                from_micros(*us).ok_or_else(|| format!("{us} is not a timestamp"))
+            }
+            other => Err(wrong("a timestamp", other)),
+        }
     }
 }
 impl FromSql for serde_json::Value {
     fn from_sql(v: &Value) -> std::result::Result<Self, String> {
         match v {
+            Value::Json(j) => Ok(j.clone()),
             Value::Text(s) => serde_json::from_str(s).map_err(|e| format!("not json: {e}")),
             Value::Blob(b) => serde_json::from_slice(b).map_err(|e| format!("not json: {e}")),
-            other => Err(wrong("json text", other)),
+            other => Err(wrong("json", other)),
         }
     }
 }
@@ -694,6 +880,10 @@ pub struct Row {
 }
 
 impl Row {
+    pub(crate) fn new(columns: Arc<Vec<String>>, values: Vec<Value>) -> Row {
+        Row { columns, values }
+    }
+
     fn index(&self, col: &str) -> Result<usize> {
         self.columns
             .iter()
@@ -747,6 +937,7 @@ impl Row {
 
 /// A statement with its bound values. Placeholders are `?1`, `?2`, ... and
 /// bind in that order; `bind` is called once per placeholder in sequence.
+/// On Postgres the text is rewritten to `$1`, `$2`, ... at execution.
 pub struct Query<'q> {
     sql: &'q str,
     params: Vec<Value>,
@@ -767,45 +958,21 @@ impl Query<'_> {
     }
 
     /// Runs a statement that returns no rows and reports how many it changed.
-    /// A statement with `RETURNING` wants `fetch_*`; the engine refuses it here.
+    /// A statement with `RETURNING` wants `fetch_*`; SQLite refuses it here
+    /// and Postgres silently discards the rows.
     pub async fn execute(self, c: &Connection) -> Result<u64> {
-        let conn = c.inner.lock();
-        let mut stmt = conn.prepare(self.sql)?;
-        let n = stmt.execute(rusqlite::params_from_iter(self.params.iter()))?;
-        Ok(n as u64)
-    }
-
-    /// Reads up to `limit` rows; `None` reads them all.
-    fn fetch(self, c: &Connection, limit: Option<usize>) -> Result<Vec<Row>> {
-        let conn = c.inner.lock();
-        let mut stmt = conn.prepare(self.sql)?;
-        let columns: Arc<Vec<String>> =
-            Arc::new(stmt.column_names().into_iter().map(String::from).collect());
-        let n = columns.len();
-        let mut rows = stmt.query(rusqlite::params_from_iter(self.params.iter()))?;
-        let mut out = Vec::new();
-        while let Some(r) = rows.next()? {
-            let mut values = Vec::with_capacity(n);
-            for i in 0..n {
-                values.push(r.get::<_, Value>(i)?);
-            }
-            out.push(Row {
-                columns: columns.clone(),
-                values,
-            });
-            if limit.is_some_and(|l| out.len() >= l) {
-                break;
-            }
-        }
-        Ok(out)
+        c.execute(self.sql, &self.params).await
     }
 
     pub async fn fetch_all(self, c: &Connection) -> Result<Vec<Row>> {
-        self.fetch(c, None)
+        c.fetch(self.sql, &self.params, None).await
     }
 
     pub async fn fetch_optional(self, c: &Connection) -> Result<Option<Row>> {
-        Ok(self.fetch(c, Some(1))?.into_iter().next())
+        Ok(c.fetch(self.sql, &self.params, Some(1))
+            .await?
+            .into_iter()
+            .next())
     }
 
     pub async fn fetch_one(self, c: &Connection) -> Result<Row> {
@@ -834,8 +1001,6 @@ impl Query<'_> {
     }
 }
 
-/// Double-quotes an identifier for DDL. Callers validate the name first; the
-/// doubling is the last line, not the only one.
 /// `[a-z_][a-z0-9_]*`: what an attach alias has to be.
 fn is_identifier(s: &str) -> bool {
     let mut chars = s.chars();
@@ -843,6 +1008,8 @@ fn is_identifier(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Double-quotes an identifier for DDL. Callers validate the name first; the
+/// doubling is the last line, not the only one.
 pub fn quote_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
@@ -850,6 +1017,41 @@ pub fn quote_ident(s: &str) -> String {
 /// Single-quotes a string literal for embedding in an expression.
 pub fn quote_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+// ---------------------------------------------------------------------------
+// The test backend.
+// ---------------------------------------------------------------------------
+
+/// The connection string a test reads to run against Postgres. Unset, a
+/// database test runs on SQLite, which needs nothing; set, the test fixtures
+/// make their databases there instead.
+pub const TEST_URL_ENV: &str = "HIVE_SANDBOX_TEST_DATABASE_URL";
+
+/// Set in the environment that promised a Postgres (CI's `postgres` job), so
+/// a test that would skip for want of [`TEST_URL_ENV`] fails instead. A job
+/// that provisions a server and then skips the tests that need it reports
+/// success for doing nothing.
+pub const TEST_REQUIRE_ENV: &str = "HIVE_SANDBOX_REQUIRE_DATABASE_TESTS";
+
+/// The test Postgres URL, for a test that only makes sense on that engine.
+/// `None` means the variable is unset and a `SKIPPED:` line naming the test
+/// has been printed; the caller returns. Under [`TEST_REQUIRE_ENV`] the
+/// absence is a panic instead, so the skip cannot pass as green where a
+/// server was promised.
+pub fn test_postgres_url(test_name: &str) -> Option<String> {
+    match std::env::var(TEST_URL_ENV) {
+        Ok(u) if !u.trim().is_empty() => Some(u.trim().to_string()),
+        _ => {
+            if std::env::var(TEST_REQUIRE_ENV).is_ok_and(|v| v == "1") {
+                panic!(
+                    "{test_name} needs {TEST_URL_ENV} and {TEST_REQUIRE_ENV}=1 forbids the skip"
+                );
+            }
+            eprintln!("SKIPPED: {test_name} needs {TEST_URL_ENV}; run scripts/db-up and export it");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -862,9 +1064,33 @@ mod tests {
         (dir, db)
     }
 
+    fn sqlite_pool(db: &Db) -> &sqlite::Pool {
+        match &*db.inner {
+            DbInner::Sqlite(p) => p,
+            DbInner::Postgres(_) => unreachable!(),
+        }
+    }
+
+    /// The Postgres test database, when `HIVE_SANDBOX_TEST_DATABASE_URL`
+    /// names one. Tests on it use a table name of their own and drop it,
+    /// so they share the database without sharing state.
+    async fn pg(test_name: &str) -> Option<Db> {
+        let url = test_postgres_url(test_name)?;
+        Some(
+            Db::connect(&url)
+                .await
+                .expect("connect to the test postgres"),
+        )
+    }
+
+    fn unique_table() -> String {
+        format!("t_{}", Uuid::new_v4().simple())
+    }
+
     #[tokio::test]
     async fn opens_in_wal_with_foreign_keys_on() {
         let (_d, db) = temp().await;
+        assert_eq!(db.engine(), Engine::Sqlite);
         let c = db.conn().await.unwrap();
         let fk: i64 = query("PRAGMA foreign_keys").fetch_scalar(&c).await.unwrap();
         assert_eq!(fk, 1);
@@ -922,6 +1148,9 @@ mod tests {
         assert_eq!(r.get::<Option<String>>("maybe"), None);
         assert!(r.try_get::<String>("nope").is_err());
         assert!(r.try_get::<String>("n").is_err(), "an integer is not text");
+        // The SQLite shapes: a uuid is text and a bool is an integer there.
+        assert_eq!(r.get::<Value>("id"), Value::Text(id.to_string()));
+        assert_eq!(r.get::<Value>("b"), Value::Integer(1));
     }
 
     #[tokio::test]
@@ -1007,6 +1236,7 @@ mod tests {
     #[tokio::test]
     async fn connections_are_reused_and_capped() {
         let (_d, db) = temp().await;
+        let pool = sqlite_pool(&db);
         {
             let c = db.conn().await.unwrap();
             query("CREATE TABLE t (n INTEGER)")
@@ -1014,23 +1244,23 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(db.inner.idle.lock().len(), 1, "one idle after return");
+        assert_eq!(pool.idle_len(), 1, "one idle after return");
         {
             let _a = db.conn().await.unwrap();
-            assert_eq!(db.inner.idle.lock().len(), 0, "the idle one was reused");
+            assert_eq!(pool.idle_len(), 0, "the idle one was reused");
             let _b = db.conn().await.unwrap();
-            assert_eq!(db.inner.slots.available_permits(), MAX_OPEN - 2);
+            assert_eq!(pool.available_permits(), sqlite::MAX_OPEN - 2);
         }
-        assert_eq!(db.inner.idle.lock().len(), 2);
-        assert_eq!(db.inner.slots.available_permits(), MAX_OPEN);
+        assert_eq!(pool.idle_len(), 2);
+        assert_eq!(pool.available_permits(), sqlite::MAX_OPEN);
         // A connection left inside a transaction is closed, not pooled.
         {
             let c = db.conn().await.unwrap();
-            c.execute_batch("BEGIN").unwrap();
+            c.execute_batch("BEGIN").await.unwrap();
             query("INSERT INTO t VALUES (1)").execute(&c).await.unwrap();
         }
         assert_eq!(
-            db.inner.idle.lock().len(),
+            pool.idle_len(),
             1,
             "a mid-transaction connection was pooled"
         );
@@ -1042,11 +1272,11 @@ mod tests {
         assert_eq!(n, 0, "the abandoned transaction leaked a row");
         drop(c);
         let mut held = Vec::new();
-        for _ in 0..(MAX_IDLE + 4) {
+        for _ in 0..(sqlite::MAX_IDLE + 4) {
             held.push(db.conn().await.unwrap());
         }
         drop(held);
-        assert!(db.inner.idle.lock().len() <= MAX_IDLE);
+        assert!(pool.idle_len() <= sqlite::MAX_IDLE);
     }
 
     /// sqlite-vec is in every connection this process opens (D41).
@@ -1113,7 +1343,7 @@ mod tests {
         // transaction never touched detaches fine; the engine refuses only
         // what the transaction holds.)
         {
-            c.execute_batch("BEGIN IMMEDIATE").unwrap();
+            c.execute_batch("BEGIN IMMEDIATE").await.unwrap();
             c.attach(&other, "o").unwrap();
             query("INSERT INTO o.t VALUES (1)")
                 .execute(&c)
@@ -1131,7 +1361,7 @@ mod tests {
         }
         drop(c);
         assert!(
-            db.inner.idle.lock().iter().all(|c| c.attached().is_empty()),
+            sqlite_pool(&db).idle_all_clean(),
             "a connection with an attachment was pooled"
         );
     }
@@ -1154,10 +1384,14 @@ mod tests {
         for _ in 0..20 {
             let mut keep = Vec::new();
             for _ in 0..64 {
-                let c = Connection::open(&path).unwrap();
-                let n: i64 = query("SELECT count(*) FROM t")
-                    .fetch_scalar(&c)
-                    .await
+                let c = sqlite::SqliteConn::open(&path).unwrap();
+                let n: i64 = c
+                    .fetch("SELECT count(*) FROM t", &[], Some(1))
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .try_get_at(0)
                     .unwrap();
                 assert_eq!(n, 0);
                 keep.push(c);
@@ -1170,9 +1404,14 @@ mod tests {
     async fn defaults_mint_a_uuid_and_a_time() {
         let (_d, db) = temp().await;
         let c = db.conn().await.unwrap();
+        let e = db.engine();
         Db::batch(
             &c,
-            &format!("CREATE TABLE t (id TEXT PRIMARY KEY DEFAULT {UUID_SQL}, at INTEGER NOT NULL DEFAULT {NOW_SQL})"),
+            &format!(
+                "CREATE TABLE t (id TEXT PRIMARY KEY DEFAULT {}, at INTEGER NOT NULL DEFAULT {})",
+                e.uuid_sql(),
+                e.now_sql()
+            ),
         )
         .await
         .unwrap();
@@ -1192,5 +1431,309 @@ mod tests {
     fn now_round_trips_through_micros() {
         let t = now();
         assert_eq!(from_micros(micros(t)), Some(t));
+    }
+
+    #[tokio::test]
+    async fn a_closed_pool_refuses_checkouts_by_name() {
+        let (_d, db) = temp().await;
+        db.close();
+        let err = db.conn().await.unwrap_err();
+        assert!(err.is_pool_closed(), "{err}");
+    }
+
+    #[tokio::test]
+    async fn attach_is_sqlite_only() {
+        let Some(db) = pg("hive-db::attach_is_sqlite_only").await else {
+            return;
+        };
+        let c = db.conn().await.unwrap();
+        let err = c.attach(Path::new("x.db"), "o").unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(Engine::Postgres, "ATTACH")),
+            "{err}"
+        );
+        assert!(c.attached().is_empty());
+        assert!(c.path().is_none());
+        assert!(db.path().is_none());
+    }
+
+    /// The same typed round trip as the SQLite test, against typed columns:
+    /// the host binds a `Uuid`, a `DateTime`, a `bool` and json, and reads
+    /// them back as themselves, with the typed `Value` variants underneath.
+    #[tokio::test]
+    async fn postgres_binds_and_reads_every_type_by_name() {
+        let Some(db) = pg("hive-db::postgres_binds_and_reads_every_type_by_name").await else {
+            return;
+        };
+        assert_eq!(db.engine(), Engine::Postgres);
+        let c = db.conn().await.unwrap();
+        let t = unique_table();
+        Db::batch(
+            &c,
+            &format!(
+                "CREATE TABLE {t} (id uuid, n bigint, f double precision, b boolean, j jsonb, \
+                 at timestamptz, raw bytea, maybe text, small integer)"
+            ),
+        )
+        .await
+        .unwrap();
+        let id = Uuid::new_v4();
+        let at = now();
+        let j = serde_json::json!({"a": [1, 2]});
+        query(&format!(
+            "INSERT INTO {t} VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+        ))
+        .bind(id)
+        .bind(7i64)
+        .bind(1.5f64)
+        .bind(true)
+        .bind(&j)
+        .bind(at)
+        .bind(vec![1u8, 2, 3])
+        .bind(None::<String>)
+        .bind(42i32)
+        .execute(&c)
+        .await
+        .unwrap();
+        let r = query(&format!("SELECT * FROM {t}"))
+            .fetch_one(&c)
+            .await
+            .unwrap();
+        assert_eq!(r.get::<Uuid>("id"), id);
+        assert_eq!(
+            r.get::<String>("id"),
+            id.to_string(),
+            "a uuid reads as text too"
+        );
+        assert_eq!(r.get::<i64>("n"), 7);
+        assert_eq!(r.get::<i32>("n"), 7);
+        assert_eq!(r.get::<i64>("small"), 42);
+        assert_eq!(r.get::<f64>("f"), 1.5);
+        assert!(r.get::<bool>("b"));
+        assert_eq!(r.get::<serde_json::Value>("j"), j);
+        assert_eq!(r.get::<DateTime<Utc>>("at"), at);
+        assert_eq!(r.get::<Vec<u8>>("raw"), vec![1, 2, 3]);
+        assert_eq!(r.get::<Option<String>>("maybe"), None);
+        assert!(r.try_get::<String>("nope").is_err());
+        assert!(r.try_get::<String>("n").is_err(), "an integer is not text");
+        assert_eq!(r.get::<Value>("id"), Value::Uuid(id));
+        assert_eq!(r.get::<Value>("b"), Value::Bool(true));
+        assert_eq!(r.get::<Value>("at"), Value::Timestamp(at));
+        Db::batch(&c, &format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    /// A statement written against the SQLite column shapes (a uuid as text,
+    /// a time as an integer, a bool as 0/1, json as text) binds correctly
+    /// against the typed columns, because the bind converts by the type the
+    /// server inferred. This is what lets the store's statements run on both
+    /// engines before every call site is retyped.
+    #[tokio::test]
+    async fn postgres_binds_the_sqlite_shapes_to_typed_columns() {
+        let Some(db) = pg("hive-db::postgres_binds_the_sqlite_shapes_to_typed_columns").await
+        else {
+            return;
+        };
+        let c = db.conn().await.unwrap();
+        let t = unique_table();
+        Db::batch(
+            &c,
+            &format!("CREATE TABLE {t} (id uuid, b boolean, at timestamptz, j jsonb, n integer)"),
+        )
+        .await
+        .unwrap();
+        let id = Uuid::new_v4();
+        let at = now();
+        query(&format!("INSERT INTO {t} VALUES (?1, ?2, ?3, ?4, ?5)"))
+            .bind(Value::Text(id.to_string()))
+            .bind(Value::Integer(1))
+            .bind(Value::Integer(micros(at)))
+            .bind(Value::Text("{\"k\":1}".into()))
+            .bind(Value::Integer(5))
+            .execute(&c)
+            .await
+            .unwrap();
+        let r = query(&format!("SELECT * FROM {t} WHERE id = ?1 AND at = ?2"))
+            .bind(id.to_string())
+            .bind(micros(at))
+            .fetch_one(&c)
+            .await
+            .unwrap();
+        assert_eq!(r.get::<Uuid>("id"), id);
+        assert!(r.get::<bool>("b"));
+        assert_eq!(r.get::<DateTime<Utc>>("at"), at);
+        assert_eq!(r.get::<serde_json::Value>("j"), serde_json::json!({"k": 1}));
+        assert_eq!(r.get::<i64>("n"), 5);
+        // A mismatch names the target type rather than failing silently.
+        let err = query(&format!("INSERT INTO {t} (id) VALUES (?1)"))
+            .bind("not a uuid")
+            .execute(&c)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("uuid"), "{err}");
+        Db::batch(&c, &format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_trigger_and_unique_refusals_classify() {
+        let Some(db) = pg("hive-db::postgres_trigger_and_unique_refusals_classify").await else {
+            return;
+        };
+        let c = db.conn().await.unwrap();
+        let t = unique_table();
+        Db::batch(
+            &c,
+            &format!(
+                "CREATE TABLE {t} (n integer UNIQUE);
+                 CREATE FUNCTION {t}_no_neg() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                     IF NEW.n < 0 THEN RAISE EXCEPTION 'n must not be negative'; END IF;
+                     RETURN NEW;
+                 END $$;
+                 CREATE TRIGGER no_neg BEFORE INSERT ON {t} FOR EACH ROW EXECUTE FUNCTION {t}_no_neg();"
+            ),
+        )
+        .await
+        .unwrap();
+        let err = query(&format!("INSERT INTO {t} VALUES (-1)"))
+            .execute(&c)
+            .await
+            .unwrap_err();
+        assert!(err.is_constraint(), "{err:?}");
+        assert!(!err.is_unique_violation());
+        assert_eq!(err.message(), "n must not be negative");
+        assert_eq!(err.sqlstate().as_deref(), Some("P0001"));
+        query(&format!("INSERT INTO {t} VALUES (1)"))
+            .execute(&c)
+            .await
+            .unwrap();
+        let err = query(&format!("INSERT INTO {t} VALUES (1)"))
+            .execute(&c)
+            .await
+            .unwrap_err();
+        assert!(err.is_constraint());
+        assert!(err.is_unique_violation(), "{err:?}");
+        assert_eq!(err.sqlstate().as_deref(), Some("23505"));
+        Db::batch(&c, &format!("DROP TABLE {t}; DROP FUNCTION {t}_no_neg()"))
+            .await
+            .unwrap();
+    }
+
+    /// A transaction dropped without commit is rolled back, and the
+    /// connection that held it is not the one the next checkout gets: a
+    /// connection that was left mid-transaction is closed, so a later caller
+    /// cannot land inside somebody else's aborted transaction.
+    #[tokio::test]
+    async fn postgres_dropped_transaction_rolls_back_and_the_connection_is_not_reused() {
+        let Some(db) =
+            pg("hive-db::postgres_dropped_transaction_rolls_back_and_the_connection_is_not_reused")
+                .await
+        else {
+            return;
+        };
+        let t = unique_table();
+        {
+            let c = db.conn().await.unwrap();
+            Db::batch(&c, &format!("CREATE TABLE {t} (n integer)"))
+                .await
+                .unwrap();
+        }
+        {
+            let tx = db.begin().await.unwrap();
+            assert!(!tx.is_autocommit());
+            query(&format!("INSERT INTO {t} VALUES (1)"))
+                .execute(&tx)
+                .await
+                .unwrap();
+            // dropped, not committed
+        }
+        let c = db.conn().await.unwrap();
+        assert!(
+            c.is_autocommit(),
+            "the next checkout inherited a transaction"
+        );
+        let n: i64 = query(&format!("SELECT count(*) FROM {t}"))
+            .fetch_scalar(&c)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "the dropped transaction's row landed");
+        // A failed statement aborts the transaction; the rest of it is
+        // refused until it ends. Named here so the port does not learn it
+        // from a store test.
+        let tx = db.begin().await.unwrap();
+        let _ = query("SELECT no_such_function()")
+            .execute(&tx)
+            .await
+            .unwrap_err();
+        let err = query(&format!("INSERT INTO {t} VALUES (2)"))
+            .execute(&tx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.sqlstate().as_deref(), Some("25P02"), "{err}");
+        tx.rollback().await.unwrap();
+        let tx = db.begin().await.unwrap();
+        query(&format!("INSERT INTO {t} VALUES (3)"))
+            .execute(&tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let n: i64 = query(&format!("SELECT count(*) FROM {t}"))
+            .fetch_scalar(&c)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        Db::batch(&c, &format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_defaults_mint_a_uuid_and_a_time() {
+        let Some(db) = pg("hive-db::postgres_defaults_mint_a_uuid_and_a_time").await else {
+            return;
+        };
+        let c = db.conn().await.unwrap();
+        let e = db.engine();
+        let t = unique_table();
+        Db::batch(
+            &c,
+            &format!(
+                "CREATE TABLE {t} (id uuid PRIMARY KEY DEFAULT {}, at timestamptz NOT NULL DEFAULT {})",
+                e.uuid_sql(),
+                e.now_sql()
+            ),
+        )
+        .await
+        .unwrap();
+        query(&format!("INSERT INTO {t} DEFAULT VALUES"))
+            .execute(&c)
+            .await
+            .unwrap();
+        let r = query(&format!("SELECT id, at FROM {t}"))
+            .fetch_one(&c)
+            .await
+            .unwrap();
+        let id: Uuid = r.get("id");
+        assert_eq!(id.get_version_num(), 4);
+        let at: DateTime<Utc> = r.get("at");
+        let skew = (now() - at).num_seconds().abs();
+        assert!(skew < 5, "default clock is {skew}s off the host clock");
+        Db::batch(&c, &format!("DROP TABLE {t}")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_closed_pool_refuses_checkouts_by_name() {
+        let Some(db) = pg("hive-db::postgres_closed_pool_refuses_checkouts_by_name").await else {
+            return;
+        };
+        db.close();
+        let err = db.conn().await.unwrap_err();
+        assert!(err.is_pool_closed(), "{err}");
+    }
+
+    #[tokio::test]
+    async fn postgres_refuses_a_bad_url_without_echoing_a_secret() {
+        let err = Db::connect("postgres://nobody:s3cret@127.0.0.1:1/none?sslmode=disable")
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("s3cret"), "{text}");
     }
 }

@@ -178,17 +178,18 @@ inside a Podman-built toolchain image ... Rust, clippy, rustfmt, the wasm target
 and node live in the image, Podman is the only thing the host needs, and
 anything after `--` runs there in place of the gate.
 
-**Nothing has to be running first.** The store is SQLite (D38) and every
-database test makes its own files under the temp directory, so the database
-precondition is gone and so are the skips it caused. The lesson it taught
-stays, because it was shape 2 from the list below at full scale: when the
-tests needed a database URL and the gate merely suggested it, **every
-database-backed test in the repo skipped itself** ... the whole grant
-predicate suite included ... and the gate still printed `GATE GREEN` in about
-the same wall time, because skipping is fast. A fix to a live cross-principal
-leak was reported as gate-green over a reproduction that had never executed.
-The tiers that still need a backend (Podman, chromium) are the ones
-that rule now guards.
+**Nothing has to be running first.** The store the gate tests is SQLite
+(D38) and every database test makes its own files under the temp directory,
+so the database precondition is gone from the gate and so are the skips it
+caused. The lesson it taught stays, because it was shape 2 from the list
+below at full scale: when the tests needed a database URL and the gate merely
+suggested it, **every database-backed test in the repo skipped itself** ...
+the whole grant predicate suite included ... and the gate still printed `GATE
+GREEN` in about the same wall time, because skipping is fast. A fix to a live
+cross-principal leak was reported as gate-green over a reproduction that had
+never executed. The tiers that still need a backend (Podman, chromium, and
+since D43 the Postgres engine, which the `postgres` CI job provides and
+requires) are the ones that rule now guards.
 
 The gate also NAMES every test that skipped, every run. A skip is a test saying
 out loud that it is not answering the question, and that only helps if somebody
@@ -223,13 +224,15 @@ a bare machine:
 | tier | needs | brought up by |
 |---|---|---|
 | unit + integration | nothing | `cargo test` |
+| the Postgres engine (D43) | a Postgres 17 with pgvector, `HIVE_SANDBOX_TEST_DATABASE_URL` | `./scripts/db-up.sh`, then `cargo test -p hive-db -p hive-schema` |
 | container (harness, egress) | Podman, both images | `./scripts/harness-build.sh`, `./scripts/egress-build.sh` |
 | end-to-end | a daemon and chromium | `cd test/e2e && npm install && npm run browsers && npm test` |
 
-**`HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS=1` turns a skip into a failure.** It is
-the enforcement half of "Check the skip" below, and CI sets it on every job that
-promised a backend ... a job that provisions Podman and then skips the Podman
-tests reports success for doing nothing.
+**`HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS=1` and
+`HIVE_SANDBOX_REQUIRE_DATABASE_TESTS=1` turn a skip into a failure.** They are
+the enforcement half of "Check the skip" below, and CI sets them on every job
+that promised a backend ... a job that provisions Podman, or a Postgres, and
+then skips the tests that need it reports success for doing nothing.
 
 Guests are a separate build: `./scripts/build-guests.sh` needs the
 `wasm32-wasip1` target (`rustup target add wasm32-wasip1`) and nothing else.
@@ -277,11 +280,13 @@ crates/hive-sandbox/   the daemon binary. Roles are flags, one process serves al
                        defaults on except the proxy, so a single-role image turns the others off
                        by name. --addr defaults to :7979. Also the unix socket (invariant 13)
                        and the blob driver chosen from config
-crates/hive-db/        the store's engine behind one seam: open, pool, BEGIN IMMEDIATE
-                       transactions, bind and read types. Nothing above it names rusqlite
+crates/hive-db/        the store's engines behind one seam: SQLite (a path) or Postgres (a
+                       URL, D43), open, pool, transactions, bind and read types, `?N`
+                       placeholders on both. Nothing above it names rusqlite or tokio-postgres
 crates/hive-schema/    the forward-only migrations, embedded, applied in one write transaction,
                        with the checksum that refuses a file applied differently. migrations/
-                       is the store's; migrations-audit/ is the override audit file's (D38)
+                       is the SQLite set, migrations-pg/ the Postgres set (one schema, two
+                       texts); migrations-audit/ is the override audit file's (D38)
 crates/hive-store/     SQLite: the data layer, the grant predicate, credentials, installs,
                        the owner files and the one way they are attached (D39),
                        builds, events, chat, the guest-facing Storage/Blob/Events. The single
@@ -361,11 +366,14 @@ and has tests.
   away from. Every setting in a guest's release profile is load-bearing;
   `scripts/guest-build.md` says why. Built `.wasm` files are checked in; CI
   rebuilds them from source and reruns the tests against the fresh bytes.
-- SQLite via `hive-db`, never `rusqlite` directly. **Every write transaction
-  is `BEGIN IMMEDIATE`**, so two writers queue in the engine rather than one
-  failing mid-transaction with BUSY; a connection left mid-transaction is
-  closed, never returned to the pool. The bell is in-process and the tailer
-  stays correct when every ring is dropped.
+- The database via `hive-db`, never `rusqlite` or `tokio-postgres` directly.
+  **Every SQLite write transaction is `BEGIN IMMEDIATE`**, so two writers
+  queue in the engine rather than one failing mid-transaction with BUSY; on
+  either engine a connection left mid-transaction is closed, never returned
+  to the pool. A statement that fails inside a Postgres transaction aborts
+  it (`25P02` on everything after), which SQLite does not do; a site that
+  tries a write and continues on refusal needs a `SAVEPOINT` there. The bell
+  is in-process and the tailer stays correct when every ring is dropped.
 - Claim work with `UPDATE ... RETURNING` under `BEGIN IMMEDIATE` plus a lease
   expiry and a heartbeat.
 - **A skip is a printed line, never a silent return.** `SKIPPED: <test> <why>`

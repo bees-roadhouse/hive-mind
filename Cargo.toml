@@ -49,6 +49,17 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # the seam; the engine swaps there when the fork is fixed or phase 3 needs it.
 rusqlite = { version = "0.37", features = ["bundled"] }
 sqlite-vec = "0.1"
+# Postgres, the server store (D43 §7). tokio-postgres rather than sqlx: no
+# compile-time checking against a live database (the gate runs with nothing
+# up), prepared statements, LISTEN on a connection of its own, no native
+# library. deadpool-postgres is the pool. rustls is the TLS, the stack reqwest
+# already links, with the ring provider named explicitly so a second provider
+# arriving by feature unification cannot make the config builder panic.
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1", "with-serde_json-1"] }
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+tokio-postgres-rustls = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

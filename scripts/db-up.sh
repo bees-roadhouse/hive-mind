@@ -32,6 +32,13 @@ if ! command -v podman >/dev/null 2>&1; then
   exit 1
 fi
 
+# A stopped podman machine (Windows, macOS) fails every command the same way;
+# say so once.
+if ! podman info --format '{{.Host.Arch}}' >/dev/null 2>&1; then
+  echo "podman is not reachable. On a machine-based install: podman machine start" >&2
+  exit 1
+fi
+
 if ! podman container exists "$name" 2>/dev/null; then
   say "==> creating $name from $image on 127.0.0.1:$port"
   password=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)

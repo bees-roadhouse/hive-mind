@@ -252,8 +252,19 @@ jobs:
         env:
           HIVE_SANDBOX_TEST_DATABASE_URL: ""
         run: |
+          # pipefail, or `if` reads tee's exit and the refusal reads as a run.
+          set -o pipefail
           if cargo test -p hive-testdb -- a_fresh_store_is_migrated_and_private 2>&1 | tee /tmp/require.log; then
             echo "the fixture ran on SQLite with HIVE_SANDBOX_REQUIRE_DATABASE_TESTS=1 set" >&2
             exit 1
           fi
           grep -q 'forbids falling back to SQLite' /tmp/require.log
+
+      # Every fixture drops its schema on the way out. One left behind means a
+      # drop failed (a lock the test's connection still held, say) and the
+      # fixture only printed about it; here it is red.
+      - name: no test schema outlived its fixture
+        run: |
+          left=$(PGPASSWORD=hive psql -h localhost -U hive -d hive_test -tAc "select count(*) from pg_namespace where nspname like 't\_%'")
+          echo "test schemas left behind: $left"
+          [ "$left" = "0" ]

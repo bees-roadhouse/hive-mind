@@ -109,10 +109,13 @@ impl TestDb {
             admin.close();
         }
         // search_path as a startup parameter, so every pooled connection has
-        // it from its first statement. The name is [a-z0-9_] only, so it
-        // needs no quoting and survives the URL unencoded.
+        // it from its first statement. application_name is the schema, so
+        // the drop below can find every session this test opened without
+        // trusting the pool to have closed them. The name is [a-z0-9_] only,
+        // so it needs no quoting and survives the URL unencoded.
         let sep = if url.contains('?') { '&' } else { '?' };
-        let scoped = format!("{url}{sep}options=-c%20search_path%3D{schema}");
+        let scoped =
+            format!("{url}{sep}options=-c%20search_path%3D{schema}&application_name={schema}");
         let db = Db::connect(&scoped)
             .await
             .unwrap_or_else(|e| panic!("connect to schema {schema}: {e}"));
@@ -237,9 +240,23 @@ impl Drop for TestDb {
                             return;
                         };
                         if let Ok(c) = admin.conn().await {
-                            // Bounded, so a lock the test's closed pool did
-                            // not release reads as an error naming the
-                            // schema rather than a test that never ends.
+                            // The test's own sessions first. A transaction a
+                            // test dropped without commit is still open on the
+                            // server, holding its locks, until the socket
+                            // closes, and the task that closes it lives on the
+                            // runtime blocked in `join` below; the DROP would
+                            // wait on those locks until its timeout. Found as
+                            // a 15 s drop in CI, with the schema left behind.
+                            let _ = hive_db::query(
+                                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                                  WHERE application_name = ?1 AND pid <> pg_backend_pid()",
+                            )
+                            .bind(&schema)
+                            .fetch_all(&c)
+                            .await;
+                            // Bounded, so a lock the terminate did not clear
+                            // reads as an error naming the schema rather than
+                            // a test that never ends.
                             let _ = Db::batch(&c, "SET lock_timeout = '15s'").await;
                             if let Err(e) = Db::batch(
                                 &c,

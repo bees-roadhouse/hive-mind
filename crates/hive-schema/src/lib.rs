@@ -451,7 +451,8 @@ mod tests {
                 admin.close();
             }
             let sep = if url.contains('?') { '&' } else { '?' };
-            let scoped = format!("{url}{sep}options=-c%20search_path%3D{name}");
+            let scoped =
+                format!("{url}{sep}options=-c%20search_path%3D{name}&application_name={name}");
             let db = Db::connect(&scoped).await.expect("connect scoped");
             Some(PgSchema {
                 db: Some(db),
@@ -490,6 +491,18 @@ mod tests {
                         return;
                     };
                     if let Ok(c) = admin.conn().await {
+                        // The test's sessions first: a transaction the test
+                        // dropped without commit holds its locks until its
+                        // socket closes, and the task that closes it is on
+                        // the runtime blocked in `join`. hive-testdb says the
+                        // same at its drop; found as a 15 s drop in CI.
+                        let _ = query(
+                            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+                              WHERE application_name = ?1 AND pid <> pg_backend_pid()",
+                        )
+                        .bind(&name)
+                        .fetch_all(&c)
+                        .await;
                         let _ = Db::batch(&c, "SET lock_timeout = '15s'").await;
                         if let Err(e) = Db::batch(&c, &format!("DROP SCHEMA {name} CASCADE")).await
                         {

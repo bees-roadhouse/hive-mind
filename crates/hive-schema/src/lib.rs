@@ -45,11 +45,23 @@ pub const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-/// Every Postgres migration this binary carries, in order (D43). Empty until
-/// phase 1's second slice ports migration one; `migrate` refuses a Postgres
-/// `Db` with [`MigrateError::NoMigrations`] until then, so nothing can read
-/// an empty database as a migrated one.
-pub const PG_MIGRATIONS: &[Migration] = &[];
+/// Every Postgres migration this binary carries, in order (D43): the same
+/// schema as [`MIGRATIONS`] in Postgres types, version for version, so a
+/// database on either engine answers the same `schema_migrations` question.
+/// The override audit's table is in `0001` here rather than in a set of its
+/// own (see [`AUDIT_MIGRATIONS`]).
+pub const PG_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: "0001",
+        name: "init",
+        sql: include_str!("../migrations-pg/0001_init.sql"),
+    },
+    Migration {
+        version: "0002",
+        name: "model_jobs",
+        sql: include_str!("../migrations-pg/0002_model_jobs.sql"),
+    },
+];
 
 /// The override audit's own file (D38 §3): evidence that must survive any
 /// caller's transaction, which on one file per writer means its own file.
@@ -491,33 +503,88 @@ mod tests {
         }
     }
 
-    /// With no Postgres set yet, `migrate` on a Postgres `Db` refuses, and
-    /// leaves no `schema_migrations` behind to make the database look
-    /// migrated; the audit check and the owner set refuse by name too.
+    /// Migration one in Postgres dialect parses and applies, and the objects
+    /// the store names are there: the same tables and views the SQLite test
+    /// checks, plus the functions the triggers call. The audit table is in
+    /// this set (so `migrate_audit` is a check that passes), the owner set
+    /// has no Postgres form, and before `migrate` has run the audit check
+    /// refuses by name rather than reporting an empty success.
     #[tokio::test]
-    async fn postgres_refuses_until_its_set_exists() {
-        let Some(s) = PgSchema::new("hive-schema::postgres_refuses_until_its_set_exists").await
+    async fn postgres_migration_one_applies_and_is_idempotent() {
+        let Some(s) =
+            PgSchema::new("hive-schema::postgres_migration_one_applies_and_is_idempotent").await
         else {
             return;
         };
-        let err = migrate(s.db()).await.unwrap_err();
-        assert!(
-            matches!(err, MigrateError::NoMigrations(Engine::Postgres)),
-            "{err}"
-        );
-        let c = s.db().conn().await.unwrap();
-        let present: bool = query("SELECT to_regclass('schema_migrations') IS NOT NULL")
-            .fetch_scalar(&c)
-            .await
-            .unwrap();
-        assert!(!present, "a refused migrate created schema_migrations");
         let err = migrate_audit(s.db()).await.unwrap_err();
         assert!(matches!(err, MigrateError::AuditMissing(_)), "{err}");
+
+        let ran = migrate(s.db()).await.expect("first migrate");
+        assert_eq!(ran, vec!["0001".to_string(), "0002".to_string()]);
+        let again = migrate(s.db()).await.expect("second migrate");
+        assert!(again.is_empty(), "nothing to apply the second time");
+        assert!(migrate_audit(s.db()).await.expect("audit check").is_empty());
         let err = migrate_owner(s.db()).await.unwrap_err();
         assert!(
             matches!(err, MigrateError::Unsupported(Engine::Postgres, _)),
             "{err}"
         );
+
+        let c = s.db().conn().await.unwrap();
+        let tables: Vec<String> = query(
+            "SELECT table_name FROM information_schema.tables
+              WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+              ORDER BY table_name",
+        )
+        .fetch_scalars(&c)
+        .await
+        .unwrap();
+        for want in [
+            "actors",
+            "grants",
+            "events",
+            "installs",
+            "chat_turns",
+            "model_jobs",
+            "grant_override_audit",
+            "schema_migrations",
+        ] {
+            assert!(
+                tables.iter().any(|t| t == want),
+                "missing table {want}: {tables:?}"
+            );
+        }
+        let views: Vec<String> = query(
+            "SELECT table_name FROM information_schema.views WHERE table_schema = current_schema()",
+        )
+        .fetch_scalars(&c)
+        .await
+        .unwrap();
+        assert!(views.iter().any(|v| v == "subject_owners"), "{views:?}");
+        assert!(
+            views.iter().any(|v| v == "builds_awaiting_promotion"),
+            "{views:?}"
+        );
+        let functions: Vec<String> = query(
+            "SELECT routine_name FROM information_schema.routines
+              WHERE specific_schema = current_schema() ORDER BY routine_name",
+        )
+        .fetch_scalars(&c)
+        .await
+        .unwrap();
+        for want in ["acting_kind", "capability_set", "grants_issue_policy"] {
+            assert!(
+                functions.iter().any(|f| f == want),
+                "missing function {want}: {functions:?}"
+            );
+        }
+        // One rule from each engine's trigger text, with the message the
+        // SQLite text uses, so a test that asserts the message holds on both.
+        let err = query("INSERT INTO actors (kind, handle, principal_kind, principal_id) VALUES ('human', 'x', 'user', gen_random_uuid())")
+            .execute(&c)
+            .await
+            .unwrap_err();
+        assert!(err.is_constraint(), "{err:?}");
     }
 
     /// The runner's machinery on Postgres, against a list of its own:

@@ -236,10 +236,24 @@ jobs:
       - name: database tests, where a skip is a failure
         run: |
           log=$(mktemp)
-          cargo test -p hive-db -p hive-schema -- --nocapture 2>&1 | tee "$log"
+          cargo test -p hive-db -p hive-schema -p hive-testdb -- --nocapture 2>&1 | tee "$log"
           status=${PIPESTATUS[0]}
           if grep -E '^SKIPPED: ' "$log"; then
             echo "a database test skipped in the job that promised a database" >&2
             exit 1
           fi
           exit "$status"
+
+      # The require flag is what makes the step above honest, so this step
+      # watches it fail: with the URL removed and the flag kept, the fixture
+      # must refuse rather than quietly test the file engine. A guard nobody
+      # has seen fire is a comment, not a guard.
+      - name: the require flag refuses a missing server
+        env:
+          HIVE_SANDBOX_TEST_DATABASE_URL: ""
+        run: |
+          if cargo test -p hive-testdb -- a_fresh_store_is_migrated_and_private 2>&1 | tee /tmp/require.log; then
+            echo "the fixture ran on SQLite with HIVE_SANDBOX_REQUIRE_DATABASE_TESTS=1 set" >&2
+            exit 1
+          fi
+          grep -q 'forbids falling back to SQLite' /tmp/require.log

@@ -88,7 +88,7 @@ echo "POSTGRES READY on 127.0.0.1:$port ($name)"
 echo
 echo "Point the database tests at it for this shell:"
 echo "  export HIVE_SANDBOX_TEST_DATABASE_URL='$url'"
-echo "  cargo test -p hive-db -p hive-schema"
+echo "  cargo test -p hive-db -p hive-schema -p hive-testdb"
 echo
 echo "Stop it when you are done (it holds ~250 MB of somebody's video otherwise):"
 echo "  podman stop $name"

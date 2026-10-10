@@ -95,7 +95,7 @@ Write-Host "POSTGRES READY on 127.0.0.1:$Port ($Name)" -ForegroundColor Green
 Write-Host ""
 Write-Host "Point the database tests at it for this shell:"
 Write-Host "  `$env:HIVE_SANDBOX_TEST_DATABASE_URL = '$url'"
-Write-Host "  cargo test -p hive-db -p hive-schema"
+Write-Host "  cargo test -p hive-db -p hive-schema -p hive-testdb"
 Write-Host ""
 Write-Host "Stop it when you are done (it holds ~250 MB of somebody's video otherwise):"
 Write-Host "  podman stop $Name"

@@ -50,9 +50,15 @@ locally:
 ```bash
 ./scripts/db-up.sh                      # one podman container, pgvector/pgvector:pg17, 127.0.0.1:55434
 export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
-cargo test -p hive-db -p hive-schema
+cargo test -p hive-db -p hive-schema -p hive-testdb
 podman stop hive-mind-pg-rust           # when you are done
 ```
+
+With the URL set, `hive_testdb::TestDb` makes every integration test's store
+a private schema on that server instead of a file, so any suite can be
+pointed at Postgres the same way. A suite that has not been ported yet
+(#127) fails there on its SQLite dialect rather than skipping; that is the
+honest signal, and the `postgres` CI job runs only the crates that pass.
 
 (`.\scripts\db-up.ps1 -Quiet` on Windows.) The script is one `podman run`
 with no compose, because the compose-resolving version picked `podman

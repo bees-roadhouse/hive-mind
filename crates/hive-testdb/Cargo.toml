@@ -1,6 +1,6 @@
 [package]
 name = "hive-testdb"
-description = "A private database file per test for the integration tests, migrated and deleted on the way out; the Go tree's internal/testdb, on files instead of schemas"
+description = "A private store per test for the integration tests, migrated and deleted on the way out: a SQLite file by default, a Postgres schema when HIVE_SANDBOX_TEST_DATABASE_URL names a server (D43)"
 edition.workspace = true
 version.workspace = true
 rust-version.workspace = true
@@ -13,3 +13,5 @@ workspace = true
 hive-db = { path = "../hive-db" }
 hive-schema = { path = "../hive-schema" }
 uuid.workspace = true
+# The Postgres fixture drops its schema from a runtime of its own (see Drop).
+tokio.workspace = true

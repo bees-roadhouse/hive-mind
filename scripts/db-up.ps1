@@ -29,8 +29,20 @@ if (-not (Get-Command podman -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+# The machine stops on its own between sessions on this box; say so rather
+# than letting every later command fail with the same connection error.
+$ErrorActionPreference = "Continue"
+& podman info --format '{{.Host.Arch}}' 2>$null | Out-Null
+$ErrorActionPreference = "Stop"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "podman is not reachable. On Windows: podman machine start" -ForegroundColor Red
+    exit 1
+}
+
 # `podman container exists` answers with the exit code and nothing else.
+$ErrorActionPreference = "Continue"
 & podman container exists $Name 2>$null
+$ErrorActionPreference = "Stop"
 if ($LASTEXITCODE -ne 0) {
     Say "==> creating $Name from $Image on 127.0.0.1:$Port"
     $bytes = New-Object byte[] 24
@@ -95,7 +107,7 @@ Write-Host "POSTGRES READY on 127.0.0.1:$Port ($Name)" -ForegroundColor Green
 Write-Host ""
 Write-Host "Point the database tests at it for this shell:"
 Write-Host "  `$env:HIVE_SANDBOX_TEST_DATABASE_URL = '$url'"
-Write-Host "  cargo test -p hive-db -p hive-schema"
+Write-Host "  cargo test -p hive-db -p hive-schema -p hive-testdb"
 Write-Host ""
 Write-Host "Stop it when you are done (it holds ~250 MB of somebody's video otherwise):"
 Write-Host "  podman stop $Name"

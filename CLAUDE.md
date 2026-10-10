@@ -224,7 +224,7 @@ a bare machine:
 | tier | needs | brought up by |
 |---|---|---|
 | unit + integration | nothing | `cargo test` |
-| the Postgres engine (D43) | a Postgres 17 with pgvector, `HIVE_SANDBOX_TEST_DATABASE_URL` | `./scripts/db-up.sh`, then `cargo test -p hive-db -p hive-schema` |
+| the Postgres engine (D43) | a Postgres 17 with pgvector, `HIVE_SANDBOX_TEST_DATABASE_URL` | `./scripts/db-up.sh`, then `cargo test -p hive-db -p hive-schema -p hive-testdb` (the ported crates; the rest fail there on dialect until #127 ports them) |
 | container (harness, egress) | Podman, both images | `./scripts/harness-build.sh`, `./scripts/egress-build.sh` |
 | end-to-end | a daemon and chromium | `cd test/e2e && npm install && npm run browsers && npm test` |
 

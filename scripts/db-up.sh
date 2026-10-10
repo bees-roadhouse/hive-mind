@@ -32,6 +32,13 @@ if ! command -v podman >/dev/null 2>&1; then
   exit 1
 fi
 
+# A stopped podman machine (Windows, macOS) fails every command the same way;
+# say so once.
+if ! podman info --format '{{.Host.Arch}}' >/dev/null 2>&1; then
+  echo "podman is not reachable. On a machine-based install: podman machine start" >&2
+  exit 1
+fi
+
 if ! podman container exists "$name" 2>/dev/null; then
   say "==> creating $name from $image on 127.0.0.1:$port"
   password=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)
@@ -88,7 +95,7 @@ echo "POSTGRES READY on 127.0.0.1:$port ($name)"
 echo
 echo "Point the database tests at it for this shell:"
 echo "  export HIVE_SANDBOX_TEST_DATABASE_URL='$url'"
-echo "  cargo test -p hive-db -p hive-schema"
+echo "  cargo test -p hive-db -p hive-schema -p hive-testdb"
 echo
 echo "Stop it when you are done (it holds ~250 MB of somebody's video otherwise):"
 echo "  podman stop $name"

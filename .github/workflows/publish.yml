@@ -1,0 +1,171 @@
+# publish: every push to main publishes the daemon image, so the cluster can
+# roll to it (brh-infra owns that half). Nothing here runs for pull requests;
+# the PR gate is ci.yml, and this workflow does not gate anything itself: a
+# red gate on main is still a red gate, this just also ships the binary.
+#
+#   ghcr.io/bees-roadhouse/hive-mind:latest        main, moving
+#   ghcr.io/bees-roadhouse/hive-mind:sha-<short>   immutable, every publish
+#
+# Both tags are multi-arch manifests, linux/amd64 and linux/arm64: the pod
+# floats across the cluster's Pis and the x86 nodes. Each platform is built
+# on a runner of that architecture (the repo is public, so GitHub's arm64
+# runners are free) and pushed by digest; a last job stitches the two digests
+# into the tagged manifest. No QEMU: a release build of this workspace with
+# lto under emulation is an hour, native it is minutes.
+#
+# A workflow_dispatch from a branch publishes only sha-<short>, so a branch
+# can be tried on the cluster by its sha without moving latest.
+#
+# The image is docker/hive-sandbox/Containerfile's `daemon` target, built from
+# the repo root because the build stage compiles the whole workspace. The
+# binary reports the commit it was built from (HIVE_SANDBOX_VERSION, via the
+# VERSION build arg) and the merge job reads that back out of the pushed
+# manifest, which is the same check scripts/image-build.sh does locally: a
+# pin that names a version the binary does not report is a lie that gets
+# found during an incident.
+name: publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Queue, do not cancel: every commit on main gets its sha-tagged image.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/bees-roadhouse/hive-mind
+
+jobs:
+  # One platform per native runner, pushed by digest and untagged; the tags
+  # are put on the merged manifest below, never on a single-platform image.
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/hive-sandbox/Containerfile
+          target: daemon
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/bees-roadhouse/hive-mind
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=hive-mind
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      # The digest travels to the merge job as an empty file named for it,
+      # which is the documented shape for buildx's imagetools.
+      - name: export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # sha-<short> always; latest only from main.
+      - name: resolve tags
+        id: tags
+        run: |
+          short="${GITHUB_SHA::7}"
+          tags="--tag ${IMAGE}:sha-${short}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            tags="${tags} --tag ${IMAGE}:latest"
+          fi
+          echo "short=${short}" >> "$GITHUB_OUTPUT"
+          echo "args=${tags}" >> "$GITHUB_OUTPUT"
+          echo "$tags"
+
+      - name: create the multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create ${{ steps.tags.outputs.args }} \
+            $(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:sha-${{ steps.tags.outputs.short }}"
+
+      # Read the version back out of the PUSHED manifest, not the build log,
+      # on the runner's own platform. The entrypoint is the binary with its
+      # role flags; --version after them is answered before any role starts,
+      # so a distroless image with no shell still answers.
+      - name: the pushed image reports the commit it was built from
+        env:
+          SHORT: ${{ steps.tags.outputs.short }}
+        run: |
+          docker pull "${IMAGE}:sha-${SHORT}"
+          reported=$(docker run --rm "${IMAGE}:sha-${SHORT}" --version | sed 's/^hive-sandbox //' | tr -d '\r\n')
+          echo "image reports: ${reported}"
+          if [ "$reported" != "$GITHUB_SHA" ]; then
+            echo "the image reports '${reported}' but was built as '${GITHUB_SHA}'; VERSION did not reach the build" >&2
+            exit 1
+          fi
+          {
+            echo "## Published"
+            echo
+            echo "- \`${IMAGE}:sha-${SHORT}\` (linux/amd64, linux/arm64)"
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "- \`${IMAGE}:latest\`"
+            fi
+            echo
+            echo "The binary reports \`${reported}\`."
+          } >> "$GITHUB_STEP_SUMMARY"

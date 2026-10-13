@@ -29,7 +29,7 @@
   --brh-mute: #8b9098;
   --brh-err: #e06b52;
   --brh-ok: #8fbf6a;
-  --brh-warn: #f0883e;
+  --brh-warn: #f57c00;
 
   /* this app's semantic names, aliased to the roles */
   --bg: var(--brh-bg);

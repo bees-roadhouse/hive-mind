@@ -1,33 +1,51 @@
+/* Brand: charcoal and gold, dark only. The values are the Roadhouse Brand &
+   Visual Identity Standard (KB page 2451; the token block everything mirrors
+   is brh-infra's Keycloak theme, beesroadhouse-3.css :root). Nate, on
+   2026-10-13: "more grey and charcoal and gold rather than brown and gold
+   ... so its more professional looking." The roles are named --brh-* so a
+   change to the standard is a value change here and never a hunt; the
+   semantic names below (--bg, --panel, ...) are this app's and alias the
+   roles, so a rule reads as what it means and the brand decides the colour.
+   A colour that appears here and not on the page is a bug in one of the two.
+   Dark only is the standard's rule, not an omission: the identity surfaces
+   ignore the device's light preference on purpose, and "never white on
+   gold" is why the primary button's lettering is --brh-on-gold. */
 :root {
-  color-scheme: light dark;
-  --bg: #f6f5f2;
-  --panel: #ffffff;
-  --ink: #1d1d1b;
-  --muted: #6b6a66;
-  --line: #e2e0da;
-  --accent: #b8860b;
-  --accent-ink: #ffffff;
-  --user: #eef3ff;
-  --agent: #f7f2e3;
-  --system: #f1f1f1;
-  --error: #a4262c;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: dark;
+
+  /* the roles, from the standard */
+  --brh-night: #111214;
+  --brh-night-raised: #17191c;
+  --brh-plate: #1d2024;
+  --brh-line: #3d4148;
+  --brh-line-dim: #2a2d32;
+  --brh-gold: #e2a921;
+  --brh-gold-lit: #f2c655;
+  --brh-pale-gold: #f4e493;
+  --brh-on-gold: #1a1407;
+  --brh-text: #f2f3f5;
+  --brh-text-2: #c4c8ce;
+  --brh-mute: #8b9098;
+  --brh-error: #e06b52;
+  --brh-success: #8fbf6a;
+
+  /* this app's semantic names, aliased to the roles */
+  --bg: var(--brh-night);
+  --panel: var(--brh-plate);
+  --ink: var(--brh-text);
+  --muted: var(--brh-text-2);
+  --faint: var(--brh-mute);
+  --line: var(--brh-line);
+  --line-dim: var(--brh-line-dim);
+  --accent: var(--brh-gold);
+  --accent-lit: var(--brh-gold-lit);
+  --accent-ink: var(--brh-on-gold);
+  --user: var(--brh-plate);
+  --agent: var(--brh-night-raised);
+  --system: var(--brh-night);
+  --error: var(--brh-error);
+  font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
   font-size: 15px;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #16160f;
-    --panel: #1f1e18;
-    --ink: #ebe8df;
-    --muted: #9c9a90;
-    --line: #34332b;
-    --accent: #d9a520;
-    --accent-ink: #1a1a10;
-    --user: #22283a;
-    --agent: #2c2716;
-    --system: #262620;
-    --error: #ff8a8a;
-  }
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
@@ -43,9 +61,11 @@ header {
 
 button { font: inherit; padding: .45rem .9rem; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
 button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button.primary:hover { background: var(--accent-lit); border-color: var(--accent-lit); }
 button.ghost { background: transparent; }
 button:disabled { opacity: .5; cursor: default; }
-input, select, textarea { font: inherit; padding: .45rem .6rem; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); width: 100%; }
+input, select, textarea { font: inherit; padding: .45rem .6rem; border-radius: 6px; border: 1px solid var(--line-dim); background: var(--bg); color: var(--ink); width: 100%; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
 label { display: block; margin: .6rem 0; }
 label input { margin-top: .3rem; }
 
@@ -61,16 +81,16 @@ label input { margin-top: .3rem; }
 .list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
 .list li { padding: .6rem .9rem; border-bottom: 1px solid var(--line); cursor: pointer; }
 .list li.active { background: var(--agent); }
-.list li .meta { display: block; color: var(--muted); font-size: .8rem; }
+.list li .meta { display: block; color: var(--faint); font-size: .8rem; }
 
 .thread { display: flex; flex-direction: column; min-height: 0; }
 .messages { flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column; gap: .6rem; }
 .msg { max-width: 48rem; padding: .6rem .8rem; border-radius: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.msg.user { background: var(--user); align-self: flex-end; }
+.msg.user { background: var(--user); border: 1px solid var(--line-dim); align-self: flex-end; }
 .msg.agent { background: var(--agent); align-self: flex-start; }
 .msg.system { background: var(--system); color: var(--muted); align-self: center; font-size: .9rem; }
 .msg.live { border: 1px dashed var(--accent); }
-.msg .who { display: block; font-size: .75rem; color: var(--muted); margin-bottom: .2rem; }
+.msg .who { display: block; font-size: .75rem; color: var(--faint); margin-bottom: .2rem; }
 .thinking::after { content: " …"; animation: blink 1.2s infinite; }
 @keyframes blink { 50% { opacity: .3; } }
 

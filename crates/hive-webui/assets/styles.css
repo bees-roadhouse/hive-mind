@@ -1,31 +1,40 @@
+/* Palette: grey, charcoal and gold (Nate, 2026-10-13: "more grey and
+   charcoal and gold rather than brown and gold"). The gold accent is the
+   brand; everything around it is NEUTRAL grey so the gold reads against
+   grey rather than against brown. The previous tokens leaned warm (an
+   off-white with a yellow cast, a beige agent bubble, a brown-black dark
+   scheme), which made the whole page read as brown. Rule for anyone adding
+   a colour: greys carry no warm cast (equal-ish R, G, B or a slight cool
+   lean), gold is the only saturated hue besides the user bubble's blue and
+   the error red, and the D45 client inherits these tokens by name. */
 :root {
   color-scheme: light dark;
-  --bg: #f6f5f2;
+  --bg: #f2f3f5;
   --panel: #ffffff;
-  --ink: #1d1d1b;
-  --muted: #6b6a66;
-  --line: #e2e0da;
+  --ink: #1e2023;
+  --muted: #6a7077;
+  --line: #d8dbdf;
   --accent: #b8860b;
   --accent-ink: #ffffff;
   --user: #eef3ff;
-  --agent: #f7f2e3;
-  --system: #f1f1f1;
+  --agent: #e9ebee;
+  --system: #f0f1f3;
   --error: #a4262c;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   font-size: 15px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #16160f;
-    --panel: #1f1e18;
-    --ink: #ebe8df;
-    --muted: #9c9a90;
-    --line: #34332b;
-    --accent: #d9a520;
-    --accent-ink: #1a1a10;
+    --bg: #121416;
+    --panel: #1b1e21;
+    --ink: #e6e8eb;
+    --muted: #9aa0a6;
+    --line: #2e3236;
+    --accent: #d4a72c;
+    --accent-ink: #15171a;
     --user: #22283a;
-    --agent: #2c2716;
-    --system: #262620;
+    --agent: #24282c;
+    --system: #1f2226;
     --error: #ff8a8a;
   }
 }

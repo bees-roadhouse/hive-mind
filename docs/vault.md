@@ -1,8 +1,13 @@
 # The credential vault
 
-Status: **design, not built.** Written down now because several things already
-in the tree assume it exists, and because the shape it needs is constrained by
-decisions already made.
+Status: **decided (D48, 2026-10-13), not built.** This note is the design
+sketch D48 grew from; where the two differ, `docs/design/D48-the-vault-for-ai-and-humans.md`
+wins. D48 settles the two faces (items for humans, leases for AIs), the
+grant kind, the per-org key under a master key, the device-only versus
+server-leasable choice for personal entries, 1Password as a synced driver
+speaking Connect, and the order of the #87 slices. Written down originally
+because several things already in the tree assume the vault exists, and
+because the shape it needs is constrained by decisions already made.
 
 ## What it is for
 

@@ -2,48 +2,50 @@
    Visual Identity Standard (KB page 2451; the token block everything mirrors
    is brh-infra's Keycloak theme, beesroadhouse-3.css :root). Nate, on
    2026-10-13: "more grey and charcoal and gold rather than brown and gold
-   ... so its more professional looking." The roles are named --brh-* so a
-   change to the standard is a value change here and never a hunt; the
+   ... so its more professional looking." The roles carry the canonical
+   block's own names (--brh-bg, --brh-card, --brh-gold-ink ...) so a change to
+   the standard is a value change here and never a hunt; the
    semantic names below (--bg, --panel, ...) are this app's and alias the
    roles, so a rule reads as what it means and the brand decides the colour.
    A colour that appears here and not on the page is a bug in one of the two.
    Dark only is the standard's rule, not an omission: the identity surfaces
    ignore the device's light preference on purpose, and "never white on
-   gold" is why the primary button's lettering is --brh-on-gold. */
+   gold" is why the primary button's lettering is --brh-gold-ink. */
 :root {
   color-scheme: dark;
 
   /* the roles, from the standard */
-  --brh-night: #111214;
-  --brh-night-raised: #17191c;
-  --brh-plate: #1d2024;
+  --brh-bg: #111214;
+  --brh-bg2: #17191c;
+  --brh-card: #1d2024;
   --brh-line: #3d4148;
   --brh-line-dim: #2a2d32;
   --brh-gold: #e2a921;
-  --brh-gold-lit: #f2c655;
-  --brh-pale-gold: #f4e493;
-  --brh-on-gold: #1a1407;
+  --brh-gold-hi: #f2c655;
+  --brh-pale: #f4e493;
+  --brh-gold-ink: #1a1407;
   --brh-text: #f2f3f5;
-  --brh-text-2: #c4c8ce;
+  --brh-text2: #c4c8ce;
   --brh-mute: #8b9098;
-  --brh-error: #e06b52;
-  --brh-success: #8fbf6a;
+  --brh-err: #e06b52;
+  --brh-ok: #8fbf6a;
+  --brh-warn: #f0883e;
 
   /* this app's semantic names, aliased to the roles */
-  --bg: var(--brh-night);
-  --panel: var(--brh-plate);
+  --bg: var(--brh-bg);
+  --panel: var(--brh-card);
   --ink: var(--brh-text);
-  --muted: var(--brh-text-2);
+  --muted: var(--brh-text2);
   --faint: var(--brh-mute);
   --line: var(--brh-line);
   --line-dim: var(--brh-line-dim);
   --accent: var(--brh-gold);
-  --accent-lit: var(--brh-gold-lit);
-  --accent-ink: var(--brh-on-gold);
-  --user: var(--brh-plate);
-  --agent: var(--brh-night-raised);
-  --system: var(--brh-night);
-  --error: var(--brh-error);
+  --accent-lit: var(--brh-gold-hi);
+  --accent-ink: var(--brh-gold-ink);
+  --user: var(--brh-card);
+  --agent: var(--brh-bg2);
+  --system: var(--brh-bg);
+  --error: var(--brh-err);
   font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif;
   font-size: 15px;
 }

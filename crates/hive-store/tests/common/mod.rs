@@ -202,7 +202,10 @@ impl World {
         .bind(owner.kind.as_str())
         .bind(owner.id)
         .bind(by)
-        .bind(format!("app_{slug}_{}", &sum[..8]))
+        // The LAST eight hex digits: next_hash counts up from zero, so the
+        // first eight are zeros for every build in a test and two installs of
+        // one slug would collide on schema_name (it did, #163 slice 2).
+        .bind(format!("app_{slug}_{}", &sum[sum.len() - 8..]))
         .fetch_scalar(&c)
         .await
         .unwrap_or_else(|e| panic!("create install: {e}"))

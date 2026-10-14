@@ -377,7 +377,10 @@ mod tests {
             .fetch_scalars(&c)
             .await
             .unwrap();
-        assert_eq!(versions, vec!["0001".to_string(), "0002".to_string()]);
+        assert_eq!(
+            versions,
+            vec!["0001".to_string(), "0002".to_string(), "0003".to_string()]
+        );
         let n: i64 = query("SELECT count(*) FROM actors")
             .fetch_scalar(&c)
             .await

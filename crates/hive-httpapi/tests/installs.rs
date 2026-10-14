@@ -318,3 +318,78 @@ async fn a_use_of_an_app_the_owner_lacks_is_a_conflict() {
     assert_eq!(status, 201, "{}", text(&body));
     a.stop().await;
 }
+
+/// A process app (D53) is installed with an actor of its own, acting for the
+/// owner, created in the install's transaction by the installing person; a
+/// guest install gets none. The actor is what the container's credential
+/// will be minted for (#163 slice 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_a_process_app_gets_an_actor() {
+    let a = Api::with("installs_process_actor", hosted()).await;
+    let mut m = host_only_app("notes");
+    m.process = Some(hive_manifest::Process {
+        runtime: Some(hive_manifest::AppRuntime::Bun),
+        entry: "src/app.ts".into(),
+        ..Default::default()
+    });
+    let (status, body) = post_json(
+        &format!("{}/apps", a.url),
+        &a.root_token,
+        &serde_json::json!({ "manifest": m }),
+    )
+    .await;
+    assert_eq!(status, 201, "{}", text(&body));
+    let install: uuid::Uuid = decode(&body)["install"].as_str().unwrap().parse().unwrap();
+
+    let conn = a.store.conn().await.unwrap();
+    let actor: Option<uuid::Uuid> = hive_db::query("SELECT actor_id FROM installs WHERE id = ?1")
+        .bind(install)
+        .fetch_scalar(&conn)
+        .await
+        .unwrap();
+    let actor = actor.expect("a process install has no actor");
+    let row = hive_db::query(
+        "SELECT kind, persona, principal_kind, principal_id, created_by_actor FROM actors WHERE id = ?1",
+    )
+    .bind(actor)
+    .fetch_one(&conn)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String>("kind"), "ai");
+    assert_eq!(
+        row.get::<String>("persona"),
+        hive_store::install_persona("notes")
+    );
+    assert_eq!(
+        row.get::<uuid::Uuid>("principal_id"),
+        a.root,
+        "the actor does not act for the owner"
+    );
+    assert_eq!(
+        row.get::<uuid::Uuid>("created_by_actor"),
+        a.root,
+        "created by someone other than the installer"
+    );
+    assert_eq!(
+        hive_store::install_of_actor(&conn, actor).await.unwrap(),
+        Some(install)
+    );
+
+    // The guest install beside it has none: no process, no container, no
+    // credential to mint.
+    let (status, body) = post_json(
+        &format!("{}/apps", a.url),
+        &a.root_token,
+        &serde_json::json!({ "manifest": host_only_app("plain") }),
+    )
+    .await;
+    assert_eq!(status, 201, "{}", text(&body));
+    let guest: uuid::Uuid = decode(&body)["install"].as_str().unwrap().parse().unwrap();
+    let none: Option<uuid::Uuid> = hive_db::query("SELECT actor_id FROM installs WHERE id = ?1")
+        .bind(guest)
+        .fetch_scalar(&conn)
+        .await
+        .unwrap();
+    assert_eq!(none, None, "a guest install grew an actor");
+    a.stop().await;
+}

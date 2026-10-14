@@ -1,0 +1,14 @@
+{
+  "name": "hello-bun",
+  "version": "0.1.0",
+  "description": "The reference process app (D53): a tool, a route, a subscription and a document collection, on @hive/app.",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@hive/app": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.0",
+    "typescript": "5.9.3"
+  }
+}

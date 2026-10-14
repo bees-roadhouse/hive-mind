@@ -170,11 +170,17 @@ jobs:
       - name: build the app test image
         run: ./scripts/app-test-build.sh
 
+      # The reference Bun app (D53 §3, scenario 1), from the one Containerfile
+      # every runtime: bun app is built with.
+      - name: build the reference app image
+        run: ./scripts/app-build.sh apps/hello-bun
+
       - name: the pins exist
         run: |
           cat docker/harness/digests.json
           cat docker/egress/digest.json
           cat docker/app-test/digest.json
+          cat apps/hello-bun/image.json
 
       - name: container tests, where a skip is a failure
         env:
@@ -182,6 +188,7 @@ jobs:
         run: |
           cargo test -p hive-harness --test supervisor -- podman_runs_the_pinned_image egress_proxy_enforces_the_allowlist egress_proxy_that_dies_reports_its_exit
           cargo test -p hive-apps --test podman -- --nocapture
+          cargo test -p hive-apps --test podman_bun -- --nocapture
 
       - name: nothing outlived the run
         if: ${{ always() }}
@@ -212,7 +219,6 @@ jobs:
           bun-version: "1.4.3"
 
       - name: install
-        working-directory: packages/hive-app
         run: bun install --frozen-lockfile
 
       - name: types
@@ -222,6 +228,10 @@ jobs:
       - name: tests
         working-directory: packages/hive-app
         run: bun test
+
+      - name: the reference app type-checks
+        working-directory: apps/hello-bun
+        run: bunx tsc --noEmit -p tsconfig.json
 
   postgres:
     runs-on: ubuntu-latest

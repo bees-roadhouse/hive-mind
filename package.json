@@ -1,0 +1,9 @@
+{
+  "name": "hive-mind-js",
+  "private": true,
+  "description": "The Bun workspace for the process-app side (D53 §2): the @hive/app SDK and the first-party Bun apps. The Rust workspace is Cargo.toml; test/e2e keeps its own npm package.",
+  "workspaces": [
+    "packages/hive-app",
+    "apps/hello-bun"
+  ]
+}

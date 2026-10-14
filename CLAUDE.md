@@ -329,6 +329,10 @@ crates/hive-identity/  the credential every layer passes around. Types and valid
 crates/hive-trust/     provenance carried across every layer (invariants 3 and 12)
 crates/hive-testdb/    a private store per test for the integration tests
 crates/hive-repodocs/  no code. The gate's assertions about this repo's own documentation
+packages/hive-app/     @hive/app, the TypeScript SDK a process app is written against (D53 §2):
+                       defineApp serves the runtime's protocol on the app socket, Host reaches
+                       the daemon's MCP route over its socket with the install credential. Bun;
+                       `bun test` in the sdk CI job
 guest/                 the SDK a WASM guest links against, and the root of the guest workspace
                        (wasm32-wasip1 only; the release profile every guest builds with is here)
 apps/                  first-party guest apps, members of the guest workspace. apps/hello is

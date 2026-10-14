@@ -189,6 +189,31 @@ jobs:
   # job that promised a server, and a skip here is the "never executes" shape.
   # The crate list grows as D43 phase 1 ports them (#127); a crate not in it
   # has not been ported, and the PR that ports it adds it here.
+  # The TypeScript SDK a process app is written against (D53 §2, #168). Bun
+  # is the runtime (house standard, page 1921): its tests run under `bun
+  # test` against a fake daemon, and `tsc` holds the types. No daemon and no
+  # container: the host's side of the same contract is hive-apps' suite.
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.3"
+
+      - name: install
+        working-directory: packages/hive-app
+        run: bun install --frozen-lockfile
+
+      - name: types
+        working-directory: packages/hive-app
+        run: bunx tsc --noEmit -p tsconfig.json
+
+      - name: tests
+        working-directory: packages/hive-app
+        run: bun test
+
   postgres:
     runs-on: ubuntu-latest
     services:

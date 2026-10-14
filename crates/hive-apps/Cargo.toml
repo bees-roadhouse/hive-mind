@@ -1,0 +1,30 @@
+[package]
+name = "hive-apps"
+version = "0.1.0"
+edition = "2024"
+description = "Process apps (D53): the dispatcher over the app socket and the container's life, one per install"
+
+[dependencies]
+tokio.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+bytes.workspace = true
+hive-db = { path = "../hive-db" }
+hive-identity = { path = "../hive-identity" }
+hive-trust = { path = "../hive-trust" }
+hive-manifest = { path = "../hive-manifest" }
+hive-harness = { path = "../hive-harness" }
+hive-store = { path = "../hive-store" }
+
+[dev-dependencies]
+axum.workspace = true
+hive-testdb = { path = "../hive-testdb" }

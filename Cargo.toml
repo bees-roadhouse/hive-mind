@@ -22,6 +22,7 @@ members = [
     "crates/hive-httpauth",
     "crates/hive-bus",
     "crates/hive-harness",
+    "crates/hive-apps",
     "crates/hive-egress",
     "crates/hive-chat",
     "crates/hive-models",

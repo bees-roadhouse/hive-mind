@@ -1263,6 +1263,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-apps"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "hive-db",
+ "hive-harness",
+ "hive-identity",
+ "hive-manifest",
+ "hive-store",
+ "hive-testdb",
+ "hive-trust",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "hive-blob"
 version = "0.1.0"
 dependencies = [

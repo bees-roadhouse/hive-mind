@@ -102,9 +102,13 @@ mod tier {
         .execute(&c)
         .await
         .unwrap();
-        hive_store::ensure_install_actor(&c, install, &Credential::new(alice, PrincipalKind::User, alice))
-            .await
-            .unwrap();
+        hive_store::ensure_install_actor(
+            &c,
+            install,
+            &Credential::new(alice, PrincipalKind::User, alice),
+        )
+        .await
+        .unwrap();
         (alice, install)
     }
 
@@ -117,14 +121,22 @@ mod tier {
         let pin = match EgressPin::load(repo_path(PIN_PATH)) {
             Ok(p) => p,
             Err(e) => {
-                return skip_or_fail(T, &format!("no hello-bun pin ({e}); run scripts/app-build.sh apps/hello-bun"));
+                return skip_or_fail(
+                    T,
+                    &format!("no hello-bun pin ({e}); run scripts/app-build.sh apps/hello-bun"),
+                );
             }
         };
         let image = AppImage::parse(&pin.reference()).expect("the pin is a reference");
         let raw = std::fs::read(repo_path(MANIFEST_PATH)).expect("apps/hello-bun/manifest.json");
         let manifest: Manifest = serde_json::from_slice(&raw).expect("the manifest parses");
-        manifest.validate().expect("the checked-in manifest validates");
-        let process = manifest.process.clone().expect("hello-bun is a process app");
+        manifest
+            .validate()
+            .expect("the checked-in manifest validates");
+        let process = manifest
+            .process
+            .clone()
+            .expect("hello-bun is a process app");
 
         let db = TestDb::new("apps_podman_bun").await;
         let store = Store::from_dbs(db.db().clone(), db.audit().clone());
@@ -158,14 +170,20 @@ mod tier {
         };
 
         // Scenario 1's tool call: through the dispatch socket, `{trust, data}` back.
-        let out = apps.invoke(call("add", serde_json::json!({"a": 2, "b": 40}))).await.expect("add");
+        let out = apps
+            .invoke(call("add", serde_json::json!({"a": 2, "b": 40})))
+            .await
+            .expect("add");
         assert_eq!(out.trust, Level::Trusted);
         assert_eq!(out.data, serde_json::json!({"sum": 42}));
         assert!(container_exists(&name));
 
         // What the app sees from inside: its install, the caller, the
         // credential by environment, the entry the manifest named.
-        let out = apps.invoke(call("whoami", serde_json::Value::Null)).await.expect("whoami");
+        let out = apps
+            .invoke(call("whoami", serde_json::Value::Null))
+            .await
+            .expect("whoami");
         let d = &out.data;
         assert_eq!(d["install"], install_id.to_string(), "{d}");
         assert_eq!(d["caller"]["actor"], alice.to_string(), "{d}");
@@ -204,5 +222,7 @@ mod tier {
 #[cfg(not(unix))]
 #[test]
 fn unix_only() {
-    println!("SKIPPED: the_reference_bun_app_answers_a_tool_call_in_a_real_container needs unix sockets");
+    println!(
+        "SKIPPED: the_reference_bun_app_answers_a_tool_call_in_a_real_container needs unix sockets"
+    );
 }

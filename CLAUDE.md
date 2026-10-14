@@ -306,6 +306,10 @@ crates/hive-bus/       events table + the in-process bell + the backstop poll + 
 crates/hive-harness/   hosted agent runs (claude / codex / opencode), rootless Podman, the
                        supervisor that drains, deadlines and terminates; and the app
                        container's spec (D53: one per install, the dispatch socket, no network)
+crates/hive-apps/      process apps (D53): the dispatcher over an install's app socket with the
+                       {trust, data} envelope and a deadline, and the container's life (start on
+                       call, idle stop, the install credential minted and revoked with it) behind
+                       a launcher trait, so the host's decisions are tested without Podman
 crates/hive-egress/    the allowlisting proxy a harness run reaches the internet through
 crates/hive-mcp/       the tool surface. Everything tools/list shows, tools/call accepts
 crates/hive-surfaces/  hive-mcp's three collaborators over the store and the wasm host, plus the

@@ -54,6 +54,18 @@ cargo test -p hive-db -p hive-schema -p hive-testdb -p hive-store -p hive-blob -
 podman stop hive-mind-pg-rust           # when you are done
 ```
 
+The daemon runs on the same server: `--database-url` (or
+`HIVE_SANDBOX_DATABASE_URL`) in place of `--data-dir` for the store, with
+`--blob-root` still a path. The override audit is a second pool on the same
+database (D38 §3's second file was SQLite's one-writer lock, which Postgres
+does not have), and `migrate_audit` is a presence check there. The
+`postgres` CI job starts the daemon this way against a fresh database and
+reads `/readyz`.
+
+```bash
+cargo run -p hive-sandbox -- --database-url "$(./scripts/db-up.sh --quiet)" --blob-root ./data/blobs --plain-http
+```
+
 With the URL set, `hive_testdb::TestDb` makes every integration test's store
 a private schema on that server instead of a file, so any suite can be
 pointed at Postgres the same way. A suite that has not been ported yet

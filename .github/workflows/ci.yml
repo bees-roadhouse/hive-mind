@@ -271,6 +271,32 @@ jobs:
           fi
           grep -q 'forbids falling back to SQLite' /tmp/require.log
 
+      # The daemon itself on Postgres (D43): a URL in place of --data-dir, a
+      # fresh database so the migrations run from nothing, and /readyz has to
+      # say the store is ok. The tests above prove the crates; this proves the
+      # process that composes them opens the engine, migrates it and serves.
+      # serve-api only, as the local smoke was run; the other roles are the
+      # e2e job's business and need nothing from the engine the api does not.
+      - name: the daemon serves on Postgres by URL
+        run: |
+          set -o pipefail
+          PGPASSWORD=hive psql -h localhost -U hive -d postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE hive_smoke'
+          PGPASSWORD=hive psql -h localhost -U hive -d hive_smoke -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public'
+          cargo build -p hive-sandbox
+          blobs=$(mktemp -d); log=$(mktemp)
+          HIVE_SANDBOX_DATABASE_URL=postgres://hive:hive@localhost:5432/hive_smoke             target/debug/hive-sandbox --addr 127.0.0.1:7999 --plain-http --blob-root "$blobs"               --run-chat=false --run-workflows=false --run-models=false > "$log" 2>&1 &
+          pid=$!
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:7999/healthz >/dev/null 2>&1 && break; sleep 0.5; done
+          ready=$(curl -sS http://127.0.0.1:7999/readyz)
+          echo "readyz: $ready"
+          kill "$pid"; wait "$pid" || true
+          grep -E 'store open engine=postgres' "$log"
+          grep -E 'migrated versions=' "$log"
+          echo "$ready" | grep -q '"store":"ok"'
+          tables=$(PGPASSWORD=hive psql -h localhost -U hive -d hive_smoke -tAc "select count(*) from information_schema.tables where table_schema='public'")
+          echo "tables migrated into hive_smoke: $tables"
+          [ "$tables" -gt 20 ]
+
       # Every fixture drops its schema on the way out. One left behind means a
       # drop failed (a lock the test's connection still held, say) and the
       # fixture only printed about it; here it is red.

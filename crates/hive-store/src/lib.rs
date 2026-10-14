@@ -223,6 +223,32 @@ impl Store {
         let audit = Db::open(dir.join(AUDIT_FILE))
             .await
             .map_err(|e| StoreError::db("open audit", e))?;
+        Self::pinged(db, audit).await
+    }
+
+    /// Connects to a Postgres database by URL (D43) and verifies it. The
+    /// override audit is a second pool on the same database, not a second
+    /// database: the second FILE on SQLite existed for the one-writer lock
+    /// (D38 §3), so that a row written under a caller's open write
+    /// transaction survived that caller's rollback, and Postgres has no such
+    /// lock. The audit's own connection is what buys that survival here: a
+    /// write on the audit pool commits on its own, whatever the request's
+    /// transaction then does. `migrate_audit` is a presence check on this
+    /// engine (the audit table is in the main migration set), so the two
+    /// pools are migrated by one call and checked by the other.
+    pub async fn connect(url: &str) -> Result<Store> {
+        let db = Db::connect(url)
+            .await
+            .map_err(|e| StoreError::db("connect", e))?;
+        let audit = Db::connect(url)
+            .await
+            .map_err(|e| StoreError::db("connect audit", e))?;
+        Self::pinged(db, audit).await
+    }
+
+    /// One round trip on each pool before anything is built on them, so a
+    /// daemon with a wrong path or URL fails at open and not at first use.
+    async fn pinged(db: Db, audit: Db) -> Result<Store> {
         for d in [&db, &audit] {
             let c = d.conn().await.map_err(|e| StoreError::db("connect", e))?;
             // A query, not a statement: the engine refuses to `execute` a

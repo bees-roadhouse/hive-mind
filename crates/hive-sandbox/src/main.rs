@@ -66,6 +66,11 @@ struct Args {
     /// Created on first boot.
     #[arg(long, env = "HIVE_SANDBOX_DATA_DIR")]
     data_dir: Option<String>,
+    /// A Postgres URL for the store (D43). Set, it replaces the files under
+    /// --data-dir for the platform database and the override audit; the blob
+    /// root is still a path. Unset, the store is SQLite in --data-dir.
+    #[arg(long, env = "HIVE_SANDBOX_DATABASE_URL")]
+    database_url: Option<String>,
     /// Apply pending migrations at boot.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     migrate: bool,
@@ -198,8 +203,13 @@ async fn run() -> anyhow::Result<()> {
             "no role enabled: pass --serve-api, --run-workflows, --run-chat, --run-models, --run-egress-proxy, or a combination"
         );
     }
-    if args.needs_database() && args.data_dir.as_deref().unwrap_or("").is_empty() {
-        bail!("no store: pass --data-dir or set HIVE_SANDBOX_DATA_DIR");
+    if args.needs_database()
+        && args.data_dir.as_deref().unwrap_or("").is_empty()
+        && args.database_url.as_deref().unwrap_or("").is_empty()
+    {
+        bail!(
+            "no store: pass --data-dir (SQLite) or --database-url (Postgres), or set HIVE_SANDBOX_DATA_DIR or HIVE_SANDBOX_DATABASE_URL"
+        );
     }
 
     tracing::info!(
@@ -231,9 +241,13 @@ async fn run() -> anyhow::Result<()> {
     let mut wake: Option<Arc<dyn Fn() + Send + Sync>> = None;
 
     if args.needs_database() {
-        let st = Store::open(std::path::Path::new(args.data_dir.as_deref().unwrap_or("")))
-            .await
-            .context("open store")?;
+        let st = match args.database_url.as_deref().map(str::trim) {
+            Some(url) if !url.is_empty() => Store::connect(url).await.context("connect store")?,
+            _ => Store::open(std::path::Path::new(args.data_dir.as_deref().unwrap_or("")))
+                .await
+                .context("open store")?,
+        };
+        tracing::info!(engine = %st.db().engine().as_str(), "store open");
         prepare(&st, &args).await?;
 
         // The guest data layer and the runtime that calls it. Built here
@@ -476,8 +490,10 @@ async fn prepare(st: &Store, args: &Args) -> anyhow::Result<()> {
         if !applied.is_empty() {
             tracing::info!(versions = ?applied, "migrated");
         }
-        // The override audit is its own file (D38): a row written under a
-        // caller's open write lock must survive that caller's rollback.
+        // The override audit is its own file on SQLite (D38): a row written
+        // under a caller's open write lock must survive that caller's
+        // rollback. On Postgres it is the same database on its own pool and
+        // this call is a check that `migrate` put the table there.
         let applied = hive_store::migrate_audit(st.audit())
             .await
             .context("migrate audit")?;

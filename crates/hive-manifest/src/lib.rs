@@ -162,6 +162,36 @@ pub struct Process {
     /// holds a schedule.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub always_on: bool,
+    /// A digest-pinned image the app ships as (`repository@sha256:<64 hex>`),
+    /// D53 §1's "a reference the manifest names". Unset, the registry builds
+    /// one from the runtime (D53 step 2); until that exists an install with
+    /// no image cannot start, and the refusal says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// The rule for `process.image`: a repository, `@sha256:` and 64 lowercase
+/// hex digits. A tag is not a pin (D12.5).
+pub fn validate_image(reference: &str) -> Result<(), String> {
+    let Some((repo, digest)) = reference.rsplit_once('@') else {
+        return Err(format!(
+            "image {reference:?} has no digest; a tag is not a pin"
+        ));
+    };
+    if repo.is_empty() || repo.contains(char::is_whitespace) || repo.contains('@') {
+        return Err(format!(
+            "image {reference:?}: repository is not a repository"
+        ));
+    }
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(format!("image {reference:?}: digest is not sha256"));
+    };
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(format!(
+            "image {reference:?}: digest is not 64 lowercase hex digits"
+        ));
+    }
+    Ok(())
 }
 
 /// The rule for a process app's `entry`, in one place so the harness spec
@@ -516,6 +546,11 @@ impl Manifest {
                 );
             }
             if let Err(e) = validate_entry(&p.entry) {
+                err(ErrorKind::Process, e);
+            }
+            if let Some(image) = &p.image
+                && let Err(e) = validate_image(image)
+            {
                 err(ErrorKind::Process, e);
             }
             match p.idle_timeout_secs {

@@ -321,7 +321,7 @@ impl PodmanLauncher {
     }
 }
 
-pub(crate) fn is_no_such_container(output: &str) -> bool {
+pub fn is_no_such_container(output: &str) -> bool {
     let lowered = output.to_ascii_lowercase();
     lowered.contains("no such container") || lowered.contains("no container with name")
 }

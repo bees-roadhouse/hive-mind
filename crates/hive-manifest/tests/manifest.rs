@@ -1157,6 +1157,7 @@ fn a_process_app_declares_a_runtime_and_an_entry() {
         entry: "src/app.ts".into(),
         idle_timeout_secs: Some(300),
         always_on: false,
+        image: None,
     });
     m.validate().expect("a bun process app");
 
@@ -1228,6 +1229,7 @@ fn a_process_without_a_runtime_or_an_entry_is_refused_by_name() {
                 entry: "main.ts".into(),
                 idle_timeout_secs: Some(0),
                 always_on: false,
+                image: None,
             },
             "is not a timeout; say always_on",
         ),
@@ -1238,6 +1240,7 @@ fn a_process_without_a_runtime_or_an_entry_is_refused_by_name() {
                 entry: "main.ts".into(),
                 idle_timeout_secs: Some(60),
                 always_on: true,
+                image: None,
             },
             "one or the other",
         ),
@@ -1304,5 +1307,39 @@ fn entry_rule() {
         "a\nb",
     ] {
         assert!(validate_entry(bad).is_err(), "{bad:?} accepted");
+    }
+}
+
+/// `process.image` is a digest-pinned reference or nothing; a tag is refused
+/// by name (a tag is not a pin).
+#[test]
+fn a_process_image_is_a_pin_or_nothing() {
+    let mut p = Process {
+        runtime: Some(AppRuntime::Bun),
+        entry: "app.ts".into(),
+        ..Default::default()
+    };
+    with_process(p.clone())
+        .validate()
+        .expect("no image is fine");
+    p.image = Some(format!(
+        "ghcr.io/bees-roadhouse/notes@sha256:{}",
+        "c".repeat(64)
+    ));
+    with_process(p.clone()).validate().expect("a pinned image");
+    for bad in [
+        "ghcr.io/x/notes:latest",
+        "@sha256:abc",
+        "ghcr.io/x/notes@sha256:ABC",
+    ] {
+        p.image = Some(bad.into());
+        let errs = with_process(p.clone())
+            .validate()
+            .expect_err(&format!("{bad} accepted"));
+        assert!(errs.is(ErrorKind::Process), "{bad}: {errs}");
+        assert!(
+            format!("{errs}").contains("image"),
+            "{bad}: refused as something else: {errs}"
+        );
     }
 }

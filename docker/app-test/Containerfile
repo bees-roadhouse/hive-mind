@@ -1,0 +1,24 @@
+# The app the container tier tests the runtime with (D53, #163 slice 4): the
+# smallest process that speaks hive-apps' protocol over the one socket the
+# host mounts, so what is proved is the host's side (the sandbox, the
+# credential by environment, the dispatch, no network) and not an SDK. The
+# real SDKs (@hive/app, hive_app) come with D53 step 2 and get their own
+# image; this one stays a fixture.
+#
+# Built by scripts/app-test-build.sh, which pins the digest into
+# docker/app-test/digest.json the way the egress image is pinned.
+
+FROM docker.io/library/python:3.12-alpine
+
+# The runtime's contract, as the generated images will honour it: the socket
+# path and the entry arrive by environment; the app binds the socket and
+# answers /ready and /invoke. This fixture ignores the entry (it is its own
+# handler) and reports what it can see, so the test can assert it from
+# outside: its credential variable, and whether the network is reachable.
+COPY docker/app-test/app.py /app/app.py
+
+# uid 1001 is what the launcher maps (hive-harness podman.rs); the app
+# root is read-only and the socket directory is the only writable mount.
+USER 1001:1001
+WORKDIR /app
+CMD ["python3", "/app/app.py"]

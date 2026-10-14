@@ -105,6 +105,85 @@ pub struct Manifest {
     pub subscriptions: Vec<Subscription>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+
+    /// Set, the app is a process in a container (D53): the runtime starts
+    /// `entry` and the host dispatches into it. Unset, the app is a WASM guest
+    /// (the frozen tier, D53 §5). One field rather than four so a manifest
+    /// that is a guest says nothing about processes at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<Process>,
+}
+
+/// The process runtimes an app may declare (D53 §2). Two, on purpose: the
+/// WASM tier is frozen and a third language is a record, not a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppRuntime {
+    Bun,
+    Python,
+}
+
+impl AppRuntime {
+    pub const ALL: [AppRuntime; 2] = [AppRuntime::Bun, AppRuntime::Python];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AppRuntime::Bun => "bun",
+            AppRuntime::Python => "python",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<AppRuntime> {
+        AppRuntime::ALL.into_iter().find(|r| r.as_str() == s)
+    }
+}
+
+impl fmt::Display for AppRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How a process app runs (D53 §1). What it does NOT carry, on purpose: the
+/// image, the socket paths, the uid, the network. Those are the sandbox's and
+/// the manifest has no say in them, the way D35 §6 gives a run's image
+/// control of userland only.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Process {
+    pub runtime: Option<AppRuntime>,
+    /// The handler file the runtime starts, relative to the app's root.
+    #[serde(default)]
+    pub entry: String,
+    /// Seconds with no invocation before the container is stopped. Unset
+    /// means the platform default; it is refused beside `always_on`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+    /// Never stopped for idleness: for an app that subscribes to events or
+    /// holds a schedule.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_on: bool,
+}
+
+/// The rule for a process app's `entry`, in one place so the harness spec
+/// and the manifest refuse the same strings with the same words: a relative
+/// path inside the app's root, no `..`, no `.`, no empty segment, no leading
+/// slash, no control character.
+pub fn validate_entry(entry: &str) -> Result<(), String> {
+    if entry.is_empty() {
+        return Err("entry is required".to_string());
+    }
+    if entry.starts_with('/') || entry.starts_with('\\') {
+        return Err(format!("entry {entry:?} must be relative to the app root"));
+    }
+    if entry.chars().any(|c| c.is_control()) {
+        return Err(format!("entry {entry:?} carries a control character"));
+    }
+    for seg in entry.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(format!("entry {entry:?} has an empty, `.` or `..` segment"));
+        }
+    }
+    Ok(())
 }
 
 /// The collections an app declares. The host owns all DDL (D3.3): an app names
@@ -298,6 +377,8 @@ pub enum ErrorKind {
     Index,
     /// invalid `uses` declaration
     Uses,
+    /// invalid process declaration
+    Process,
 }
 
 impl ErrorKind {
@@ -313,6 +394,7 @@ impl ErrorKind {
             ErrorKind::Route => "manifest: invalid route",
             ErrorKind::Index => "manifest: invalid index declaration",
             ErrorKind::Uses => "manifest: invalid uses declaration",
+            ErrorKind::Process => "manifest: invalid process declaration",
         }
     }
 }
@@ -412,6 +494,41 @@ impl Manifest {
         }
         if self.version < 1 {
             err(ErrorKind::Version, self.version.to_string());
+        }
+
+        // A process app (D53). The runtime and the entry are both required
+        // once `process` is present: a runtime with nothing to start, or an
+        // entry with nothing to start it, is a manifest that will fail at
+        // container start, which is the wrong place to learn it. A tool is
+        // a verb and never a process: the tool tier skips provisioning and
+        // mounting, and a long-lived container is both.
+        if let Some(p) = &self.process {
+            if self.kind == Some(Kind::Tool) {
+                err(
+                    ErrorKind::ToolTier,
+                    format!("{:?} declares a process", self.name),
+                );
+            }
+            if p.runtime.is_none() {
+                err(
+                    ErrorKind::Process,
+                    "runtime is required (bun or python)".to_string(),
+                );
+            }
+            if let Err(e) = validate_entry(&p.entry) {
+                err(ErrorKind::Process, e);
+            }
+            match p.idle_timeout_secs {
+                Some(0) => err(
+                    ErrorKind::Process,
+                    "idle_timeout_secs 0 is not a timeout; say always_on".to_string(),
+                ),
+                Some(_) if p.always_on => err(
+                    ErrorKind::Process,
+                    "idle_timeout_secs beside always_on: one or the other".to_string(),
+                ),
+                _ => {}
+            }
         }
 
         // The tool tier is a contract, not a convention (D10.3). A tool that

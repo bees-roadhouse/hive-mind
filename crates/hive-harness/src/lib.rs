@@ -22,6 +22,7 @@
 //! against a real container in production and a cheap local process in tests
 //! rather than being mocked out of the tests that matter.
 
+mod app;
 mod egress;
 mod pins;
 mod podman;
@@ -29,6 +30,10 @@ mod record;
 mod spec;
 mod supervisor;
 
+pub use app::{
+    APP_ENV_CREDENTIAL, APP_ENV_ENTRY, APP_ENV_INSTALL, APP_ENV_SOCKET, AppRuntime, AppSpec,
+    CONTAINER_APP_DIR, CONTAINER_APP_ROOT, CONTAINER_APP_SOCK, podman_app_args, validate_entry,
+};
 pub use egress::{DEFAULT_EGRESS_DNS, EgressLauncherError};
 pub use pins::{
     DEFAULT_EGRESS_PIN_PATH, DEFAULT_EGRESS_REPOSITORY, DEFAULT_PINS_PATH, EgressPin, ImagePin,

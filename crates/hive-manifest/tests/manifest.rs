@@ -65,6 +65,7 @@ fn journalish() -> Manifest {
         subscriptions: vec![],
         // specifically no egress; memory is never the outbound leg
         capabilities: vec![],
+        process: None,
     }
 }
 
@@ -900,6 +901,7 @@ fn golden_manifest() -> Manifest {
             kind: "entry.created".into(),
         }],
         capabilities: vec!["storage".into(), "log".into(), "kv".into(), "log".into()],
+        process: None,
     }
 }
 
@@ -1137,4 +1139,170 @@ fn an_empty_uses_is_absent_from_the_json() {
         raw["storage"].get("uses").is_none(),
         "an empty uses was serialised: {raw}"
     );
+}
+
+/// A process app (D53): `process` present makes the app a container, and a
+/// container with no runtime or nothing to start is refused here, where the
+/// fix is a line in the manifest, rather than at container start.
+fn with_process(p: Process) -> Manifest {
+    let mut m = journalish();
+    m.process = Some(p);
+    m
+}
+
+#[test]
+fn a_process_app_declares_a_runtime_and_an_entry() {
+    let m = with_process(Process {
+        runtime: Some(AppRuntime::Bun),
+        entry: "src/app.ts".into(),
+        idle_timeout_secs: Some(300),
+        always_on: false,
+    });
+    m.validate().expect("a bun process app");
+
+    // Round trip: what an author writes parses to the same thing, and a
+    // guest manifest carries no `process` key at all, so nothing already
+    // written changed meaning.
+    let raw = serde_json::to_value(&m).unwrap();
+    assert_eq!(raw["process"]["runtime"], json!("bun"));
+    assert_eq!(raw["process"]["entry"], json!("src/app.ts"));
+    assert!(
+        raw["process"].get("always_on").is_none(),
+        "false is absent: {raw}"
+    );
+    let back: Manifest = serde_json::from_value(raw).unwrap();
+    assert_eq!(back, m);
+    assert!(
+        serde_json::to_value(journalish())
+            .unwrap()
+            .get("process")
+            .is_none(),
+        "a guest manifest grew a process key"
+    );
+    assert_eq!(AppRuntime::parse("python"), Some(AppRuntime::Python));
+    assert_eq!(AppRuntime::parse("node"), None);
+}
+
+#[test]
+fn a_process_without_a_runtime_or_an_entry_is_refused_by_name() {
+    for (name, p, message) in [
+        (
+            "no runtime",
+            Process {
+                runtime: None,
+                entry: "app.ts".into(),
+                ..Default::default()
+            },
+            "runtime is required",
+        ),
+        (
+            "no entry",
+            Process {
+                runtime: Some(AppRuntime::Python),
+                ..Default::default()
+            },
+            "entry is required",
+        ),
+        (
+            "absolute entry",
+            Process {
+                runtime: Some(AppRuntime::Bun),
+                entry: "/app/main.ts".into(),
+                ..Default::default()
+            },
+            "relative to the app root",
+        ),
+        (
+            "dotdot entry",
+            Process {
+                runtime: Some(AppRuntime::Bun),
+                entry: "../other/main.ts".into(),
+                ..Default::default()
+            },
+            "`..` segment",
+        ),
+        (
+            "zero idle timeout",
+            Process {
+                runtime: Some(AppRuntime::Bun),
+                entry: "main.ts".into(),
+                idle_timeout_secs: Some(0),
+                always_on: false,
+            },
+            "is not a timeout; say always_on",
+        ),
+        (
+            "timeout beside always_on",
+            Process {
+                runtime: Some(AppRuntime::Bun),
+                entry: "main.ts".into(),
+                idle_timeout_secs: Some(60),
+                always_on: true,
+            },
+            "one or the other",
+        ),
+    ] {
+        let errs = with_process(p)
+            .validate()
+            .expect_err(&format!("{name} was accepted"));
+        assert!(errs.is(ErrorKind::Process), "{name}: wrong kind: {errs}");
+        // The message, not merely a refusal: these fixtures are otherwise
+        // valid manifests, so a refusal for another reason is a bug here.
+        assert!(
+            format!("{errs}").contains(message),
+            "{name}: refused as something else: {errs}"
+        );
+    }
+}
+
+/// A tool is a verb and never a process: the tool tier skips provisioning and
+/// mounting, and a long-lived container is both.
+#[test]
+fn a_tool_cannot_be_a_process() {
+    let mut m = Manifest {
+        kind: Some(Kind::Tool),
+        name: "shout".into(),
+        version: 1,
+        functions: vec![Function {
+            name: "shout".into(),
+            doc: String::new(),
+        }],
+        ..Default::default()
+    };
+    m.validate().expect("a tool with one function");
+    m.process = Some(Process {
+        runtime: Some(AppRuntime::Bun),
+        entry: "shout.ts".into(),
+        ..Default::default()
+    });
+    let errs = m
+        .validate()
+        .expect_err("a tool with a process was accepted");
+    assert!(errs.is(ErrorKind::ToolTier), "{errs}");
+    assert!(format!("{errs}").contains("declares a process"), "{errs}");
+}
+
+/// The entry rule is one function the harness spec also uses; this is the
+/// manifest's view of it.
+#[test]
+fn entry_rule() {
+    for ok in [
+        "app.ts",
+        "src/app.ts",
+        "src/handlers/main.py",
+        "a.b/c-d_e.ts",
+    ] {
+        validate_entry(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for bad in [
+        "",
+        "/app.ts",
+        "./app.ts",
+        "src//app.ts",
+        "src/./app.ts",
+        "..",
+        "a\nb",
+    ] {
+        assert!(validate_entry(bad).is_err(), "{bad:?} accepted");
+    }
 }

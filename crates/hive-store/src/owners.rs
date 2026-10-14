@@ -82,13 +82,21 @@ pub async fn attach_owner(conn: &Connection, owner: Owner) -> Result<String> {
     }
     // An owner file is a SQLite file beside the control plane file. Under
     // Postgres there is no file to be beside (D43 §5: the org's database is
-    // the tenant), and D43's phase 6 removes this layer; until then the
-    // refusal is explicit rather than a path that does not exist.
+    // the tenant) and nothing is attached: a collection lives as a plain
+    // table in a Postgres schema named for the INSTALL, and that name
+    // already carries the owner's digest (`hive_manifest::schema_name`), so
+    // two owners of one app are two schemas there as they are two files
+    // here. The alias is still returned, unchanged in shape, so a caller
+    // that holds one addresses the same collection on either engine
+    // through `appschema::table_name`, which is where the engine decides
+    // what the alias means. What the Postgres alias omits is the owner
+    // dimension as a NAMESPACE, and that is safe for exactly one reason:
+    // the install's schema name is unique per (app, owner) by construction
+    // and `installs.schema_name` is UNIQUE, so no two owners can resolve to
+    // one schema (invariant 14, the sixth instance, re-checked here).
+    // Phase 2 of D43 then makes the owner's org a database of its own.
     let Some(control_plane) = conn.path() else {
-        return Err(StoreError::Other(format!(
-            "owner files exist only on the sqlite engine; this connection is {}",
-            conn.engine()
-        )));
+        return Ok(alias);
     };
     let path = owner_file(&owners_dir(control_plane), owner);
     initialise(&path, owner).await?;

@@ -43,6 +43,17 @@ fn cursor_round_trip() {
 #[tokio::test]
 async fn tail_walks_the_cursor_index() {
     let w = World::new("tail_walks_the_cursor_index").await;
+    // The assertions below read SQLite's `EXPLAIN QUERY PLAN` text. Postgres
+    // has a plan of its own with different words and a different planner;
+    // asserting its index choice is a port of this test, not a translation,
+    // and until it is written the engine skips aloud rather than passing on
+    // a string it never produced.
+    if w.db().engine() == hive_db::Engine::Postgres {
+        println!(
+            "SKIPPED: tail_walks_the_cursor_index reads SQLite's query plan; the Postgres plan assertion is not written"
+        );
+        return;
+    }
     let alice = w.human("alice").await;
     let alice_cred = cred(alice, PrincipalKind::User, alice);
     let mut events: Vec<Event> = (0..50)
@@ -323,9 +334,20 @@ async fn event_kind_cannot_carry_a_frame_separator() {
         .await
         .err()
         .unwrap_or_else(|| panic!("column/{name}: the column accepted {kind:?}"));
+        // Postgres refuses a NUL byte before any constraint sees it ("invalid
+        // byte sequence for encoding UTF8"), because its text type cannot hold
+        // one at all. That is a refusal, and it is the engine's rather than
+        // the rule under test, so the assertion names what each engine says
+        // instead of passing on the wrong refusal (CLAUDE.md, *Check which
+        // refusal*).
+        let expected = if name == "nul" && conn.engine() == hive_db::Engine::Postgres {
+            "invalid byte sequence"
+        } else {
+            column_err
+        };
         assert!(
-            err.to_string().contains(column_err),
-            "column/{name}: rejected by something other than {column_err}: {err}"
+            err.to_string().contains(expected),
+            "column/{name}: rejected by something other than {expected}: {err}"
         );
     }
     for ok in [
@@ -513,7 +535,9 @@ async fn workflow_definitions_are_immutable() {
         .is_err(),
         "a workflow definition was edited in place"
     );
-    query("UPDATE workflow_defs SET enabled = 0 WHERE id = ?1")
+    // FALSE rather than 0: the column is boolean on Postgres, and SQLite
+    // reads the keyword as 0.
+    query("UPDATE workflow_defs SET enabled = FALSE WHERE id = ?1")
         .bind(id)
         .execute(&conn)
         .await

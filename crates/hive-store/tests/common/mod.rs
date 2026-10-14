@@ -264,7 +264,7 @@ impl World {
         offset: Duration,
     ) -> Option<Reason> {
         let at = now() + chrono::Duration::from_std(offset).unwrap_or_default();
-        let row = query(&hive_store::__predicate_sql_for_tests())
+        let row = query(&hive_store::__predicate_sql_for_tests(self.db().engine()))
             .bind(subj.kind.as_str())
             .bind(subj.id)
             .bind(subj.name.as_deref())
@@ -285,7 +285,13 @@ impl World {
     /// against rows a bug would have written. The file is deleted with the
     /// test, so nothing re-enables it.
     pub async fn issue_policy_off(&self) {
-        query("DROP TRIGGER grants_issue_policy")
+        // Postgres scopes a trigger to its table and wants the table named;
+        // SQLite refuses the ON clause.
+        let sql = match self.db().engine() {
+            hive_db::Engine::Sqlite => "DROP TRIGGER grants_issue_policy",
+            hive_db::Engine::Postgres => "DROP TRIGGER grants_issue_policy ON grants",
+        };
+        query(sql)
             .execute(&*self.conn().await)
             .await
             .expect("disable issue policy");
@@ -336,5 +342,248 @@ impl World {
             .fetch_scalar(&*self.conn().await)
             .await
             .expect("read install state")
+    }
+}
+
+// --- the catalogue, read the way each engine keeps it -----------------------
+//
+// A collection's table lives in the owner's file as `<schema>__<collection>`
+// on SQLite and in the install's own schema as `<collection>` on Postgres
+// (hive-store's `appschema` module doc says why). These helpers answer the
+// questions the suites ask about what provisioning left behind, in terms of
+// collection names, so a test reads the same on either engine and the engine
+// difference lives here once. `alias` is what `attach_owner` returned on the
+// connection; Postgres ignores it, as the store does.
+
+/// The collections provisioned under `schema`, by collection name, sorted.
+pub async fn collection_tables(
+    conn: &hive_db::Connection,
+    alias: &str,
+    schema: &str,
+) -> Vec<String> {
+    match conn.engine() {
+        hive_db::Engine::Sqlite => {
+            let prefix = format!("{schema}__");
+            let names: Vec<String> = query(&format!(
+                "SELECT name FROM {}.sqlite_master
+                  WHERE type = 'table' AND substr(name, 1, length(?1)) = ?1 ORDER BY name",
+                hive_db::quote_ident(alias)
+            ))
+            .bind(&prefix)
+            .fetch_scalars(conn)
+            .await
+            .unwrap();
+            // The virtual tables an index provisions sit under the same
+            // prefix (`<schema>__<collection>_<n>_fts`); only the collection
+            // tables themselves are wanted here, and those carry no digit
+            // suffix after a second `_`.
+            names
+                .into_iter()
+                .filter(|n| !is_virtual_name(n))
+                .map(|n| n[prefix.len()..].to_string())
+                .collect()
+        }
+        hive_db::Engine::Postgres => query(
+            "SELECT table_name::text FROM information_schema.tables
+              WHERE table_schema = ?1 AND table_type = 'BASE TABLE' ORDER BY table_name",
+        )
+        .bind(schema)
+        .fetch_scalars(conn)
+        .await
+        .unwrap(),
+    }
+}
+
+/// `<schema>__<collection>_<n>_fts` or `_vec`: a virtual table's name on
+/// SQLite, told apart from a collection's by its last two segments.
+fn is_virtual_name(name: &str) -> bool {
+    let mut parts = name.rsplitn(3, '_');
+    matches!(
+        (parts.next(), parts.next()),
+        (Some("fts") | Some("vec"), Some(n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+    )
+}
+
+/// Whether anything was provisioned for `schema`: at least one table in the
+/// owner's file under its prefix, or the schema itself on Postgres.
+pub async fn schema_provisioned(conn: &hive_db::Connection, alias: &str, schema: &str) -> bool {
+    match conn.engine() {
+        hive_db::Engine::Sqlite => !collection_tables(conn, alias, schema).await.is_empty(),
+        hive_db::Engine::Postgres => {
+            let n: i64 =
+                query("SELECT count(*) FROM information_schema.schemata WHERE schema_name = ?1")
+                    .bind(schema)
+                    .fetch_scalar(conn)
+                    .await
+                    .unwrap();
+            n > 0
+        }
+    }
+}
+
+pub async fn collection_exists(
+    conn: &hive_db::Connection,
+    alias: &str,
+    schema: &str,
+    collection: &str,
+) -> bool {
+    collection_tables(conn, alias, schema)
+        .await
+        .iter()
+        .any(|c| c == collection)
+}
+
+/// Whether the collection's table has a column named `col`.
+pub async fn collection_column_exists(
+    conn: &hive_db::Connection,
+    alias: &str,
+    schema: &str,
+    collection: &str,
+    col: &str,
+) -> bool {
+    let n: i64 = match conn.engine() {
+        hive_db::Engine::Sqlite => {
+            query("SELECT count(*) FROM pragma_table_info(?1, ?2) WHERE name = ?3")
+                .bind(format!("{schema}__{collection}"))
+                .bind(alias)
+                .bind(col)
+                .fetch_scalar(conn)
+                .await
+                .unwrap()
+        }
+        hive_db::Engine::Postgres => query(
+            "SELECT count(*) FROM information_schema.columns
+              WHERE table_schema = ?1 AND table_name = ?2 AND column_name = ?3",
+        )
+        .bind(schema)
+        .bind(collection)
+        .bind(col)
+        .fetch_scalar(conn)
+        .await
+        .unwrap(),
+    };
+    n > 0
+}
+
+/// The names of everything an index provisions for a collection: the indexes
+/// on its table (the one behind the primary key included) and the triggers on
+/// it, plus the virtual tables beside it on SQLite or the `fts_<n>` and
+/// `vec_<n>` columns on it on Postgres (D41, D43 §3). Sorted.
+pub async fn collection_index_names(
+    conn: &hive_db::Connection,
+    alias: &str,
+    schema: &str,
+    collection: &str,
+) -> Vec<String> {
+    match conn.engine() {
+        hive_db::Engine::Sqlite => {
+            let base = format!("{schema}__{collection}");
+            query(&format!(
+                "SELECT name FROM {}.sqlite_master
+                  WHERE (type IN ('index', 'trigger') AND tbl_name = ?1)
+                     OR (type IN ('table', 'trigger') AND name GLOB ?2)
+                  ORDER BY name",
+                hive_db::quote_ident(alias)
+            ))
+            .bind(&base)
+            .bind(format!("{base}_[0-9]*_[fv]*"))
+            .fetch_scalars(conn)
+            .await
+            .unwrap()
+        }
+        hive_db::Engine::Postgres => {
+            let mut names: Vec<String> = query(
+                "SELECT indexname::text FROM pg_indexes WHERE schemaname = ?1 AND tablename = ?2",
+            )
+            .bind(schema)
+            .bind(collection)
+            .fetch_scalars(conn)
+            .await
+            .unwrap();
+            let triggers: Vec<String> = query(
+                "SELECT t.tgname::text FROM pg_trigger t
+                   JOIN pg_class c ON c.oid = t.tgrelid
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = ?1 AND c.relname = ?2 AND NOT t.tgisinternal",
+            )
+            .bind(schema)
+            .bind(collection)
+            .fetch_scalars(conn)
+            .await
+            .unwrap();
+            let columns: Vec<String> = query(
+                "SELECT column_name::text FROM information_schema.columns
+                  WHERE table_schema = ?1 AND table_name = ?2
+                    AND (column_name LIKE 'fts\\_%' OR column_name LIKE 'vec\\_%')",
+            )
+            .bind(schema)
+            .bind(collection)
+            .fetch_scalars(conn)
+            .await
+            .unwrap();
+            names.extend(triggers);
+            names.extend(columns);
+            names.sort();
+            names
+        }
+    }
+}
+
+/// Whether a platform table (one migration one made, not a collection's)
+/// exists on this connection's default schema.
+pub async fn platform_table_exists(conn: &hive_db::Connection, name: &str) -> bool {
+    let n: i64 = match conn.engine() {
+        hive_db::Engine::Sqlite => {
+            query("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(name)
+                .fetch_scalar(conn)
+                .await
+                .unwrap()
+        }
+        hive_db::Engine::Postgres => query(
+            "SELECT count(*) FROM information_schema.tables
+              WHERE table_schema = current_schema() AND table_name = ?1",
+        )
+        .bind(name)
+        .fetch_scalar(conn)
+        .await
+        .unwrap(),
+    };
+    n > 0
+}
+
+/// The text of a named CHECK constraint on a platform table, as the engine
+/// holds it: cut from the table's `CREATE` text on SQLite, from the
+/// constraint's own definition on Postgres.
+pub async fn check_constraint_text(
+    conn: &hive_db::Connection,
+    table: &str,
+    constraint: &str,
+) -> String {
+    match conn.engine() {
+        hive_db::Engine::Sqlite => {
+            let ddl: String =
+                query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                    .bind(table)
+                    .fetch_scalar(conn)
+                    .await
+                    .expect("read table definition");
+            ddl.split(constraint)
+                .nth(1)
+                .and_then(|rest| rest.split("CONSTRAINT").next())
+                .unwrap_or_default()
+                .to_string()
+        }
+        hive_db::Engine::Postgres => query(
+            "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c
+               JOIN pg_class t ON t.oid = c.conrelid
+               JOIN pg_namespace n ON n.oid = t.relnamespace
+              WHERE n.nspname = current_schema() AND t.relname = ?1 AND c.conname = ?2",
+        )
+        .bind(table)
+        .bind(constraint)
+        .fetch_scalar(conn)
+        .await
+        .expect("read constraint definition"),
     }
 }

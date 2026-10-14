@@ -10,19 +10,34 @@
 //! any reason to know about grants ... which is precisely how the first hole
 //! gets made (invariant 1, and D21's shape).
 //!
-//! An install's collections are tables named `<schema>__<collection>` in the
-//! OWNER's file (D39), attached on the caller's connection and addressed
-//! through the alias `attach_owner` returns. The schema name is the
-//! install's, derived from the app and the owner, so two installs of one app
-//! are two sets of tables (invariant 14); the file is the owner's, so two
-//! owners of one app are two files.
+//! Where an install's collections live is the one thing here that differs by
+//! engine, and [`table_name`] is the only function that knows:
+//!
+//! - **SQLite** (D39): tables named `<schema>__<collection>` in the OWNER's
+//!   file, attached on the caller's connection and addressed through the
+//!   alias `attach_owner` returns. The schema name is the install's, derived
+//!   from the app and the owner, so two installs of one app are two sets of
+//!   tables (invariant 14); the file is the owner's, so two owners of one app
+//!   are two files.
+//! - **Postgres** (D43 §2): a schema per install, named `<schema>`, holding a
+//!   table per collection named `<collection>`. The same derived name, used
+//!   as the namespace it was always meant to be, and the split is what keeps
+//!   every identifier inside Postgres's 63 bytes: the manifest bounds the
+//!   schema name and the collection name separately against that limit
+//!   (`hive_manifest::MAX_APP_NAME`, `MAX_COLLECTION_NAME`), and a joined
+//!   `<schema>__<collection>` would not fit and would be silently truncated,
+//!   which is the dangerous half (the sixth instance of invariant 14). The
+//!   full-text and vector indexes that are virtual tables beside the
+//!   collection on SQLite are columns on the collection's own table here: a
+//!   generated `tsvector` with a GIN index, and a `vector(dim)` kept by a
+//!   trigger with an HNSW index.
 //!
 //! Nothing in here interpolates a string that came from a manifest without
 //! having been through `parse_index` or the identifier check below. A manifest
 //! is a file an AI writes; DDL built from one is the obvious injection surface,
 //! and quoting at this end is the last line rather than the only one.
 
-use hive_db::{Connection, query, quote_ident, quote_literal};
+use hive_db::{Connection, Engine, query, quote_ident, quote_literal};
 use hive_identity::Owner;
 use hive_manifest::{CollectionPlan, Index, IndexMethod, SchemaPlan};
 
@@ -49,11 +64,46 @@ pub async fn apply_schema_plan(tx: &Connection, owner: Owner, plan: &SchemaPlan)
     // After every name is checked and before any DDL: a refused plan attaches
     // nothing and creates no file.
     let alias = attach_owner(tx, owner).await?;
-    for c in &plan.collections {
-        apply_collection(tx, &alias, &plan.schema, c).await?;
+    match tx.engine() {
+        Engine::Sqlite => {
+            for c in &plan.collections {
+                apply_collection(tx, &alias, &plan.schema, c).await?;
+            }
+        }
+        Engine::Postgres => {
+            let schema = quote_ident(&plan.schema);
+            query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                .execute(tx)
+                .await
+                .map_err(|e| StoreError::db(format!("create schema {}", plan.schema), e))?;
+            // One touch function per schema, shared by every collection in
+            // it: the clock read is the same whoever is asking (see the
+            // SQLite trigger below for why this column may be a trigger's).
+            query(&format!(
+                "CREATE OR REPLACE FUNCTION {schema}.{PG_TOUCH_FN}() RETURNS trigger
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     IF NEW.updated_at IS NOT DISTINCT FROM OLD.updated_at THEN
+                         NEW.updated_at := now();
+                     END IF;
+                     RETURN NEW;
+                 END $$"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| StoreError::db(format!("create touch function in {}", plan.schema), e))?;
+            for c in &plan.collections {
+                apply_collection_pg(tx, &plan.schema, c).await?;
+            }
+        }
     }
     Ok(())
 }
+
+/// The name of the per-schema `updated_at` trigger function on Postgres. Not
+/// derived from any manifest name, so it never competes with one for the
+/// identifier bound; `hive_` so a listing of the schema says whose it is.
+const PG_TOUCH_FN: &str = "hive_touch_updated_at";
 
 /// Uninstall. Every table under the install's prefix goes, found in the
 /// catalogue rather than taken from the plan, so a collection a later manifest
@@ -62,6 +112,19 @@ pub async fn apply_schema_plan(tx: &Connection, owner: Owner, plan: &SchemaPlan)
 pub async fn drop_schema_plan(tx: &Connection, owner: Owner, plan: &SchemaPlan) -> Result<()> {
     check_ident(&plan.schema)?;
     let alias = attach_owner(tx, owner).await?;
+    if tx.engine() == Engine::Postgres {
+        // The install IS a schema there, so the blast radius is one statement
+        // and the catalogue walk below is the file engine's way of getting
+        // the same answer.
+        query(&format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            quote_ident(&plan.schema)
+        ))
+        .execute(tx)
+        .await
+        .map_err(|e| StoreError::db(format!("drop schema {}", plan.schema), e))?;
+        return Ok(());
+    }
     let prefix = format!("{}__", plan.schema);
     // Virtual tables first: dropping one takes its shadow tables with it,
     // and a shadow table cannot be dropped on its own (D41 measurement 6).
@@ -101,7 +164,7 @@ async fn apply_collection(
     c: &CollectionPlan,
 ) -> Result<()> {
     check_ident(&c.name)?;
-    let table = table_name(alias, schema, &c.name);
+    let table = table_name(Engine::Sqlite, alias, schema, &c.name);
     // Inside a trigger body a qualified name is refused by the engine (D39
     // measurement 3); the trigger lives in the owner's file, so the bare
     // name resolves there.
@@ -343,10 +406,211 @@ pub(crate) fn is_virtual(sql: &str) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("CREATE VIRTUAL TABLE "))
 }
 
-/// The qualified, quoted table name for a collection in the owner's file:
-/// `"<alias>"."<schema>__<collection>"`.
-pub(crate) fn table_name(alias: &str, schema: &str, collection: &str) -> String {
-    owner_table(alias, &format!("{schema}__{collection}"))
+/// The qualified, quoted name of a collection's table, per engine (the
+/// module doc says why they differ): `"<alias>"."<schema>__<collection>"` in
+/// the owner's file on SQLite, `"<schema>"."<collection>"` on Postgres, where
+/// the alias names nothing and is accepted so every caller is written once.
+pub(crate) fn table_name(engine: Engine, alias: &str, schema: &str, collection: &str) -> String {
+    match engine {
+        Engine::Sqlite => owner_table(alias, &format!("{schema}__{collection}")),
+        Engine::Postgres => format!("{}.{}", quote_ident(schema), quote_ident(collection)),
+    }
+}
+
+/// The column that carries a full-text or vector index on Postgres, where
+/// SQLite has a virtual table beside the collection: `fts_<n>` or `vec_<n>`
+/// by the index's ordinal, the same number the query path uses to find it.
+pub(crate) fn pg_index_column(method: IndexMethod, ordinal: usize) -> String {
+    let kind = match method {
+        IndexMethod::Fts => "fts",
+        IndexMethod::Vector => "vec",
+        // Only the two column-backed methods have a column; the others are
+        // plain indexes and never asked.
+        IndexMethod::BTree | IndexMethod::Gin => "idx",
+    };
+    format!("{kind}_{ordinal}")
+}
+
+/// A Postgres identifier derived from a collection name, held to the engine's
+/// 63-byte limit rather than the file engine's looser bound, because Postgres
+/// truncates silently past it and a truncated derived name is the sixth
+/// instance of invariant 14 waiting to recur. The manifest's
+/// `MAX_COLLECTION_NAME` leaves room for every suffix in `DERIVED_SUFFIXES`,
+/// so a refusal here means a suffix was added there without the bound
+/// following, which is the bug this check exists to surface.
+fn pg_derived_ident(collection: &str, suffix: &str) -> Result<String> {
+    let name = format!("{collection}{suffix}");
+    if name.len() > MAX_IDENTIFIER {
+        return Err(StoreError::UnsafeIdentifier(format!(
+            "{name:?} is {} characters, past the engine's identifier limit",
+            name.len()
+        )));
+    }
+    Ok(quote_ident(&name))
+}
+
+/// One collection on Postgres: the table, its touch trigger and its indexes.
+/// Idempotent like its SQLite twin (every statement IF NOT EXISTS or OR
+/// REPLACE), so re-applying a plan is a migration rather than a failure.
+async fn apply_collection_pg(tx: &Connection, schema: &str, c: &CollectionPlan) -> Result<()> {
+    check_ident(&c.name)?;
+    let table = table_name(Engine::Postgres, "", schema, &c.name);
+    let qschema = quote_ident(schema);
+    // The same shape as the SQLite table, in the D38 §3 column types read
+    // right to left (D43 §2): the id IS the entity's id, trust travels with
+    // the row, and there is still no owner pair and no author here, for the
+    // reasons the SQLite twin gives.
+    query(&format!(
+        "CREATE TABLE IF NOT EXISTS {table} (
+            id          uuid PRIMARY KEY,
+            doc         jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+            trust       text NOT NULL DEFAULT 'trusted' CHECK (trust IN ('trusted', 'untrusted')),
+            tainted_by  text,
+            created_at  timestamptz NOT NULL DEFAULT now(),
+            updated_at  timestamptz NOT NULL DEFAULT now()
+        )"
+    ))
+    .execute(tx)
+    .await
+    .map_err(|e| StoreError::db(format!("create table {schema}.{}", c.name), e))?;
+
+    // BEFORE rather than SQLite's AFTER: Postgres can rewrite NEW, so the
+    // touch is one write instead of a second UPDATE. Trigger names are
+    // scoped to their table here, so the bare suffix cannot collide.
+    let trigger = pg_derived_ident(&c.name, "_touch")?;
+    query(&format!("DROP TRIGGER IF EXISTS {trigger} ON {table}"))
+        .execute(tx)
+        .await
+        .map_err(|e| StoreError::db(format!("drop touch trigger on {schema}.{}", c.name), e))?;
+    query(&format!(
+        "CREATE TRIGGER {trigger} BEFORE UPDATE OF doc, trust, tainted_by ON {table}
+         FOR EACH ROW EXECUTE FUNCTION {qschema}.{PG_TOUCH_FN}()"
+    ))
+    .execute(tx)
+    .await
+    .map_err(|e| StoreError::db(format!("create touch trigger on {schema}.{}", c.name), e))?;
+
+    for (i, idx) in c.indexes.iter().enumerate() {
+        apply_index_pg(tx, schema, &c.name, &table, i, idx).await?;
+    }
+    Ok(())
+}
+
+async fn apply_index_pg(
+    tx: &Connection,
+    schema: &str,
+    collection: &str,
+    table: &str,
+    ordinal: usize,
+    idx: &Index,
+) -> Result<()> {
+    let expr = doc_path(idx)?;
+    let fail = |what: &str, e: hive_db::Error| {
+        StoreError::db(
+            format!("{what} {} index on {schema}.{collection}", idx.method),
+            e,
+        )
+    };
+    let name = pg_derived_ident(collection, &format!("_{}_{ordinal}_idx", idx.method))?;
+    match idx.method {
+        // An expression index over the JSON path, as on SQLite; the doubled
+        // parentheses are Postgres's syntax for an expression in an index.
+        IndexMethod::BTree => {
+            query(&format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON {table} (({expr}))"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("create", e))?;
+        }
+        // Here the engine does have an inverted index over JSON, so a gin
+        // index on the path serves containment on the server. The host still
+        // decides containment itself for the query path (`appdata`), the same
+        // on both engines, so an answer never depends on which engine the
+        // install landed on; the index only makes that decision cheaper.
+        IndexMethod::Gin => {
+            query(&format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON {table} USING gin (({expr}))"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("create", e))?;
+        }
+        // Full text: a generated tsvector column kept by the engine itself,
+        // with a GIN index. 'simple' rather than a language: the mirror on
+        // SQLite is FTS5's default tokenizer, which stems nothing, and a
+        // search has to find the same documents on either engine.
+        IndexMethod::Fts => {
+            let col = quote_ident(&pg_index_column(IndexMethod::Fts, ordinal));
+            query(&format!(
+                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} tsvector
+                 GENERATED ALWAYS AS (to_tsvector('simple', coalesce({expr}, ''))) STORED"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("add column for", e))?;
+            query(&format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON {table} USING gin ({col})"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("create", e))?;
+        }
+        // Semantic recall: a vector(dim) column filled from the JSON array at
+        // the path by a trigger, with an HNSW index on L2 distance, which is
+        // what vec0 ranks by on SQLite. A generated column would be the
+        // tidier form, and the text-to-vector cast is not marked immutable,
+        // so it cannot be one. The dimension is the column's: an array of
+        // any other length is refused by the engine at the write, which is
+        // the same contract the vec0 table gives (D41).
+        IndexMethod::Vector => {
+            let col = quote_ident(&pg_index_column(IndexMethod::Vector, ordinal));
+            query(&format!(
+                "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} vector({})",
+                idx.dim
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("add column for", e))?;
+            let json = doc_json_path(idx)?;
+            let json = json.replacen("doc", "NEW.doc", 1);
+            let func = pg_derived_ident(collection, &format!("_vec_{ordinal}_mirror"))?;
+            let qschema = quote_ident(schema);
+            query(&format!(
+                "CREATE OR REPLACE FUNCTION {qschema}.{func}() RETURNS trigger
+                 LANGUAGE plpgsql AS $$
+                 BEGIN
+                     IF ({json}) IS NULL OR jsonb_typeof({json}) <> 'array' THEN
+                         NEW.{col} := NULL;
+                     ELSE
+                         NEW.{col} := ({json})::text::vector;
+                     END IF;
+                     RETURN NEW;
+                 END $$"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("create mirror function for", e))?;
+            query(&format!("DROP TRIGGER IF EXISTS {func} ON {table}"))
+                .execute(tx)
+                .await
+                .map_err(|e| fail("drop mirror trigger for", e))?;
+            query(&format!(
+                "CREATE TRIGGER {func} BEFORE INSERT OR UPDATE OF doc ON {table}
+                 FOR EACH ROW EXECUTE FUNCTION {qschema}.{func}()"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("create mirror trigger for", e))?;
+            query(&format!(
+                "CREATE INDEX IF NOT EXISTS {name} ON {table} USING hnsw ({col} vector_l2_ops)"
+            ))
+            .execute(tx)
+            .await
+            .map_err(|e| fail("create", e))?;
+        }
+    }
+    Ok(())
 }
 
 /// Builds the JSON accessor for an index path. The `->` and `->>` operators
@@ -460,9 +724,25 @@ mod tests {
         assert!(derived_ident(&base, "_touch").is_err());
         assert_eq!(derived_ident("c", "_touch").unwrap(), "\"c_touch\"");
         assert_eq!(
-            table_name("o_user_ab", "app_1", "entries"),
+            table_name(Engine::Sqlite, "o_user_ab", "app_1", "entries"),
             "\"o_user_ab\".\"app_1__entries\""
         );
+        assert_eq!(
+            table_name(Engine::Postgres, "o_user_ab", "app_1", "entries"),
+            "\"app_1\".\"entries\""
+        );
+    }
+
+    #[test]
+    fn postgres_derived_names_stop_at_the_engine_limit() {
+        // The longest collection name the manifest allows plus the longest
+        // suffix fits exactly; one more character and it is refused rather
+        // than truncated.
+        let longest = "c".repeat(hive_manifest::MAX_COLLECTION_NAME);
+        assert!(pg_derived_ident(&longest, "_vector_9999_idx").is_ok());
+        assert!(pg_derived_ident(&format!("{longest}c"), "_vector_9999_idx").is_err());
+        assert_eq!(pg_index_column(IndexMethod::Fts, 2), "fts_2");
+        assert_eq!(pg_index_column(IndexMethod::Vector, 0), "vec_0");
     }
 
     #[test]

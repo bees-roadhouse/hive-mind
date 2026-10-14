@@ -30,14 +30,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hive_blob::{Catalog, Hash, RefSpec, SourceKind};
-use hive_db::{Connection, Row, Transaction, query};
+use hive_db::{Connection, Engine, Row, Transaction, query};
 use hive_identity::{Credential, Owner, PrincipalKind};
 use hive_trust::Level;
 use hive_wasmhost::{HostError, Request, Response, Storage};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::appschema::{check_ident, table_name};
+use crate::appschema::{check_ident, pg_index_column, table_name};
 use crate::docblobs::descriptors_in;
 use crate::events::{Event, append_events};
 use crate::grants::{Access, ActingInstall, Reason, Subject};
@@ -140,13 +140,19 @@ pub struct IndexDecl {
 /// install already has a row, a schema name and real tables. An unpromoted build
 /// that reached a guest invocation would simply run.
 pub async fn resolve_active_install(db: &Connection, install_id: Uuid) -> Result<InstallInfo> {
-    let row = query(
+    // JSON text on SQLite, jsonb on Postgres: each engine reaches into the
+    // manifest its own way (`installs::declared_uses` is the twin).
+    let collections = match db.engine() {
+        Engine::Sqlite => "coalesce(json_extract(b.manifest, '$.storage.collections'), '[]')",
+        Engine::Postgres => "coalesce(b.manifest -> 'storage' -> 'collections', '[]'::jsonb)",
+    };
+    let row = query(&format!(
         "SELECT i.id, i.slug, i.schema_name, i.owner_kind, i.owner_id, i.state,
-                coalesce(json_extract(b.manifest, '$.storage.collections'), '[]') AS collections
+                {collections} AS collections
            FROM installs i
            JOIN app_builds b ON b.id = i.build_id
-          WHERE i.id = ?1",
-    )
+          WHERE i.id = ?1"
+    ))
     .bind(install_id)
     .fetch_optional(db)
     .await
@@ -294,6 +300,10 @@ impl<'a> QualifiedName<'a> {
 struct Target {
     info: InstallInfo,
     collection: String,
+    /// Which engine the connection that resolved this target speaks, because
+    /// where a collection's table lives differs by engine (`appschema`'s
+    /// module doc) and the name is composed here.
+    engine: Engine,
     /// The caller reached this through some OTHER install, so the collection
     /// gate applies (D33).
     ///
@@ -374,6 +384,7 @@ async fn resolve_target(
         return Ok(Target {
             info: caller.clone(),
             collection: q.collection.to_string(),
+            engine: conn.engine(),
             cross: false,
             alias,
         });
@@ -407,9 +418,22 @@ async fn resolve_target(
     Ok(Target {
         info,
         collection: q.collection.to_string(),
+        engine: conn.engine(),
         cross,
         alias,
     })
+}
+
+/// The entities table as a query in a collection's statement names it. On
+/// SQLite the owner's file is attached beside the control plane, so the
+/// control plane's tables are qualified with its schema name to say which
+/// side of the attachment is meant; Postgres has no attachment and no schema
+/// called `main`.
+fn entities(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Sqlite => "main.entities",
+        Engine::Postgres => "entities",
+    }
 }
 
 impl Target {
@@ -428,7 +452,12 @@ impl Target {
     }
 
     fn table(&self) -> String {
-        table_name(&self.alias, &self.info.schema, &self.collection)
+        table_name(
+            self.engine,
+            &self.alias,
+            &self.info.schema,
+            &self.collection,
+        )
     }
 
     /// D33's dimension. Not an `Option`, and that is the point rather than an
@@ -446,7 +475,11 @@ impl Target {
 /// is the caller's mistake, not the host's failure.
 fn doc_write_error(what: &str, e: hive_db::Error) -> StoreError {
     let msg = e.message();
-    if msg.contains("Dimension mismatch") {
+    // sqlite-vec says "Dimension mismatch"; pgvector says "expected N
+    // dimensions, not M". Same mistake, same answer to the caller.
+    if msg.contains("Dimension mismatch")
+        || (msg.contains("expected ") && msg.contains(" dimensions"))
+    {
         return StoreError::Host(HostError::invalid(
             "a vector in the document has the wrong dimension for its index",
         ));
@@ -686,8 +719,9 @@ impl AppData {
         let row = query(&format!(
             "SELECT t.id, e.ref, e.kind, t.doc, t.trust, t.tainted_by, t.created_at, t.updated_at
                FROM {table} t
-               JOIN main.entities e ON e.id = t.id
-              WHERE t.id = ?1 AND e.deleted_at IS NULL"
+               JOIN {} e ON e.id = t.id
+              WHERE t.id = ?1 AND e.deleted_at IS NULL",
+            entities(conn.engine())
         ))
         .bind(id)
         .fetch_optional(conn)
@@ -949,31 +983,35 @@ impl AppData {
             })?)
         };
 
-        let reason = predicate::reason(&Args {
-            subject_kind: "'entity'",
-            subject_id: "e.id",
-            subject_name: "NULL",
-            principal_kind: "?3",
-            principal_id: "?4",
-            actor_id: "?5",
-            access: "'read'",
-            now: "?6",
-            acting_install: "NULL",
-        });
+        let reason = predicate::reason(
+            target.engine,
+            &Args {
+                subject_kind: "'entity'",
+                subject_id: "e.id",
+                subject_name: "NULL",
+                principal_kind: "?3",
+                principal_id: "?4",
+                actor_id: "?5",
+                access: "'read'",
+                now: "?6",
+                acting_install: "NULL",
+            },
+        );
 
         // The virtual tables a `search` or a `near` consults, resolved from
         // the install's declared indexes (D41 §2). The id sets they produce
         // are filters on the same statement the predicate governs.
         let base = format!("{}__{}", target.info.schema, target.collection);
+        let engine = target.engine;
         let mut search_clause = String::new();
         let mut words: Option<String> = None;
         if !d.search.trim().is_empty() {
-            let fts: Vec<String> = target
+            let fts: Vec<usize> = target
                 .info
                 .indexes
                 .iter()
                 .filter(|i| i.collection == target.collection && i.index.method == IndexMethod::Fts)
-                .map(|i| format!("{base}_{}_fts", i.ordinal))
+                .map(|i| i.ordinal)
                 .collect();
             if fts.is_empty() {
                 return Err(StoreError::Host(HostError::invalid(format!(
@@ -981,20 +1019,51 @@ impl AppData {
                     target.collection
                 ))));
             }
-            let arms: Vec<String> = fts
-                .iter()
-                .map(|vt| {
-                    format!(
-                        "SELECT id FROM {} WHERE {} MATCH ?8",
-                        owner_table(&target.alias, vt),
-                        hive_db::quote_ident(vt)
-                    )
-                })
-                .collect();
-            search_clause = format!("AND t.id IN ({})", arms.join(" UNION "));
-            words = Some(fts_words(&d.search));
+            // The same words on both engines; what differs is where the
+            // index lives (`appschema`'s module doc): a virtual table beside
+            // the collection on SQLite, a generated column on it on Postgres.
+            // `websearch_to_tsquery` takes words the way FTS5's MATCH takes
+            // the quoted phrases `fts_words` builds, and neither is handed
+            // syntax (D41 §2).
+            search_clause = match engine {
+                Engine::Sqlite => {
+                    let arms: Vec<String> = fts
+                        .iter()
+                        .map(|n| {
+                            let vt = format!("{base}_{n}_fts");
+                            format!(
+                                "SELECT id FROM {} WHERE {} MATCH ?8",
+                                owner_table(&target.alias, &vt),
+                                hive_db::quote_ident(&vt)
+                            )
+                        })
+                        .collect();
+                    format!("AND t.id IN ({})", arms.join(" UNION "))
+                }
+                Engine::Postgres => {
+                    let arms: Vec<String> = fts
+                        .iter()
+                        .map(|n| {
+                            // `plainto_tsquery`, not `websearch_to_tsquery`:
+                            // the latter reads OR, quotes and a leading dash
+                            // as operators, and D41 §2 says a search is words
+                            // and never syntax on any engine.
+                            format!(
+                                "t.{} @@ plainto_tsquery('simple', ?8::text)",
+                                hive_db::quote_ident(&pg_index_column(IndexMethod::Fts, *n))
+                            )
+                        })
+                        .collect();
+                    format!("AND ({})", arms.join(" OR "))
+                }
+            };
+            words = Some(match engine {
+                Engine::Sqlite => fts_words(&d.search),
+                Engine::Postgres => d.search.trim().to_string(),
+            });
         }
         let mut near_join = String::new();
+        let mut near_filter = String::new();
         let mut near_vector: Option<String> = None;
         let mut order = "ORDER BY t.created_at DESC, t.id DESC".to_string();
         let mut distance_col = "NULL AS distance".to_string();
@@ -1023,31 +1092,70 @@ impl AppData {
                     decl.index.dim
                 ))));
             }
-            let vt = owner_table(&target.alias, &format!("{base}_{}_vec", decl.ordinal));
-            near_join = format!(
-                "JOIN (SELECT id, distance FROM {vt} WHERE embedding MATCH vec_f32(?9) AND k = ?7) v ON v.id = t.id"
-            );
             near_vector = Some(serde_json::to_string(&near.vector)?);
-            order = "ORDER BY v.distance, t.id".to_string();
-            distance_col = "v.distance AS distance".to_string();
+            match engine {
+                // vec0 answers a k-nearest query as a table of (id, distance)
+                // joined back onto the collection.
+                Engine::Sqlite => {
+                    let vt = owner_table(&target.alias, &format!("{base}_{}_vec", decl.ordinal));
+                    near_join = format!(
+                        "JOIN (SELECT id, distance FROM {vt} WHERE embedding MATCH vec_f32(?9) AND k = ?7) v ON v.id = t.id"
+                    );
+                    order = "ORDER BY v.distance, t.id".to_string();
+                    distance_col = "v.distance AS distance".to_string();
+                }
+                // pgvector ranks by the distance operator over the column the
+                // mirror trigger keeps; `<->` is L2, the metric vec0 uses, so
+                // a `near` orders the same rows the same way on both engines.
+                Engine::Postgres => {
+                    let col =
+                        hive_db::quote_ident(&pg_index_column(IndexMethod::Vector, decl.ordinal));
+                    distance_col = format!("(t.{col} <-> ?9::text::vector) AS distance");
+                    order = format!("ORDER BY t.{col} <-> ?9::text::vector, t.id");
+                    // vec0 answers only for rows that have an embedding; a
+                    // NULL column here would sort last and still fill the
+                    // batch, so a document with nothing at the path is left
+                    // out the way the virtual table leaves it out.
+                    near_filter = format!("AND t.{col} IS NOT NULL");
+                }
+            }
         }
 
+        // The words and the vector are bound on every query, and the trailing
+        // clause references them so a statement with neither still has every
+        // numbered placeholder it is handed. On Postgres each reference is
+        // cast to text, because a parameter's type is inferred from its uses
+        // and `websearch_to_tsquery` and `::vector` would otherwise disagree
+        // with `coalesce` about what ?8 and ?9 are.
+        let referenced = match engine {
+            Engine::Sqlite => "coalesce(?8, ?9, '') IS NOT NULL",
+            Engine::Postgres => "coalesce(?8::text, ?9::text, '') IS NOT NULL",
+        };
+        // The cursor's first use is `IS NULL`, which types nothing on
+        // Postgres, and its use inside the row comparison below is not
+        // enough for the engine to infer a uuid from; said once, here.
+        let after_param = match engine {
+            Engine::Sqlite => "?2",
+            Engine::Postgres => "?2::uuid",
+        };
         let sql = format!(
             "SELECT t.id, e.ref, e.kind, t.doc, t.trust, t.tainted_by, t.created_at, t.updated_at,
                     {distance_col}
                FROM {} t
-               JOIN main.entities e ON e.id = t.id
+               JOIN {} e ON e.id = t.id
                {near_join}
               WHERE e.deleted_at IS NULL
                 AND (?1 = '' OR e.kind = ?1)
-                AND (?2 IS NULL OR (t.created_at, t.id) < (
-                        (SELECT created_at FROM entities WHERE id = ?2), ?2))
+                AND ({after_param} IS NULL OR (t.created_at, t.id) < (
+                        (SELECT created_at FROM entities WHERE id = {after_param}), {after_param}))
                 AND {reason} IS NOT NULL
                 {search_clause}
-                AND coalesce(?8, ?9, '') IS NOT NULL
+                {near_filter}
+                AND {referenced}
               {order}
               LIMIT ?7",
-            target.table()
+            target.table(),
+            entities(engine)
         );
         // The words and the vector are bound on every query; the `coalesce`
         // above references them so a statement with neither still has every

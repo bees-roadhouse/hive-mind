@@ -232,18 +232,21 @@ pub struct ActingInstall(pub Uuid);
 
 /// The point check's text, with every argument a placeholder: subject kind,
 /// id, name, principal kind, id, actor, access, now, acting install.
-pub(crate) fn point_sql() -> String {
-    predicate::decision(&Args {
-        subject_kind: "?1",
-        subject_id: "?2",
-        subject_name: "?3",
-        principal_kind: "?4",
-        principal_id: "?5",
-        actor_id: "?6",
-        access: "?7",
-        now: "?8",
-        acting_install: "?9",
-    })
+pub(crate) fn point_sql(engine: hive_db::Engine) -> String {
+    predicate::decision(
+        engine,
+        &Args {
+            subject_kind: "?1",
+            subject_id: "?2",
+            subject_name: "?3",
+            principal_kind: "?4",
+            principal_id: "?5",
+            actor_id: "?6",
+            access: "?7",
+            now: "?8",
+            acting_install: "?9",
+        },
+    )
 }
 
 /// Answers "may this actor do this" and is the only thing in the platform
@@ -288,7 +291,7 @@ impl Guard {
         access: Access,
         acting: Option<ActingInstall>,
     ) -> Result<(Option<Reason>, Option<Uuid>)> {
-        let row = query(&point_sql())
+        let row = query(&point_sql(db.engine()))
             .bind(subj.kind.as_str())
             .bind(subj.id)
             .bind(subj.name())
@@ -515,7 +518,7 @@ impl Guard {
         name: &str,
         note: &str,
     ) -> Result<Option<Reason>> {
-        let probe = predicate::has_allowlist("?1", "?2", "?3", "?4", "?5");
+        let probe = predicate::has_allowlist(db.engine(), "?1", "?2", "?3", "?4", "?5");
         let has_allowlist: bool = query(&probe)
             .bind(kind.as_str())
             .bind(install_id)
@@ -597,23 +600,26 @@ impl Guard {
         kind: &str,
         limit: i64,
     ) -> Result<Vec<Uuid>> {
-        let reason = predicate::reason(&Args {
-            subject_kind: "'entity'",
-            subject_id: "e.id",
-            subject_name: "NULL",
-            principal_kind: "?2",
-            principal_id: "?3",
-            actor_id: "?4",
-            access: "?5",
-            now: "?6",
-            acting_install: "NULL",
-        });
+        let reason = predicate::reason(
+            db.engine(),
+            &Args {
+                subject_kind: "'entity'",
+                subject_id: "e.id",
+                subject_name: "NULL",
+                principal_kind: "?2",
+                principal_id: "?3",
+                actor_id: "?4",
+                access: "?5",
+                now: "?6",
+                acting_install: "NULL",
+            },
+        );
         let rows = query(&format!(
             "SELECT e.id, {reason} AS reason
                FROM entities e
               WHERE e.deleted_at IS NULL
                 AND (?1 = '' OR e.kind = ?1)
-                AND reason IS NOT NULL
+                AND {reason} IS NOT NULL
               ORDER BY e.created_at DESC
               LIMIT ?7"
         ))
@@ -641,22 +647,25 @@ impl Guard {
         access: Access,
         limit: i64,
     ) -> Result<Vec<Uuid>> {
-        let reason = predicate::reason(&Args {
-            subject_kind: "'conversation'",
-            subject_id: "c.id",
-            subject_name: "NULL",
-            principal_kind: "?1",
-            principal_id: "?2",
-            actor_id: "?3",
-            access: "?4",
-            now: "?5",
-            acting_install: "NULL",
-        });
+        let reason = predicate::reason(
+            db.engine(),
+            &Args {
+                subject_kind: "'conversation'",
+                subject_id: "c.id",
+                subject_name: "NULL",
+                principal_kind: "?1",
+                principal_id: "?2",
+                actor_id: "?3",
+                access: "?4",
+                now: "?5",
+                acting_install: "NULL",
+            },
+        );
         let rows = query(&format!(
             "SELECT c.id, {reason} AS reason
                FROM conversations c
               WHERE c.archived_at IS NULL
-                AND reason IS NOT NULL
+                AND {reason} IS NOT NULL
               ORDER BY c.updated_at DESC
               LIMIT ?6"
         ))
@@ -797,7 +806,7 @@ pub async fn write_install_grant(
 ) -> Result<Uuid> {
     let existing: Option<Uuid> = query(
         "SELECT id FROM grants
-          WHERE subject_kind = ?1 AND subject_id = ?2 AND subject_name IS ?3
+          WHERE subject_kind = ?1 AND subject_id = ?2 AND subject_name IS NOT DISTINCT FROM ?3
             AND target_kind = 'install' AND target_install_id = ?4
             AND access = ?5 AND source = 'direct' AND revoked_at IS NULL
           LIMIT 1",
@@ -888,7 +897,7 @@ pub async fn unshare(
     let directs: i64 = query(
         "SELECT count(*) FROM grants g
           WHERE g.subject_kind = ?1 AND g.subject_id = ?2
-            AND g.subject_name IS ?3
+            AND g.subject_name IS NOT DISTINCT FROM ?3
             AND g.target_kind = ?4 AND g.target_id = ?5
             AND g.source = 'direct' AND g.revoked_at IS NULL",
     )
@@ -910,7 +919,7 @@ pub async fn unshare(
         "UPDATE grants
             SET revoked_at = ?6, revoked_by = ?7
           WHERE subject_kind = ?1 AND subject_id = ?2
-            AND subject_name IS ?3
+            AND subject_name IS NOT DISTINCT FROM ?3
             AND target_kind = ?4 AND target_id = ?5
             AND source = 'inherited' AND revoked_at IS NULL",
     )
@@ -928,7 +937,7 @@ pub async fn unshare(
         query(
             "DELETE FROM grants
               WHERE subject_kind = ?1 AND subject_id = ?2
-                AND subject_name IS ?3
+                AND subject_name IS NOT DISTINCT FROM ?3
                 AND target_kind = ?4 AND target_id = ?5
                 AND source = 'direct' AND revoked_at IS NULL",
         )
@@ -980,12 +989,12 @@ pub async fn materialize_inherited(
                 p.expires_at, ?10
            FROM grants p
           WHERE p.subject_kind = ?1 AND p.subject_id = ?2
-            AND p.subject_name IS ?3
+            AND p.subject_name IS NOT DISTINCT FROM ?3
             AND p.source <> 'override'
             AND p.revoked_at IS NULL
             AND (p.expires_at IS NULL OR p.expires_at > ?10)
          ON CONFLICT DO NOTHING",
-        uuid = hive_db::UUID_SQL
+        uuid = db.engine().uuid_sql()
     ))
     .bind(parent.kind.as_str())
     .bind(parent.id)
@@ -1030,7 +1039,7 @@ pub async fn enter_break_glass(
         "DELETE FROM grants
           WHERE source = 'override'
             AND subject_kind = ?1 AND subject_id = ?2
-            AND subject_name IS ?3
+            AND subject_name IS NOT DISTINCT FROM ?3
             AND target_kind = 'user' AND target_id = ?4
             AND (revoked_at IS NOT NULL OR expires_at <= ?5)",
     )

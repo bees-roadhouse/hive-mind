@@ -135,18 +135,34 @@ impl Fx {
         serde_json::from_slice(&res.data).unwrap()
     }
 
-    /// Every object in the owner's file under this install's prefix.
+    /// Every object provisioned for this install: everything under its prefix
+    /// in the owner's file on SQLite; on Postgres, the collection tables in
+    /// its schema and what each carries (indexes, triggers and the `fts_<n>`
+    /// and `vec_<n>` columns that stand where the virtual tables stood).
     async fn objects(&self) -> Vec<String> {
         let conn = self.w.conn().await;
         let alias = attach_owner(&conn, user(self.alice)).await.unwrap();
-        query(&format!(
-            "SELECT name FROM {}.sqlite_master WHERE name GLOB ?1 ORDER BY name",
-            hive_db::quote_ident(&alias)
-        ))
-        .bind(format!("{}__*", self.schema))
-        .fetch_scalars(&conn)
-        .await
-        .unwrap()
+        match conn.engine() {
+            hive_db::Engine::Sqlite => query(&format!(
+                "SELECT name FROM {}.sqlite_master WHERE name GLOB ?1 ORDER BY name",
+                hive_db::quote_ident(&alias)
+            ))
+            .bind(format!("{}__*", self.schema))
+            .fetch_scalars(&conn)
+            .await
+            .unwrap(),
+            hive_db::Engine::Postgres => {
+                let mut out = Vec::new();
+                for t in common::collection_tables(&conn, &alias, &self.schema).await {
+                    out.extend(
+                        common::collection_index_names(&conn, &alias, &self.schema, &t).await,
+                    );
+                    out.push(t);
+                }
+                out.sort();
+                out
+            }
+        }
     }
 }
 
@@ -244,11 +260,16 @@ async fn near_ranks_by_distance() {
         "a document with no embedding was ranked"
     );
 
-    // Updating the embedding moves the document.
+    // Updating the embedding moves the document. It moves to a point
+    // FARTHER from the query than b and c, not merely elsewhere: at
+    // [0, 0, 0, 1] all three sit at the same distance from [1, 0, 0, 0], and
+    // which of a tie ranks first is the engine's tie-break, which vec0 and
+    // pgvector make differently (the second put the moved document back on
+    // top by id). A test of "the move was seen" must not depend on that.
     f.data
         .update(f.req(serde_json::json!({
             "collection": "entries", "id": a,
-            "doc": {"embedding": [0.0, 0.0, 0.0, 1.0], "n": "a moved"}
+            "doc": {"embedding": [-1.0, 0.0, 0.0, 0.0], "n": "a moved"}
         })))
         .await
         .expect("update");
@@ -303,9 +324,16 @@ async fn uninstall_drops_the_virtual_tables_too() {
         .await
         .unwrap();
     let before = f.objects().await;
+    // `<base>_<n>_fts` and `_vec` virtual tables on SQLite; `fts_<n>` and
+    // `vec_<n>` columns on Postgres (D43 §3).
+    let has = |suffix: &str, prefix: &str| {
+        before
+            .iter()
+            .any(|n| n.ends_with(suffix) || n.starts_with(prefix))
+    };
     assert!(
-        before.iter().any(|n| n.ends_with("_fts")) && before.iter().any(|n| n.ends_with("_vec")),
-        "the virtual tables were not provisioned: {before:?}"
+        has("_fts", "fts_") && has("_vec", "vec_"),
+        "the full-text and vector indexes were not provisioned: {before:?}"
     );
     let tx = f.w.store.begin().await.unwrap();
     drop_schema_plan(&tx, user(f.alice), &f.plan)

@@ -345,15 +345,25 @@ impl AppFixture {
             .await
             .unwrap();
         let alias = hive_store::attach_owner(&conn, self.owner).await.unwrap();
-        let rows = query(&format!(
-            "UPDATE {} SET doc = ?2 WHERE id = ?1",
-            hive_store::owner_table(&alias, &format!("{schema}__{}", self.collection))
-        ))
-        .bind(id)
-        .bind(body)
-        .execute(&conn)
-        .await
-        .expect("diverge document");
+        // Where the table is differs by engine (hive-store's `appschema`
+        // doc); this helper writes to it by hand, so it names it the way each
+        // engine does.
+        let table = match conn.engine() {
+            hive_db::Engine::Sqlite => {
+                hive_store::owner_table(&alias, &format!("{schema}__{}", self.collection))
+            }
+            hive_db::Engine::Postgres => format!(
+                "{}.{}",
+                hive_db::quote_ident(&schema),
+                hive_db::quote_ident(&self.collection)
+            ),
+        };
+        let rows = query(&format!("UPDATE {table} SET doc = ?2 WHERE id = ?1"))
+            .bind(id)
+            .bind(body)
+            .execute(&conn)
+            .await
+            .expect("diverge document");
         assert_eq!(rows, 1, "diverge is not rewriting what it thinks it is");
     }
 }

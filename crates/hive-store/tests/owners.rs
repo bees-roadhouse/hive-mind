@@ -66,6 +66,15 @@ async fn tables_in(conn: &hive_db::Connection, alias: &str, prefix: &str) -> Vec
 #[tokio::test]
 async fn provisioned_tables_land_in_the_owners_file() {
     let w = World::new("owner_files_land").await;
+    // Owner files are the SQLite tenant layer (D39); Postgres has no
+    // attachment and no file (D43 §5), so there is nothing here to assert
+    // against. Said out loud so the gate lists it rather than counts it green.
+    if w.db().engine() == hive_db::Engine::Postgres {
+        println!(
+            "SKIPPED: provisioned_tables_land_in_the_owners_file owner files exist only on the sqlite engine"
+        );
+        return;
+    }
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let schema_a = register(&w, "journal", user(alice), alice).await;
@@ -109,6 +118,15 @@ async fn provisioned_tables_land_in_the_owners_file() {
 #[tokio::test]
 async fn attaching_an_owner_twice_is_one_attachment() {
     let w = World::new("owner_files_idempotent").await;
+    // Owner files are the SQLite tenant layer (D39); Postgres has no
+    // attachment and no file (D43 §5), so there is nothing here to assert
+    // against. Said out loud so the gate lists it rather than counts it green.
+    if w.db().engine() == hive_db::Engine::Postgres {
+        println!(
+            "SKIPPED: attaching_an_owner_twice_is_one_attachment owner files exist only on the sqlite engine"
+        );
+        return;
+    }
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let conn = w.conn().await;
@@ -129,6 +147,15 @@ async fn attaching_an_owner_twice_is_one_attachment() {
 #[tokio::test]
 async fn a_pooled_connection_returns_without_its_attachments() {
     let w = World::new("owner_files_detach_on_return").await;
+    // Owner files are the SQLite tenant layer (D39); Postgres has no
+    // attachment and no file (D43 §5), so there is nothing here to assert
+    // against. Said out loud so the gate lists it rather than counts it green.
+    if w.db().engine() == hive_db::Engine::Postgres {
+        println!(
+            "SKIPPED: a_pooled_connection_returns_without_its_attachments owner files exist only on the sqlite engine"
+        );
+        return;
+    }
     let alice = w.human("alice").await;
     {
         let conn = w.conn().await;
@@ -159,6 +186,15 @@ async fn a_pooled_connection_returns_without_its_attachments() {
 #[tokio::test]
 async fn an_attach_inside_a_transaction_rolls_back_with_it() {
     let w = World::new("owner_files_rollback").await;
+    // Owner files are the SQLite tenant layer (D39); Postgres has no
+    // attachment and no file (D43 §5), so there is nothing here to assert
+    // against. Said out loud so the gate lists it rather than counts it green.
+    if w.db().engine() == hive_db::Engine::Postgres {
+        println!(
+            "SKIPPED: an_attach_inside_a_transaction_rolls_back_with_it owner files exist only on the sqlite engine"
+        );
+        return;
+    }
     let alice = w.human("alice").await;
     let tx = w.store.begin().await.unwrap();
     let alias = attach_owner(&tx, user(alice)).await.unwrap();
@@ -189,6 +225,15 @@ async fn an_attach_inside_a_transaction_rolls_back_with_it() {
 #[tokio::test]
 async fn a_file_that_names_another_owner_is_refused() {
     let w = World::new("owner_files_marker").await;
+    // Owner files are the SQLite tenant layer (D39); Postgres has no
+    // attachment and no file (D43 §5), so there is nothing here to assert
+    // against. Said out loud so the gate lists it rather than counts it green.
+    if w.db().engine() == hive_db::Engine::Postgres {
+        println!(
+            "SKIPPED: a_file_that_names_another_owner_is_refused owner files exist only on the sqlite engine"
+        );
+        return;
+    }
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     {
@@ -232,6 +277,15 @@ async fn a_grantees_read_attaches_the_owners_file() {
     use hive_wasmhost::{Caller, Request, Storage as _};
 
     let w = World::new("owner_files_grantee").await;
+    // Owner files are the SQLite tenant layer (D39); Postgres has no
+    // attachment and no file (D43 §5), so there is nothing here to assert
+    // against. Said out loud so the gate lists it rather than counts it green.
+    if w.db().engine() == hive_db::Engine::Postgres {
+        println!(
+            "SKIPPED: a_grantees_read_attaches_the_owners_file owner files exist only on the sqlite engine"
+        );
+        return;
+    }
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let by = cred(alice, PrincipalKind::User, alice);

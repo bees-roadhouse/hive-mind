@@ -40,7 +40,7 @@ async fn acts_for(conn: &Connection, by: &Credential, principal: Owner) -> Resul
     }
     let kind: Option<String> = query(&format!(
         "SELECT {}",
-        predicate::acting_kind("?1", "?2", "?3")
+        predicate::acting_kind(conn.engine(), "?1", "?2", "?3")
     ))
     .bind(by.actor_id)
     .bind(by.principal_kind.as_str())
@@ -322,11 +322,20 @@ pub async fn activate_install(conn: &Connection, install_id: Uuid, by: &Credenti
 /// What the install's manifest declares it uses, read back off the build
 /// row rather than carried in by the caller (invariant 11).
 async fn declared_uses(conn: &Connection, install_id: Uuid) -> Result<Vec<hive_manifest::Use>> {
-    let raw: Option<String> = query(
-        "SELECT coalesce(json_extract(b.manifest, '$.storage.uses'), '[]')
+    // The manifest is JSON text on SQLite and jsonb on Postgres (D38 §3 read
+    // right to left, D43 §2); each engine reaches into it its own way and
+    // both hand back text for serde.
+    let uses = match conn.engine() {
+        hive_db::Engine::Sqlite => "coalesce(json_extract(b.manifest, '$.storage.uses'), '[]')",
+        hive_db::Engine::Postgres => {
+            "coalesce(b.manifest -> 'storage' -> 'uses', '[]'::jsonb)::text"
+        }
+    };
+    let raw: Option<String> = query(&format!(
+        "SELECT {uses}
            FROM installs i JOIN app_builds b ON b.id = i.build_id
-          WHERE i.id = ?1",
-    )
+          WHERE i.id = ?1"
+    ))
     .bind(install_id)
     .fetch_scalar_optional(conn)
     .await

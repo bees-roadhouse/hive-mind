@@ -242,9 +242,18 @@ impl Chat {
         }
         let ids_json =
             serde_json::Value::from(ids.iter().map(|id| id.to_string()).collect::<Vec<_>>());
+        // A JSON array of ids unpacked by the engine: `json_each` on SQLite,
+        // `jsonb_array_elements_text` on Postgres, where the elements are
+        // text and the column is uuid.
+        let unpacked = match conn.engine() {
+            hive_db::Engine::Sqlite => "SELECT value FROM json_each(?1)",
+            hive_db::Engine::Postgres => {
+                "SELECT value::uuid FROM jsonb_array_elements_text(?1::jsonb)"
+            }
+        };
         let rows = query(&format!(
             "SELECT {CONVERSATION_COLUMNS} FROM conversations
-              WHERE id IN (SELECT value FROM json_each(?1))
+              WHERE id IN ({unpacked})
               ORDER BY updated_at DESC"
         ))
         .bind(ids_json)

@@ -304,7 +304,8 @@ crates/hive-blob/      content-addressed bytes on the path mounted at --blob-roo
                        one driver, D40), and the catalog where refs, ownership and trust live
 crates/hive-bus/       events table + the in-process bell + the backstop poll + SSE fan-out
 crates/hive-harness/   hosted agent runs (claude / codex / opencode), rootless Podman, the
-                       supervisor that drains, deadlines and terminates
+                       supervisor that drains, deadlines and terminates; and the app
+                       container's spec (D53: one per install, the dispatch socket, no network)
 crates/hive-egress/    the allowlisting proxy a harness run reaches the internet through
 crates/hive-mcp/       the tool surface. Everything tools/list shows, tools/call accepts
 crates/hive-surfaces/  hive-mcp's three collaborators over the store and the wasm host, plus the

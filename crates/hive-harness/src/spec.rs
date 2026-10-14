@@ -126,7 +126,7 @@ impl Limits {
         }
     }
 
-    fn validate(&self) -> Result<(), SpecError> {
+    pub(crate) fn validate(&self) -> Result<(), SpecError> {
         if self.memory_bytes <= 0 {
             return Err(SpecError("limits: memory_bytes must be positive".into()));
         }

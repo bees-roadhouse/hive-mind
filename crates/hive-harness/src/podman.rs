@@ -19,10 +19,10 @@ use crate::supervisor::{Launcher, RunError};
 pub(crate) const CONTAINER_WORKSPACE: &str = "/workspace";
 pub(crate) const CONTAINER_HOME: &str = "/home/harness";
 pub(crate) const CONTAINER_DAEMON_SOCK: &str = "/run/hive-sandbox/api.sock";
-const CONTAINER_UID: u32 = 1001;
-const CONTAINER_GID: u32 = 1001;
-const CONTAINER_TMP_SIZE: &str = "512m";
-const CONTAINER_HOME_TMP_SIZE: &str = "256m";
+pub(crate) const CONTAINER_UID: u32 = 1001;
+pub(crate) const CONTAINER_GID: u32 = 1001;
+pub(crate) const CONTAINER_TMP_SIZE: &str = "512m";
+pub(crate) const CONTAINER_HOME_TMP_SIZE: &str = "256m";
 
 /// Set by the launcher and refused from a spec.
 ///
@@ -255,7 +255,7 @@ pub fn podman_run_args(spec: &RunSpec, extra: &[String]) -> Result<Vec<String>, 
 
 /// Renders a CPU count the way `strconv.FormatFloat(f, 'f', -1, 64)` did: the
 /// shortest decimal that round-trips, with no trailing zeros.
-fn format_cpus(cpus: f64) -> String {
+pub(crate) fn format_cpus(cpus: f64) -> String {
     if cpus.fract() == 0.0 {
         format!("{}", cpus as i64)
     } else {

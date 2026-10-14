@@ -21,6 +21,7 @@ regex.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true
 hive-identity = { path = "../hive-identity" }
+hive-manifest = { path = "../hive-manifest" }
 hive-trust = { path = "../hive-trust" }
 
 [dev-dependencies]

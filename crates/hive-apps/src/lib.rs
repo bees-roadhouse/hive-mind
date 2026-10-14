@@ -24,6 +24,8 @@
 //! and a supervisor of long-lived containers, and the pure argument list it
 //! starts them with is `hive_harness::podman_app_args`.
 
+pub mod images;
+pub mod podman;
 pub mod protocol;
 
 use std::collections::HashMap;
@@ -43,6 +45,8 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
+pub use images::ManifestImages;
+pub use podman::PodmanAppLauncher;
 pub use protocol::{InvokeKind, RouteFacts};
 
 /// A connection to an app, whatever carries it. Unix sockets in production;

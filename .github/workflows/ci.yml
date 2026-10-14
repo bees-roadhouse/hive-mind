@@ -164,15 +164,24 @@ jobs:
       - name: build the egress proxy image
         run: ./scripts/egress-build.sh
 
+      # The process-app fixture (D53, #163): the smallest app that speaks the
+      # runtime's protocol over the socket the host mounts, so the container
+      # tier proves the host's side and not an SDK.
+      - name: build the app test image
+        run: ./scripts/app-test-build.sh
+
       - name: the pins exist
         run: |
           cat docker/harness/digests.json
           cat docker/egress/digest.json
+          cat docker/app-test/digest.json
 
       - name: container tests, where a skip is a failure
         env:
           HIVE_SANDBOX_REQUIRE_CONTAINER_TESTS: "1"
-        run: cargo test -p hive-harness --test supervisor -- podman_runs_the_pinned_image egress_proxy_enforces_the_allowlist egress_proxy_that_dies_reports_its_exit
+        run: |
+          cargo test -p hive-harness --test supervisor -- podman_runs_the_pinned_image egress_proxy_enforces_the_allowlist egress_proxy_that_dies_reports_its_exit
+          cargo test -p hive-apps --test podman -- --nocapture
 
       - name: nothing outlived the run
         if: ${{ always() }}

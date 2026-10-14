@@ -24,6 +24,7 @@ hive-store = { path = "../hive-store" }
 hive-blob = { path = "../hive-blob" }
 hive-wasmhost = { path = "../hive-wasmhost" }
 hive-mcp = { path = "../hive-mcp" }
+hive-apps = { path = "../hive-apps" }
 
 [dev-dependencies]
 tempfile.workspace = true

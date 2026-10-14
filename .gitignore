@@ -41,4 +41,5 @@ test/e2e/.playwright/
 # registry (harnesses.md open question 2).
 docker/harness/digests.json
 docker/egress/digest.json
+docker/app-test/digest.json
 

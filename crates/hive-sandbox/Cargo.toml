@@ -39,6 +39,7 @@ hive-wasmhost = { path = "../hive-wasmhost" }
 hive-webui = { path = "../hive-webui" }
 hive-mcp = { path = "../hive-mcp" }
 hive-surfaces = { path = "../hive-surfaces" }
+hive-apps = { path = "../hive-apps" }
 
 [dev-dependencies]
 tempfile.workspace = true

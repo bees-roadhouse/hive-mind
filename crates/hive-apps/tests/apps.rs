@@ -247,6 +247,7 @@ async fn process_install(
                 Some(idle.as_secs())
             },
             always_on,
+            image: None,
         }),
         ..Default::default()
     };

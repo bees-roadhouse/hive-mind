@@ -25,10 +25,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use hive_apps::{Apps, Invoke, InvokeKind, RouteFacts};
 use hive_blob::{Catalog, Hash, Range};
 use hive_db::query;
 use hive_identity::Credential;
-use hive_manifest::{Impl, Manifest, Op, Surface};
+use hive_manifest::{Impl, Manifest, Op, Process, Surface};
 use hive_mcp::{CrudCall, Dispatcher, Guard, GuestCall, Install, Installs, ToolResult};
 use hive_store::{AppData, Store, resolve_active_install};
 use hive_trust::Level;
@@ -45,6 +46,11 @@ pub struct Surfaces {
     host: Host,
     blobs: Arc<Catalog>,
     storage: Arc<AppData>,
+    /// The process-app runtime (D53). `None` on a daemon without one (no
+    /// unix socket, or not a unix host): a process install's call is then
+    /// refused with the reason rather than dispatched to a guest it has not
+    /// got.
+    apps: Option<Arc<Apps>>,
 }
 
 impl Surfaces {
@@ -55,7 +61,82 @@ impl Surfaces {
             host,
             blobs,
             storage,
+            apps: None,
         }
+    }
+
+    /// Gives process apps (D53) somewhere to run. Without it every process
+    /// install's call is refused by name.
+    pub fn with_apps(mut self, apps: Arc<Apps>) -> Surfaces {
+        self.apps = Some(apps);
+        self
+    }
+
+    /// The install's process declaration, if it is a process app. Read from
+    /// the build's manifest on every call rather than cached on `Install`:
+    /// the manifest is the install's truth, and one query beside the ones a
+    /// call already makes is the price of not keying a cache (invariant 14).
+    async fn process_of(&self, install_id: Uuid) -> Result<Option<Process>, String> {
+        let conn = self.store.conn().await.map_err(|e| e.to_string())?;
+        let manifest: Option<serde_json::Value> = query(
+            "SELECT b.manifest FROM installs i JOIN app_builds b ON b.id = i.build_id WHERE i.id = ?1",
+        )
+        .bind(install_id)
+        .fetch_scalar_optional(&conn)
+        .await
+        .map_err(|e| format!("manifest of install {install_id}: {e}"))?;
+        let Some(manifest) = manifest else {
+            return Ok(None);
+        };
+        let m: Manifest = serde_json::from_value(manifest)
+            .map_err(|e| format!("manifest of install {install_id} does not parse: {e}"))?;
+        Ok(m.process)
+    }
+
+    /// Dispatches into a process app's container (D53) with the same
+    /// `{trust, data}` shape a guest call has, and the same result type, so a
+    /// tool or a route does not know which tier answered.
+    async fn run_process(
+        &self,
+        install: &Install,
+        cred: Credential,
+        kind: InvokeKind,
+        name: &str,
+        input: Vec<u8>,
+        route: Option<RouteFacts>,
+    ) -> Result<ToolResult, String> {
+        let Some(apps) = &self.apps else {
+            return Err(format!(
+                "install {} is a process app and this daemon runs none (no app runtime: it needs a unix socket on a unix host)",
+                install.app
+            ));
+        };
+        let data: serde_json::Value = if input.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&input).map_err(|e| format!("input is not JSON: {e}"))?
+        };
+        let out = apps
+            .invoke(Invoke {
+                install_id: install.id,
+                kind,
+                name: name.to_string(),
+                cred,
+                trust: Level::Trusted,
+                data,
+                route,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(ToolResult {
+            output: serde_json::to_vec(&out.data).map_err(|e| e.to_string())?,
+            trust: out.trust,
+            tainted_by: if out.trust == Level::Trusted {
+                String::new()
+            } else {
+                "app response".to_string()
+            },
+        })
     }
 
     /// Every ACTIVE install this principal owns or holds any live grant on.
@@ -267,6 +348,29 @@ impl Surfaces {
                     let input = guest_route_input(&call, &params);
                     let input = serde_json::to_vec(&input)
                         .map_err(|e| RouteError::Failed(e.to_string()))?;
+                    if self
+                        .process_of(inst.id)
+                        .await
+                        .map_err(RouteError::Failed)?
+                        .is_some()
+                    {
+                        let facts = RouteFacts {
+                            method: call.method.clone(),
+                            path: call.path.clone(),
+                            query: call.query.clone(),
+                        };
+                        return self
+                            .run_process(
+                                &inst,
+                                call.cred,
+                                InvokeKind::Route,
+                                &route.function,
+                                input,
+                                Some(facts),
+                            )
+                            .await
+                            .map_err(RouteError::Failed);
+                    }
                     self.run_guest(&inst, call.cred, &route.function, input)
                         .await
                         .map_err(RouteError::Failed)
@@ -305,6 +409,18 @@ impl Guard for Surfaces {
 #[async_trait]
 impl Dispatcher for Surfaces {
     async fn call_guest(&self, call: GuestCall) -> Result<ToolResult, String> {
+        if self.process_of(call.install.id).await?.is_some() {
+            return self
+                .run_process(
+                    &call.install,
+                    call.cred,
+                    InvokeKind::Tool,
+                    &call.function,
+                    call.input,
+                    None,
+                )
+                .await;
+        }
         self.run_guest(&call.install, call.cred, &call.function, call.input)
             .await
     }

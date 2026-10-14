@@ -39,7 +39,7 @@ pub use pins::{
     DEFAULT_EGRESS_PIN_PATH, DEFAULT_EGRESS_REPOSITORY, DEFAULT_PINS_PATH, EgressPin, ImagePin,
     ImagePins, PinError,
 };
-pub use podman::{PodmanLauncher, podman_run_args};
+pub use podman::{PodmanLauncher, is_no_such_container, podman_run_args};
 pub use record::{MemoryStore, RunRecord, RunStore, StoreError, StoredRun};
 pub use spec::{
     DEFAULT_IMAGE_REPOSITORY, Event, EventStream, Limits, NetworkMode, PROXY_PORT, RunResult,

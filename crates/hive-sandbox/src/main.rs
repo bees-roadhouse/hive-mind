@@ -284,11 +284,63 @@ async fn run() -> anyhow::Result<()> {
         // The tool surface and the app routes, over this store and this host.
         // One `Surfaces` is all three of hive-mcp's collaborators, so tools/list
         // and tools/call cannot be given different answers by construction.
-        let surfaces = Arc::new(hive_surfaces::Surfaces::new(
-            st.clone(),
-            h.clone(),
-            cat.clone(),
-        ));
+        let surfaces = hive_surfaces::Surfaces::new(st.clone(), h.clone(), cat.clone());
+        // Process apps (D53) need the daemon's unix socket to mount into
+        // their containers (invariant 13) and a unix host for the app socket.
+        // Without either there is no runtime, and a process install's call
+        // says so rather than failing inside a container that never started.
+        #[cfg(unix)]
+        let surfaces = match args.unix_socket.as_deref().filter(|p| !p.is_empty()) {
+            Some(sock) => {
+                let runtime = Arc::new(hive_apps::Apps::new(
+                    st.clone(),
+                    Arc::new(hive_apps::PodmanAppLauncher {
+                        binary: args.podman.clone(),
+                        extra_args: vec![],
+                    }),
+                    Arc::new(hive_apps::UnixTransport),
+                    Arc::new(hive_apps::ManifestImages::new(st.clone())),
+                    hive_apps::AppsConfig {
+                        socket_root: format!(
+                            "{}/apps",
+                            std::path::Path::new(sock)
+                                .parent()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "/run/hive-sandbox".to_string())
+                        ),
+                        daemon_socket: sock.to_string(),
+                        ..hive_apps::AppsConfig::default()
+                    },
+                ));
+                // Every container the last daemon supervised died with it.
+                let revoked = runtime
+                    .revoke_stale_credentials()
+                    .await
+                    .context("revoke stale install credentials")?;
+                if revoked > 0 {
+                    tracing::info!(revoked, "install credentials of a previous daemon revoked");
+                }
+                let sweeper = runtime.clone();
+                let c = cancel.clone();
+                tasks.push(tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                    loop {
+                        tokio::select! {
+                            _ = c.cancelled() => return,
+                            _ = tick.tick() => {
+                                if let Err(e) = sweeper.sweep_idle().await {
+                                    tracing::warn!(err = %e, "app idle sweep");
+                                }
+                            }
+                        }
+                    }
+                }));
+                tracing::info!("app runtime ready");
+                surfaces.with_apps(runtime)
+            }
+            None => surfaces,
+        };
+        let surfaces = Arc::new(surfaces);
         mcp = Some(Arc::new(hive_mcp::Server::new(
             surfaces.clone(),
             surfaces.clone(),

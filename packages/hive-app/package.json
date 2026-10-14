@@ -1,0 +1,18 @@
+{
+  "name": "@hive/app",
+  "version": "0.1.0",
+  "description": "The SDK a hive-mind process app is written against (D53 §2): defineApp serves the runtime's protocol on the app socket; hive.* reaches the host over the daemon's socket with the install credential.",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.0",
+    "typescript": "5.9.3"
+  }
+}

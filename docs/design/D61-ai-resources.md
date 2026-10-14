@@ -106,14 +106,27 @@ front: a thing a host app can list, show a person, and be granted from.
 
 ### 4. Where nectar's pieces land (D56 §1)
 
-nectar's `infer` becomes one or more D42 endpoints behind the seam:
-`embedding:mxbai-embed-large` (1024 dimensions), `embedding:clip`,
-`embedding:clap` (which adds a multimodal `embed` to D42, the capability
-D56 named), `reading:rerank` (a cross-encoder answering `rerank`, the
-other capability D56 named), and `voice:whisper` for `transcribe`. nectar
-declares them in its manifest and the household grants them; its
-recommendation worker calls `ai.invoke` for embeddings the way it called
-its own code.
+nectar's `infer` becomes one or more D42 endpoints behind the seam, and
+the resources are **the configured models, never fixed names**. nectar's
+text embedder is selected by configuration (`[embedding] local_model`,
+one of `arctic-embed-m`, `bge-small`, `minilm-l6`, `mxbai-large`), the
+default being `snowflake-arctic-embed-m-v1.5` at 768 dimensions because
+`infer/examples/embed_eval.rs` chose it on the real library (nectar
+#226), and every vector records the model key it was made with
+(`local:<id>`). So the resource nectar declares is
+`embedding:arctic-embed-m` by default and whichever model is configured
+otherwise, with the dimension and model name in the binding (§1);
+changing the configured model is a new binding and a re-embed of the
+library, which is why the binding is recorded and never silently
+followed. Beside it: `embedding:clip` and `embedding:clap` (which add a
+multimodal `embed` to D42, the capability D56 named), `reading:rerank` (a
+cross-encoder answering `rerank`, the other capability D56 named) and
+`voice:whisper` for `transcribe`. nectar declares them in its manifest
+and the household grants them; its recommendation worker calls
+`ai.invoke` for embeddings the way it called its own code.
+
+*Corrected 2026-10-14 by Forage: the first text named mxbai-embed-large
+as nectar's embedder; it is one of the alternatives.*
 
 ## Acceptance scenarios, checked in before the code
 

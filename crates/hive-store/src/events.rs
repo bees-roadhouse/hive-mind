@@ -443,7 +443,10 @@ pub async fn head(db: &Connection) -> Result<Cursor> {
 /// host clock in the schema's unit, read through the file so a replica's
 /// tailer and the primary's agree on what "now" means.
 pub async fn now(db: &Connection) -> Result<DateTime<Utc>> {
-    let us: i64 = query(&format!("SELECT {}", hive_db::NOW_SQL))
+    // `Engine::now_sql` is the expression a column default uses on each
+    // engine: SQLite's yields the schema's integer microseconds, Postgres's
+    // a timestamptz, and the typed read accepts either.
+    let db_now: DateTime<Utc> = query(&format!("SELECT {}", db.engine().now_sql()))
         .fetch_scalar(db)
         .await
         .map_err(|e| StoreError::db("db now", e))?;
@@ -451,7 +454,6 @@ pub async fn now(db: &Connection) -> Result<DateTime<Utc>> {
     // The newer of the two is the honest "now", so a row written a moment ago
     // with a finer clock is never ahead of the watermark derived here.
     let host = hive_db::now();
-    let db_now = hive_db::from_micros(us).unwrap_or(host);
     Ok(if host > db_now { host } else { db_now })
 }
 
@@ -471,19 +473,22 @@ pub async fn now(db: &Connection) -> Result<DateTime<Utc>> {
 /// makes that question never arise: no writer produces a collection-subject
 /// event, and the one guard is at the INSERT rather than at every read of the
 /// feed.
-fn visible_expr() -> String {
-    let reason = predicate::reason(&Args {
-        subject_kind: "e.subject_kind",
-        subject_id: "e.subject_id",
-        subject_name: "e.subject_name",
-        principal_kind: "?1",
-        principal_id: "?2",
-        actor_id: "?3",
-        access: "'read'",
-        now: "?4",
-        acting_install: "NULL",
-    });
-    let acting = predicate::acting_kind("?3", "?1", "?2");
+fn visible_expr(engine: hive_db::Engine) -> String {
+    let reason = predicate::reason(
+        engine,
+        &Args {
+            subject_kind: "e.subject_kind",
+            subject_id: "e.subject_id",
+            subject_name: "e.subject_name",
+            principal_kind: "?1",
+            principal_id: "?2",
+            actor_id: "?3",
+            access: "'read'",
+            now: "?4",
+            acting_install: "NULL",
+        },
+    );
+    let acting = predicate::acting_kind(engine, "?3", "?1", "?2");
     format!(
         "CASE WHEN e.subject_kind IS NULL OR e.subject_id IS NULL
               THEN CASE WHEN e.owner_kind = ?1 AND e.owner_id = ?2 AND {acting} IS NOT NULL
@@ -513,7 +518,7 @@ impl Guard {
         since: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<Event>> {
-        let visible = visible_expr();
+        let visible = visible_expr(db.engine());
         let rows = query(&format!(
             "SELECT {EVENT_COLUMNS}
                FROM events e
@@ -557,11 +562,21 @@ impl Guard {
             return Ok(Vec::new());
         }
         let ids: Vec<i64> = events.iter().map(|e| e.id).collect();
-        let visible = visible_expr();
+        let visible = visible_expr(db.engine());
+        // A JSON array of ids unpacked by the engine (`chat.rs` has the
+        // twin); the elements are text on Postgres and the id is bigint.
+        let unpacked = match db.engine() {
+            hive_db::Engine::Sqlite => "json_each(?5) AS c",
+            hive_db::Engine::Postgres => "jsonb_array_elements_text(?5::jsonb) AS c(value)",
+        };
+        let id = match db.engine() {
+            hive_db::Engine::Sqlite => "c.value",
+            hive_db::Engine::Postgres => "(c.value)::bigint",
+        };
         let allowed: Vec<i64> = query(&format!(
             "SELECT e.id
-               FROM json_each(?5) AS c
-               JOIN events e ON e.id = c.value
+               FROM {unpacked}
+               JOIN events e ON e.id = {id}
               WHERE {visible} IS NOT NULL"
         ))
         .bind(cred.principal_kind.as_str())

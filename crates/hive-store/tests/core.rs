@@ -123,17 +123,10 @@ async fn bootstrap_creates_a_core_install_per_principal() {
             .await
             .unwrap();
         let alias = attach_owner(&conn, owner).await.unwrap();
-        let tables: Vec<String> = query(&format!(
-            "SELECT name FROM {}.sqlite_master WHERE type = 'table' AND name GLOB ?1 ORDER BY name",
-            hive_db::quote_ident(&alias)
-        ))
-        .bind(format!("{schema}__*"))
-        .fetch_scalars(&conn)
-        .await
-        .unwrap();
+        let tables = common::collection_tables(&conn, &alias, &schema).await;
         let want: Vec<String> = ["contacts", "decisions", "entries", "lists", "tasks"]
             .iter()
-            .map(|c| format!("{schema}__{c}"))
+            .map(|c| c.to_string())
             .collect();
         assert_eq!(tables, want, "core collections of {owner:?}");
     }

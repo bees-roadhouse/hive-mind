@@ -27,6 +27,8 @@
 //! subject through the `subject_owners` view, so no caller can supply one
 //! (invariant 11).
 
+use hive_db::Engine;
+
 /// The arguments, as SQL expressions. A point check passes placeholders; a set
 /// read passes column references for the subject and placeholders for the rest.
 pub(crate) struct Args<'a> {
@@ -46,6 +48,22 @@ pub(crate) struct Args<'a> {
     pub acting_install: &'a str,
 }
 
+/// An argument expression with the type the predicate reads it as, where the
+/// engine needs telling. Postgres infers a parameter's type from its first
+/// use, and the first use of every argument here is `IS NULL` or a null-safe
+/// comparison, which fixes nothing; the statement then fails with "could not
+/// determine data type of parameter". A cast at the point of use says what
+/// the argument is, and is as harmless on a column reference or a literal as
+/// on a placeholder. SQLite has no parameter types and no `::` syntax, and
+/// gets the expression as written. Found by the first run of this suite
+/// against Postgres.
+fn typed(engine: Engine, expr: &str, ty: &str) -> String {
+    match engine {
+        Engine::Sqlite => expr.to_string(),
+        Engine::Postgres => format!("({expr})::{ty}"),
+    }
+}
+
 /// Credential coherence (D17.4). The credential pins author_actor AND owner
 /// principal, and the two have to agree or the pair proves nothing. Evaluates
 /// to the acting actor's kind, or NULL when the pair does not hold up.
@@ -57,14 +75,17 @@ pub(crate) struct Args<'a> {
 /// The same expression is inlined in two triggers in migration one (grants
 /// and install authorities), because a trigger cannot call into the binary.
 /// Three copies, on the record (D38 §2).
-pub(crate) fn acting_kind(actor: &str, pk: &str, pid: &str) -> String {
+pub(crate) fn acting_kind(engine: Engine, actor: &str, pk: &str, pid: &str) -> String {
+    let actor = &typed(engine, actor, "uuid");
+    let pk = &typed(engine, pk, "text");
+    let pid = &typed(engine, pid, "uuid");
     format!(
         "(CASE
             WHEN {actor} IS NULL OR {pk} IS NULL OR {pid} IS NULL THEN NULL
             WHEN (SELECT disabled_at FROM actors WHERE id = {actor}) IS NOT NULL THEN NULL
             WHEN (SELECT kind FROM actors WHERE id = {actor}) = 'ai' THEN
-                 CASE WHEN (SELECT principal_kind FROM actors WHERE id = {actor}) IS {pk}
-                       AND (SELECT principal_id FROM actors WHERE id = {actor}) IS {pid}
+                 CASE WHEN (SELECT principal_kind FROM actors WHERE id = {actor}) IS NOT DISTINCT FROM {pk}
+                       AND (SELECT principal_id FROM actors WHERE id = {actor}) IS NOT DISTINCT FROM {pid}
                       THEN 'ai' END
             WHEN (SELECT kind FROM actors WHERE id = {actor}) = 'human' THEN
                  CASE WHEN ({pk} = 'user' AND {pid} = {actor})
@@ -89,23 +110,26 @@ fn access_satisfies(held: &str, required: &str) -> String {
 /// answer across a clock tick, and for 'install_grant' is the narrower of the
 /// two grants ... the one a person can revoke to shut one app out without
 /// touching their own access.
-pub(crate) fn decision(a: &Args<'_>) -> String {
-    let Args {
-        subject_kind: sk,
-        subject_id: sid,
-        subject_name: sname,
-        principal_kind: pk,
-        principal_id: pid,
-        actor_id: actor,
-        access,
-        now,
-        acting_install: acting,
-    } = a;
-    let a_kind = acting_kind(actor, pk, pid);
+pub(crate) fn decision(engine: Engine, a: &Args<'_>) -> String {
+    let sk = &typed(engine, a.subject_kind, "text");
+    let sid = &typed(engine, a.subject_id, "uuid");
+    let sname = &typed(engine, a.subject_name, "text");
+    let pk = &typed(engine, a.principal_kind, "text");
+    let pid = &typed(engine, a.principal_id, "uuid");
+    let actor = &typed(engine, a.actor_id, "uuid");
+    let access = &typed(engine, a.access, "text");
+    let now = &typed(engine, a.now, "timestamptz");
+    let acting = &typed(engine, a.acting_install, "uuid");
+    let a_kind = acting_kind(engine, actor, pk, pid);
     let satisfies = access_satisfies("g.access", access);
     let live = format!("g.revoked_at IS NULL AND (g.expires_at IS NULL OR g.expires_at > {now})");
-    let same_subject =
-        format!("g.subject_kind = {sk} AND g.subject_id = {sid} AND g.subject_name IS {sname}");
+    // `IS NOT DISTINCT FROM` rather than SQLite's bare `IS`: both engines
+    // read it as null-safe equality, where Postgres reads `x IS $4` as a
+    // syntax error (`IS` there takes only NULL, TRUE, FALSE or DISTINCT
+    // FROM). Found by the first run of this suite against Postgres.
+    let same_subject = format!(
+        "g.subject_kind = {sk} AND g.subject_id = {sid} AND g.subject_name IS NOT DISTINCT FROM {sname}"
+    );
     format!(
         "SELECT
             CASE WHEN p_reason IS NULL THEN NULL
@@ -172,7 +196,7 @@ pub(crate) fn decision(a: &Args<'_>) -> String {
                       LIMIT 1) AS g3,
                     (SELECT g.id FROM grants g
                       WHERE g.subject_kind = 'collection' AND g.subject_id = {sid}
-                        AND g.subject_name IS {sname}
+                        AND g.subject_name IS NOT DISTINCT FROM {sname}
                         AND g.target_kind = 'install' AND g.target_install_id = {acting}
                         AND {satisfies} AND {live}
                       LIMIT 1) AS g4
@@ -189,8 +213,8 @@ pub(crate) fn decision(a: &Args<'_>) -> String {
 /// check. A set read that uses this still owes the D18.2 audit for every row
 /// whose reason is 'override'; `Guard` is the only thing that may call it and
 /// discharges that obligation on every path.
-pub(crate) fn reason(a: &Args<'_>) -> String {
-    format!("(SELECT reason FROM ({}))", decision(a))
+pub(crate) fn reason(engine: Engine, a: &Args<'_>) -> String {
+    format!("(SELECT reason FROM ({}))", decision(engine, a))
 }
 
 /// Whether a live, non-override, call-bearing grant on `kind` (tool or route)
@@ -203,7 +227,19 @@ pub(crate) fn reason(a: &Args<'_>) -> String {
 /// read-only by CHECK, so a break-glass on one tool used to silently revoke
 /// call access to every tool on that install, at the moment an admin needed it
 /// most.
-pub(crate) fn has_allowlist(kind: &str, install: &str, pk: &str, pid: &str, now: &str) -> String {
+pub(crate) fn has_allowlist(
+    engine: Engine,
+    kind: &str,
+    install: &str,
+    pk: &str,
+    pid: &str,
+    now: &str,
+) -> String {
+    let kind = &typed(engine, kind, "text");
+    let install = &typed(engine, install, "uuid");
+    let pk = &typed(engine, pk, "text");
+    let pid = &typed(engine, pid, "uuid");
+    let now = &typed(engine, now, "timestamptz");
     format!(
         "SELECT EXISTS (
             SELECT 1 FROM grants g
@@ -235,25 +271,85 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = hive_db::Db::open(dir.path().join("p.db")).await.unwrap();
         hive_schema::migrate(&db).await.unwrap();
+        parses_on(&db).await;
+    }
+
+    /// The same three texts against a real Postgres, where a parameter's
+    /// type has to be inferable and `IS NOT DISTINCT FROM` has to be the
+    /// spelling: the two things the first Postgres run of the store suite
+    /// found. Skips aloud without a server; the `postgres` CI job requires
+    /// one.
+    #[tokio::test]
+    async fn the_predicate_parses_on_postgres() {
+        let Ok(url) = std::env::var(hive_db::TEST_URL_ENV) else {
+            if std::env::var(hive_db::TEST_REQUIRE_ENV).is_ok_and(|v| v == "1") {
+                panic!(
+                    "{} is unset and {}=1",
+                    hive_db::TEST_URL_ENV,
+                    hive_db::TEST_REQUIRE_ENV
+                );
+            }
+            println!(
+                "SKIPPED: the_predicate_parses_on_postgres no {}",
+                hive_db::TEST_URL_ENV
+            );
+            return;
+        };
+        // A schema of its own, first on the search_path, the way hive-testdb
+        // isolates a test; this crate cannot depend on hive-testdb without a
+        // cycle, so the two lines it needs are here.
+        let schema = format!(
+            "t_predicate_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let admin = hive_db::Db::connect(&url).await.unwrap();
+        hive_db::Db::batch(
+            &admin.conn().await.unwrap(),
+            &format!("CREATE SCHEMA {schema}"),
+        )
+        .await
+        .unwrap();
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let db = hive_db::Db::connect(&format!(
+            "{url}{sep}options=-c%20search_path%3D{schema}%2Cpublic"
+        ))
+        .await
+        .unwrap();
+        hive_schema::migrate(&db).await.unwrap();
+        parses_on(&db).await;
+        db.close();
+        hive_db::Db::batch(
+            &admin.conn().await.unwrap(),
+            &format!("DROP SCHEMA {schema} CASCADE"),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn parses_on(db: &hive_db::Db) {
+        let engine = db.engine();
         let c = db.conn().await.unwrap();
-        let point = decision(&Args {
-            subject_kind: "?1",
-            subject_id: "?2",
-            subject_name: "?3",
-            principal_kind: "?4",
-            principal_id: "?5",
-            actor_id: "?6",
-            access: "?7",
-            now: "?8",
-            acting_install: "?9",
-        });
+        let point = decision(
+            engine,
+            &Args {
+                subject_kind: "?1",
+                subject_id: "?2",
+                subject_name: "?3",
+                principal_kind: "?4",
+                principal_id: "?5",
+                actor_id: "?6",
+                access: "?7",
+                now: "?8",
+                acting_install: "?9",
+            },
+        );
         let row = hive_db::query(&point)
             .bind("entity")
-            .bind("nobody")
+            .bind(uuid::Uuid::nil())
             .bind(None::<String>)
             .bind("user")
-            .bind("nobody")
-            .bind("nobody")
+            .bind(uuid::Uuid::nil())
+            .bind(uuid::Uuid::nil())
             .bind("read")
             .bind(0i64)
             .bind(None::<String>)
@@ -263,33 +359,36 @@ mod tests {
         assert_eq!(row.get::<Option<String>>("reason"), None);
         let set = format!(
             "SELECT e.id FROM entities e WHERE {} IS NOT NULL",
-            reason(&Args {
-                subject_kind: "'entity'",
-                subject_id: "e.id",
-                subject_name: "NULL",
-                principal_kind: "?1",
-                principal_id: "?2",
-                actor_id: "?3",
-                access: "?4",
-                now: "?5",
-                acting_install: "NULL",
-            })
+            reason(
+                engine,
+                &Args {
+                    subject_kind: "'entity'",
+                    subject_id: "e.id",
+                    subject_name: "NULL",
+                    principal_kind: "?1",
+                    principal_id: "?2",
+                    actor_id: "?3",
+                    access: "?4",
+                    now: "?5",
+                    acting_install: "NULL",
+                }
+            )
         );
         let rows = hive_db::query(&set)
             .bind("user")
-            .bind("nobody")
-            .bind("nobody")
+            .bind(uuid::Uuid::nil())
+            .bind(uuid::Uuid::nil())
             .bind("read")
             .bind(0i64)
             .fetch_all(&c)
             .await
             .expect("set read parses");
         assert!(rows.is_empty());
-        let probe = has_allowlist("'tool'", "?1", "?2", "?3", "?4");
+        let probe = has_allowlist(engine, "'tool'", "?1", "?2", "?3", "?4");
         let has: bool = hive_db::query(&probe)
-            .bind("nobody")
+            .bind(uuid::Uuid::nil())
             .bind("user")
-            .bind("nobody")
+            .bind(uuid::Uuid::nil())
             .bind(0i64)
             .fetch_scalar(&c)
             .await

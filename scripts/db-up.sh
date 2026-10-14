@@ -84,6 +84,12 @@ done
 # because an org role cannot create it; the same here, so every database a
 # test creates inherits it.
 podman exec "$name" psql -U "$user" -d template1 -tAc 'create extension if not exists vector' >/dev/null 2>&1 || true
+# ... and in the test database itself, which initdb created from template1
+# BEFORE the line above ran, so it did not inherit the extension. Found by
+# the first vector-index test against Postgres: `type "vector" does not
+# exist`. The extension's types land in `public`, which the test fixture
+# keeps on every search_path for exactly this.
+podman exec "$name" psql -U "$user" -d "$db" -tAc 'create extension if not exists vector' >/dev/null 2>&1 || true
 
 url="postgres://${user}:${password}@127.0.0.1:${port}/${db}?sslmode=disable"
 if [ "$quiet" -eq 1 ]; then

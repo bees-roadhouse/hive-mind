@@ -70,36 +70,18 @@ fn bare_owner() -> Owner {
     Owner::user(Uuid::from_u128(0xB0B))
 }
 
-/// Whether any table under the install's prefix exists in the OWNER's file
-/// (D39): the engine has no schemas, so "the schema exists" means "its
-/// tables do".
+/// Whether anything was provisioned for the install's schema, on either
+/// engine (`common::schema_provisioned` says how each is asked).
 async fn schema_exists(w: &World, owner: Owner, schema: &str) -> bool {
     let conn = w.conn().await;
     let alias = attach_owner(&conn, owner).await.unwrap();
-    let n: i64 = query(&format!(
-        "SELECT count(*) FROM {}.sqlite_master
-          WHERE type = 'table' AND substr(name, 1, length(?1)) = ?1",
-        hive_db::quote_ident(&alias)
-    ))
-    .bind(format!("{schema}__"))
-    .fetch_scalar(&conn)
-    .await
-    .unwrap();
-    n > 0
+    common::schema_provisioned(&conn, &alias, schema).await
 }
 
 async fn table_exists(w: &World, owner: Owner, schema: &str, table: &str) -> bool {
     let conn = w.conn().await;
     let alias = attach_owner(&conn, owner).await.unwrap();
-    let n: i64 = query(&format!(
-        "SELECT count(*) FROM {}.sqlite_master WHERE type = 'table' AND name = ?1",
-        hive_db::quote_ident(&alias)
-    ))
-    .bind(format!("{schema}__{table}"))
-    .fetch_scalar(&conn)
-    .await
-    .unwrap();
-    n > 0
+    common::collection_exists(&conn, &alias, schema, table).await
 }
 
 /// Drops the collection tables a test provisioned. The file goes with the
@@ -586,14 +568,7 @@ async fn apply(w: &World, plan: &SchemaPlan) -> Result<(), StoreError> {
 async fn column_exists(w: &World, schema: &str, table: &str, col: &str) -> bool {
     let conn = w.conn().await;
     let alias = attach_owner(&conn, bare_owner()).await.unwrap();
-    let n: i64 = query("SELECT count(*) FROM pragma_table_info(?1, ?2) WHERE name = ?3")
-        .bind(format!("{schema}__{table}"))
-        .bind(&alias)
-        .bind(col)
-        .fetch_scalar(&conn)
-        .await
-        .unwrap();
-    n > 0
+    common::collection_column_exists(&conn, &alias, schema, table, col).await
 }
 
 /// The names of everything an index provisions for a collection table: the
@@ -602,19 +577,7 @@ async fn column_exists(w: &World, schema: &str, table: &str, col: &str) -> bool 
 async fn index_names(w: &World, schema: &str, table: &str) -> Vec<String> {
     let conn = w.conn().await;
     let alias = attach_owner(&conn, bare_owner()).await.unwrap();
-    let base = format!("{schema}__{table}");
-    query(&format!(
-        "SELECT name FROM {}.sqlite_master
-          WHERE (type = 'index' AND tbl_name = ?1)
-             OR (type IN ('table', 'trigger') AND name GLOB ?2)
-          ORDER BY name",
-        hive_db::quote_ident(&alias)
-    ))
-    .bind(&base)
-    .bind(format!("{base}_[0-9]*_[fv]*"))
-    .fetch_scalars(&conn)
-    .await
-    .unwrap()
+    common::collection_index_names(&conn, &alias, schema, table).await
 }
 
 /// Ported from `TestApplySchemaPlanProvisionsCollections`.
@@ -722,7 +685,16 @@ async fn updated_at_is_maintained_without_the_writer() {
     apply(&w, &plan).await.expect("apply");
     let conn = w.conn().await;
     let alias = attach_owner(&conn, bare_owner()).await.unwrap();
-    let table = owner_table(&alias, &format!("{}__entries", plan.schema));
+    // Where the table is differs by engine (hive-store's `appschema` doc);
+    // this test writes to it by hand, so it names it the way each engine does.
+    let table = match conn.engine() {
+        hive_db::Engine::Sqlite => owner_table(&alias, &format!("{}__entries", plan.schema)),
+        hive_db::Engine::Postgres => format!(
+            "{}.{}",
+            hive_db::quote_ident(&plan.schema),
+            hive_db::quote_ident("entries")
+        ),
+    };
     let row = query(&format!(
         "INSERT INTO {table} (id, doc) VALUES (?1, '{{\"a\":1}}') RETURNING id, created_at, updated_at"
     ))
@@ -772,34 +744,22 @@ async fn touch_trigger_lives_on_the_collection_table() {
     let w = World::bare("touch_trigger_on_table").await;
     let plan = plan_for(&unique_app(), vec![coll("entries", &[])]);
     apply(&w, &plan).await.expect("apply");
-    let table = format!("{}__entries", plan.schema);
-    let conn = w.conn().await;
-    let alias = attach_owner(&conn, bare_owner()).await.unwrap();
-    let master = format!("{}.sqlite_master", hive_db::quote_ident(&alias));
-    let triggers: Vec<String> = query(&format!(
-        "SELECT name FROM {master} WHERE type = 'trigger' AND tbl_name = ?1"
-    ))
-    .bind(&table)
-    .fetch_scalars(&conn)
-    .await
-    .unwrap();
+    let names = index_names(&w, &plan.schema, "entries").await;
     assert!(
-        triggers.iter().any(|t| t.ends_with("_touch")),
-        "no touch trigger on {table}: {triggers:?}"
+        names.iter().any(|t| t.ends_with("_touch")),
+        "no touch trigger on {}.entries: {names:?}",
+        plan.schema
     );
-    drop(conn);
     drop_plan(&w, bare_owner(), &plan).await;
-    let conn = w.conn().await;
-    let alias = attach_owner(&conn, bare_owner()).await.unwrap();
-    let left: i64 = query(&format!(
-        "SELECT count(*) FROM {}.sqlite_master WHERE tbl_name = ?1",
-        hive_db::quote_ident(&alias)
-    ))
-    .bind(&table)
-    .fetch_scalar(&conn)
-    .await
-    .unwrap();
-    assert_eq!(left, 0, "dropping the table left {left} objects behind");
+    assert!(
+        !table_exists(&w, bare_owner(), &plan.schema, "entries").await,
+        "dropping the plan left the entries table behind"
+    );
+    let left = index_names(&w, &plan.schema, "entries").await;
+    assert!(
+        left.is_empty(),
+        "dropping the table left objects behind: {left:?}"
+    );
 }
 
 /// Ported from `TestApplySchemaPlanIsIdempotent` (D3.3).
@@ -856,13 +816,27 @@ async fn vector_index_provisions_a_vec_table() {
     );
     apply(&w, &plan).await.expect("apply");
     let names = index_names(&w, &plan.schema, "entries").await;
-    let vec_table = format!("{}__entries_0_vec", plan.schema);
-    assert!(names.contains(&vec_table), "no vec0 table: {names:?}");
-    for suffix in ["_ai", "_au", "_ad"] {
-        assert!(
-            names.contains(&format!("{vec_table}{suffix}")),
-            "no {suffix} trigger: {names:?}"
-        );
+    match w.db().engine() {
+        hive_db::Engine::Sqlite => {
+            let vec_table = format!("{}__entries_0_vec", plan.schema);
+            assert!(names.contains(&vec_table), "no vec0 table: {names:?}");
+            for suffix in ["_ai", "_au", "_ad"] {
+                assert!(
+                    names.contains(&format!("{vec_table}{suffix}")),
+                    "no {suffix} trigger: {names:?}"
+                );
+            }
+        }
+        // The same index on Postgres is a column on the collection's table
+        // kept by one trigger, with an HNSW index over it (D43 §3).
+        hive_db::Engine::Postgres => {
+            for want in ["vec_0", "entries_vec_0_mirror", "entries_vector_0_idx"] {
+                assert!(
+                    names.iter().any(|n| n == want),
+                    "no {want} for the vector index: {names:?}"
+                );
+            }
+        }
     }
     drop_plan(&w, bare_owner(), &plan).await;
 }
@@ -907,13 +881,8 @@ async fn apply_schema_plan_refuses_unsafe_identifiers() {
         );
         tx.rollback().await.unwrap();
     }
-    let actors: i64 =
-        query("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'actors'")
-            .fetch_scalar(&*w.conn().await)
-            .await
-            .unwrap();
-    assert_eq!(
-        actors, 1,
+    assert!(
+        common::platform_table_exists(&*w.conn().await, "actors").await,
         "a rejected identifier still executed; actors is gone"
     );
 }

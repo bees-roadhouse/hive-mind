@@ -303,8 +303,8 @@ impl Store {
 /// without sleeping. Hidden and named for what it is: nothing in the daemon
 /// calls it, and `Guard` remains the only auditing entry point.
 #[doc(hidden)]
-pub fn __predicate_sql_for_tests() -> String {
-    grants::point_sql()
+pub fn __predicate_sql_for_tests(engine: hive_db::Engine) -> String {
+    grants::point_sql(engine)
 }
 
 /// Commits a transaction, naming the unit of work in the error.

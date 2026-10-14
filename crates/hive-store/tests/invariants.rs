@@ -7,6 +7,11 @@
 //! A test that cannot fail is worse than none, so the owner-reads-own-entity
 //! case is here too: it is what proves the predicate answers at all.
 
+// Only for the catalogue readers at the bottom of `common`, which ask the
+// engine what a migration left behind; nothing of the store's behaviour comes
+// in with them, so the raw-SQL copy this file keeps on purpose stays raw.
+mod common;
+
 use hive_db::{Conn, Connection, Value, query};
 use hive_testdb::TestDb;
 use uuid::Uuid;
@@ -207,19 +212,21 @@ impl World {
         access: &str,
         acting: Option<Uuid>,
     ) -> Option<String> {
-        let row = query(&hive_store::__predicate_sql_for_tests())
-            .bind(s.kind)
-            .bind(s.id)
-            .bind(name)
-            .bind(c.principal_kind)
-            .bind(c.principal)
-            .bind(c.actor)
-            .bind(access)
-            .bind(now())
-            .bind(acting)
-            .fetch_one(&*self.conn().await)
-            .await
-            .expect("access_decision");
+        let row = query(&hive_store::__predicate_sql_for_tests(
+            self.db.db().engine(),
+        ))
+        .bind(s.kind)
+        .bind(s.id)
+        .bind(name)
+        .bind(c.principal_kind)
+        .bind(c.principal)
+        .bind(c.actor)
+        .bind(access)
+        .bind(now())
+        .bind(acting)
+        .fetch_one(&*self.conn().await)
+        .await
+        .expect("access_decision");
         row.get("reason")
     }
 
@@ -293,19 +300,21 @@ impl World {
     /// from the subject rather than taking one (invariant 11): there is no
     /// argument here through which a caller could supply the answer.
     async fn decision(&self, c: Cred, s: Subject, access: &str) -> Option<String> {
-        let row = query(&hive_store::__predicate_sql_for_tests())
-            .bind(s.kind)
-            .bind(s.id)
-            .bind(None::<String>)
-            .bind(c.principal_kind)
-            .bind(c.principal)
-            .bind(c.actor)
-            .bind(access)
-            .bind(now())
-            .bind(None::<Uuid>)
-            .fetch_one(&*self.conn().await)
-            .await
-            .expect("access_decision");
+        let row = query(&hive_store::__predicate_sql_for_tests(
+            self.db.db().engine(),
+        ))
+        .bind(s.kind)
+        .bind(s.id)
+        .bind(None::<String>)
+        .bind(c.principal_kind)
+        .bind(c.principal)
+        .bind(c.actor)
+        .bind(access)
+        .bind(now())
+        .bind(None::<Uuid>)
+        .fetch_one(&*self.conn().await)
+        .await
+        .expect("access_decision");
         row.get("reason")
     }
 }
@@ -424,16 +433,8 @@ async fn conversation_is_a_grantable_subject() {
 #[tokio::test]
 async fn conversation_subject_has_no_name() {
     let w = World::new("conversation_subject_has_no_name").await;
-    let ddl: String =
-        query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'grants'")
-            .fetch_scalar(&*w.conn().await)
-            .await
-            .expect("read table definition");
-    let clause = ddl
-        .split("grants_named_subjects")
-        .nth(1)
-        .and_then(|rest| rest.split("CONSTRAINT").next())
-        .unwrap_or_default();
+    let clause =
+        common::check_constraint_text(&*w.conn().await, "grants", "grants_named_subjects").await;
     assert!(
         clause.contains("'conversation'"),
         "grants_named_subjects does not mention conversation; a named-subject drift would be silent: {clause}"

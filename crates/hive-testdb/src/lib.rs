@@ -115,7 +115,15 @@ impl TestDb {
         // so it needs no quoting and survives the URL unencoded.
         let sep = if url.contains('?') { '&' } else { '?' };
         let scoped =
-            format!("{url}{sep}options=-c%20search_path%3D{schema}&application_name={schema}");
+            // The private schema first, so every table the migration and
+            // the tests make lands there; `public` after it, because that is
+            // where `CREATE EXTENSION vector` put its types and a collection
+            // with a vector index names one (D43 §3). The engine resolves a
+            // bare type name along the search_path the same way it resolves
+            // a table, and a path without `public` makes `vector(1536)`
+            // "type does not exist" however many times the extension was
+            // created. Found by the first vector-index test on this engine.
+            format!("{url}{sep}options=-c%20search_path%3D{schema}%2Cpublic&application_name={schema}");
         let db = Db::connect(&scoped)
             .await
             .unwrap_or_else(|e| panic!("connect to schema {schema}: {e}"));
@@ -258,6 +266,36 @@ impl Drop for TestDb {
                             // reads as an error naming the schema rather than
                             // a test that never ends.
                             let _ = Db::batch(&c, "SET lock_timeout = '15s'").await;
+                            // An install's collections are a schema of their
+                            // own on this engine (D43 §2), beside the test's
+                            // schema rather than inside it, so CASCADE below
+                            // would not reach them. The install rows say
+                            // which schemas this test made; each goes before
+                            // the test's own. A test that never registered an
+                            // install has an empty list, and a database with
+                            // no installs table (a hive-schema test that
+                            // stopped before migration one) is simply no
+                            // rows, not an error worth a message.
+                            let installs: Vec<String> = hive_db::query(&format!(
+                                "SELECT schema_name FROM {}.installs",
+                                hive_db::quote_ident(&schema)
+                            ))
+                            .fetch_scalars(&c)
+                            .await
+                            .unwrap_or_default();
+                            for s in installs {
+                                if let Err(e) = Db::batch(
+                                    &c,
+                                    &format!(
+                                        "DROP SCHEMA IF EXISTS {} CASCADE",
+                                        hive_db::quote_ident(&s)
+                                    ),
+                                )
+                                .await
+                                {
+                                    eprintln!("testdb: drop install schema {s} of {schema}: {e}");
+                                }
+                            }
                             if let Err(e) = Db::batch(
                                 &c,
                                 &format!("DROP SCHEMA {} CASCADE", hive_db::quote_ident(&schema)),

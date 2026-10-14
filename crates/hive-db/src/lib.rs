@@ -818,6 +818,11 @@ impl FromSql for String {
             // column; a caller comparing ids as strings gets the same text
             // from either engine.
             Value::Uuid(u) => Ok(u.to_string()),
+            // Likewise a jsonb column: SQLite stores JSON as text and every
+            // reader of one parses the string itself, so Postgres's parsed
+            // value is handed back serialised rather than refused. Found by
+            // the store suite's first Postgres run on `options` and `body`.
+            Value::Json(j) => Ok(j.to_string()),
             other => Err(wrong("text", other)),
         }
     }

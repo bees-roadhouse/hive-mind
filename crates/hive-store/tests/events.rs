@@ -43,14 +43,60 @@ fn cursor_round_trip() {
 #[tokio::test]
 async fn tail_walks_the_cursor_index() {
     let w = World::new("tail_walks_the_cursor_index").await;
-    // The assertions below read SQLite's `EXPLAIN QUERY PLAN` text. Postgres
-    // has a plan of its own with different words and a different planner;
-    // asserting its index choice is a port of this test, not a translation,
-    // and until it is written the engine skips aloud rather than passing on
-    // a string it never produced.
+    // Postgres has a plan of its own with its own words. Fifty rows is a
+    // table its planner will happily scan whole, so the question asked here
+    // is the one the SQLite assertion asks too: CAN the cursor index serve
+    // the tail's shape? `enable_seqscan = off` for this session makes the
+    // planner answer that rather than "is it worth it at this size", which
+    // is its business at scale and not this test's.
     if w.db().engine() == hive_db::Engine::Postgres {
-        println!(
-            "SKIPPED: tail_walks_the_cursor_index reads SQLite's query plan; the Postgres plan assertion is not written"
+        let alice = w.human("alice").await;
+        let alice_cred = cred(alice, PrincipalKind::User, alice);
+        let mut events: Vec<Event> = (0..50)
+            .map(|_| Event::new("test.event", &alice_cred, b"{}".to_vec()))
+            .collect();
+        let conn = w.conn().await;
+        append_events(&conn, &mut events).await.expect("append");
+        // Statistics first, as the SQLite half runs ANALYZE: without them the
+        // planner costs every index alike and once picked the subject index
+        // plus a sort for the window read.
+        hive_db::Db::batch(&conn, "ANALYZE events").await.unwrap();
+        hive_db::Db::batch(&conn, "SET enable_seqscan = off")
+            .await
+            .unwrap();
+        let plan = |sql: &str| {
+            let conn = &conn;
+            let sql = format!("EXPLAIN (FORMAT TEXT) {sql}");
+            async move {
+                query(&sql)
+                    .fetch_all(conn)
+                    .await
+                    .expect("explain")
+                    .iter()
+                    .map(|r| r.get::<String>("QUERY PLAN"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            }
+        };
+        let composite = plan(
+            "SELECT id, created_at FROM events
+              WHERE created_at >= to_timestamp(1) AND (created_at, id) > (to_timestamp(1), 0)
+              ORDER BY created_at, id LIMIT 500",
+        )
+        .await;
+        assert!(
+            composite.contains("events_cursor_idx"),
+            "the composite tail does not walk the cursor index: {composite}"
+        );
+        let window = plan(
+            "SELECT id, created_at FROM events
+              WHERE created_at >= to_timestamp(1) AND (created_at, id) <= (to_timestamp(2), 0)
+              ORDER BY created_at, id LIMIT 500",
+        )
+        .await;
+        assert!(
+            window.contains("events_cursor_idx"),
+            "the late-commit sweep does not walk the cursor index: {window}"
         );
         return;
     }

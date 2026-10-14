@@ -233,6 +233,17 @@ jobs:
           done
           echo "postgres never answered from the runner" >&2; exit 1
 
+      # The image ships pgvector but a database does not have the extension
+      # until something creates it; on the cluster it is pre-installed in
+      # template1 (D43, infra notes) and scripts/db-up.sh does the same for
+      # the local container. Here the job is the operator. `WITH SCHEMA
+      # public` because the fixture's search_path ends in public and a test
+      # schema is dropped with its test (hive-testdb).
+      - name: the vector extension exists in the test database
+        run: |
+          PGPASSWORD=hive psql -h localhost -U hive -d hive_test -v ON_ERROR_STOP=1 \
+            -c 'CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public'
+
       - name: database tests, where a skip is a failure
         run: |
           log=$(mktemp)

@@ -66,12 +66,44 @@ async fn tables_in(conn: &hive_db::Connection, alias: &str, prefix: &str) -> Vec
 #[tokio::test]
 async fn provisioned_tables_land_in_the_owners_file() {
     let w = World::new("owner_files_land").await;
-    // Owner files are the SQLite tenant layer (D39); Postgres has no
-    // attachment and no file (D43 §5), so there is nothing here to assert
-    // against. Said out loud so the gate lists it rather than counts it green.
+    // On Postgres there is no file: an install's tables live in a schema
+    // named for the install, which carries the owner's digest, so two
+    // owners of one app are two schemas (D43 §2, hive-store's `appschema`
+    // doc). The assertion is the same property in that engine's terms, and
+    // `attach_owner` attaches nothing there.
     if w.db().engine() == hive_db::Engine::Postgres {
-        println!(
-            "SKIPPED: provisioned_tables_land_in_the_owners_file owner files exist only on the sqlite engine"
+        let alice = w.human("alice").await;
+        let bob = w.human("bob").await;
+        let schema_a = register(&w, "journal", user(alice), alice).await;
+        let schema_b = register(&w, "journal", user(bob), bob).await;
+        assert_ne!(schema_a, schema_b, "two owners of one app share a schema");
+        let conn = w.conn().await;
+        let a = attach_owner(&conn, user(alice))
+            .await
+            .expect("attach alice");
+        let b = attach_owner(&conn, user(bob)).await.expect("attach bob");
+        assert!(
+            conn.attached().is_empty(),
+            "something was attached on postgres"
+        );
+        assert_eq!(
+            common::collection_tables(&conn, &a, &schema_a).await,
+            vec!["entries".to_string()]
+        );
+        assert_eq!(
+            common::collection_tables(&conn, &b, &schema_b).await,
+            vec!["entries".to_string()]
+        );
+        let in_control_plane: i64 = query(
+            "SELECT count(*) FROM information_schema.tables
+              WHERE table_schema = current_schema() AND table_name LIKE 'app\\_%\\_\\_%'",
+        )
+        .fetch_scalar(&conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            in_control_plane, 0,
+            "collection tables in the control plane's schema"
         );
         return;
     }
@@ -118,12 +150,22 @@ async fn provisioned_tables_land_in_the_owners_file() {
 #[tokio::test]
 async fn attaching_an_owner_twice_is_one_attachment() {
     let w = World::new("owner_files_idempotent").await;
-    // Owner files are the SQLite tenant layer (D39); Postgres has no
-    // attachment and no file (D43 §5), so there is nothing here to assert
-    // against. Said out loud so the gate lists it rather than counts it green.
+    // On Postgres the alias is returned for the caller's sake and nothing is
+    // attached (hive-store's `owners` doc): the same calls, the same aliases,
+    // and an empty attachment list is the assertion.
     if w.db().engine() == hive_db::Engine::Postgres {
-        println!(
-            "SKIPPED: attaching_an_owner_twice_is_one_attachment owner files exist only on the sqlite engine"
+        let alice = w.human("alice").await;
+        let bob = w.human("bob").await;
+        let conn = w.conn().await;
+        let first = attach_owner(&conn, user(alice)).await.unwrap();
+        let again = attach_owner(&conn, user(alice)).await.unwrap();
+        assert_eq!(first, again);
+        let other = attach_owner(&conn, user(bob)).await.unwrap();
+        assert_ne!(first, other);
+        assert!(
+            conn.attached().is_empty(),
+            "an alias was attached on postgres: {:?}",
+            conn.attached()
         );
         return;
     }
@@ -147,12 +189,22 @@ async fn attaching_an_owner_twice_is_one_attachment() {
 #[tokio::test]
 async fn a_pooled_connection_returns_without_its_attachments() {
     let w = World::new("owner_files_detach_on_return").await;
-    // Owner files are the SQLite tenant layer (D39); Postgres has no
-    // attachment and no file (D43 §5), so there is nothing here to assert
-    // against. Said out loud so the gate lists it rather than counts it green.
+    // On Postgres nothing is attached to begin with, so the property to hold
+    // is that a checkout never carries an alias list at all.
     if w.db().engine() == hive_db::Engine::Postgres {
-        println!(
-            "SKIPPED: a_pooled_connection_returns_without_its_attachments owner files exist only on the sqlite engine"
+        let alice = w.human("alice").await;
+        {
+            let conn = w.conn().await;
+            attach_owner(&conn, user(alice)).await.unwrap();
+            assert!(
+                conn.attached().is_empty(),
+                "an alias was attached on postgres"
+            );
+        }
+        let conn = w.conn().await;
+        assert!(
+            conn.attached().is_empty(),
+            "the alias list survived the checkout"
         );
         return;
     }
@@ -186,12 +238,26 @@ async fn a_pooled_connection_returns_without_its_attachments() {
 #[tokio::test]
 async fn an_attach_inside_a_transaction_rolls_back_with_it() {
     let w = World::new("owner_files_rollback").await;
-    // Owner files are the SQLite tenant layer (D39); Postgres has no
-    // attachment and no file (D43 §5), so there is nothing here to assert
-    // against. Said out loud so the gate lists it rather than counts it green.
+    // On Postgres DDL is transactional outright, with no attachment to ride
+    // the transaction: a table created inside a rolled-back transaction is
+    // not there afterwards, which is the property this test exists for.
     if w.db().engine() == hive_db::Engine::Postgres {
-        println!(
-            "SKIPPED: an_attach_inside_a_transaction_rolls_back_with_it owner files exist only on the sqlite engine"
+        let alice = w.human("alice").await;
+        let tx = w.store.begin().await.unwrap();
+        let alias = attach_owner(&tx, user(alice)).await.unwrap();
+        assert!(
+            tx.attached().is_empty(),
+            "an alias was attached on postgres: {alias}"
+        );
+        query("CREATE TABLE probe (n integer)")
+            .execute(&tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let conn = w.conn().await;
+        assert!(
+            !common::platform_table_exists(&conn, "probe").await,
+            "DDL survived the rollback"
         );
         return;
     }
@@ -225,13 +291,24 @@ async fn an_attach_inside_a_transaction_rolls_back_with_it() {
 #[tokio::test]
 async fn a_file_that_names_another_owner_is_refused() {
     let w = World::new("owner_files_marker").await;
-    // Owner files are the SQLite tenant layer (D39); Postgres has no
-    // attachment and no file (D43 §5), so there is nothing here to assert
-    // against. Said out loud so the gate lists it rather than counts it green.
+    // On Postgres there is no file to carry a marker and no path to rename:
+    // the engine has no file at all (`Db::path` is None there), the two
+    // owners' attaches both succeed with distinct aliases, and nothing is
+    // attached. The marker is the SQLite form of invariant 14's rule; the
+    // Postgres form is the owner digest in the install's schema name, which
+    // `provisioned_tables_land_in_the_owners_file` asserts.
     if w.db().engine() == hive_db::Engine::Postgres {
-        println!(
-            "SKIPPED: a_file_that_names_another_owner_is_refused owner files exist only on the sqlite engine"
+        assert!(
+            w.db().path().is_none(),
+            "the postgres engine reports a file path"
         );
+        let alice = w.human("alice").await;
+        let bob = w.human("bob").await;
+        let conn = w.conn().await;
+        let a = attach_owner(&conn, user(alice)).await.unwrap();
+        let b = attach_owner(&conn, user(bob)).await.unwrap();
+        assert_ne!(a, b);
+        assert!(conn.attached().is_empty());
         return;
     }
     let alice = w.human("alice").await;
@@ -277,15 +354,6 @@ async fn a_grantees_read_attaches_the_owners_file() {
     use hive_wasmhost::{Caller, Request, Storage as _};
 
     let w = World::new("owner_files_grantee").await;
-    // Owner files are the SQLite tenant layer (D39); Postgres has no
-    // attachment and no file (D43 §5), so there is nothing here to assert
-    // against. Said out loud so the gate lists it rather than counts it green.
-    if w.db().engine() == hive_db::Engine::Postgres {
-        println!(
-            "SKIPPED: a_grantees_read_attaches_the_owners_file owner files exist only on the sqlite engine"
-        );
-        return;
-    }
     let alice = w.human("alice").await;
     let bob = w.human("bob").await;
     let by = cred(alice, PrincipalKind::User, alice);
@@ -347,17 +415,25 @@ async fn a_grantees_read_attaches_the_owners_file() {
         .map(|s| Uuid::parse_str(s).unwrap())
         .unwrap();
 
-    // The row is in alice's file, under her prefix.
+    // The row is in alice's file, under her prefix; on Postgres, in the
+    // install's own schema (hive-store's `appschema` doc).
     let conn = w.conn().await;
     let a = attach_owner(&conn, user(alice)).await.unwrap();
-    let n: i64 = query(&format!(
-        "SELECT count(*) FROM {} WHERE id = ?1",
-        hive_store::owner_table(&a, &format!("{}__entries", reg.schema_name))
-    ))
-    .bind(id)
-    .fetch_scalar(&conn)
-    .await
-    .unwrap();
+    let table = match conn.engine() {
+        hive_db::Engine::Sqlite => {
+            hive_store::owner_table(&a, &format!("{}__entries", reg.schema_name))
+        }
+        hive_db::Engine::Postgres => format!(
+            "{}.{}",
+            hive_db::quote_ident(&reg.schema_name),
+            hive_db::quote_ident("entries")
+        ),
+    };
+    let n: i64 = query(&format!("SELECT count(*) FROM {table} WHERE id = ?1"))
+        .bind(id)
+        .fetch_scalar(&conn)
+        .await
+        .unwrap();
     assert_eq!(n, 1, "the document is not in alice's file");
     drop(conn);
 
@@ -378,12 +454,26 @@ async fn a_grantees_read_attaches_the_owners_file() {
         .expect("a grantee could not read");
     let doc: serde_json::Value = serde_json::from_slice(&got.data).unwrap();
     assert_eq!(doc["doc"]["title"], "mine");
-    assert!(
-        !owner_file(
-            &owners_dir(w.db().path().expect("the sqlite engine has a path")),
-            user(bob)
-        )
-        .exists(),
-        "reading alice's document created a file for bob"
-    );
+    // The reader's own tenant space is never created by a read: a file for
+    // bob on SQLite, a schema named for bob's would-be install on Postgres.
+    match w.db().engine() {
+        hive_db::Engine::Sqlite => assert!(
+            !owner_file(
+                &owners_dir(w.db().path().expect("the sqlite engine has a path")),
+                user(bob)
+            )
+            .exists(),
+            "reading alice's document created a file for bob"
+        ),
+        hive_db::Engine::Postgres => {
+            let bobs = hive_manifest::schema_name("journal", "user", &bob.to_string());
+            let n: i64 =
+                query("SELECT count(*) FROM information_schema.schemata WHERE schema_name = ?1")
+                    .bind(&bobs)
+                    .fetch_scalar(&*w.conn().await)
+                    .await
+                    .unwrap();
+            assert_eq!(n, 0, "reading alice's document created a schema for bob");
+        }
+    }
 }

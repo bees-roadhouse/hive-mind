@@ -50,7 +50,7 @@ locally:
 ```bash
 ./scripts/db-up.sh                      # one podman container, pgvector/pgvector:pg17, 127.0.0.1:55434
 export HIVE_SANDBOX_TEST_DATABASE_URL="$(./scripts/db-up.sh --quiet)"
-cargo test -p hive-db -p hive-schema -p hive-testdb -p hive-store
+cargo test -p hive-db -p hive-schema -p hive-testdb -p hive-store -p hive-blob
 podman stop hive-mind-pg-rust           # when you are done
 ```
 

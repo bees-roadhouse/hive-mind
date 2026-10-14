@@ -233,16 +233,20 @@ impl LateEvent {
     }
 }
 
-/// Ported from `TestLateCommitWithALowerIDIsNotSkipped`, and changed by the
-/// engine (D38). The hazard the overlap window exists for is a row that
-/// takes a low id early and commits after a higher one is already visible.
-/// Postgres allows that; this engine has one writer at a time, so a second
-/// append cannot even START until the late transaction ends, and the low id
-/// commits first by construction. The test now proves that ordering rather
-/// than arranging the hazard it rules out: the fast append blocks behind the
-/// late one, lands with the HIGHER id, and both are delivered exactly once.
-/// The overlap window and the dedupe set stay, because a second writer
-/// process (phase 2 of D38) brings the hazard back.
+/// Ported from `TestLateCommitWithALowerIDIsNotSkipped`, and it asks each
+/// engine the question that engine can answer. The hazard the overlap window
+/// exists for is a row that takes a low id early and commits after a higher
+/// one is already visible. Postgres allows that, and there the test arranges
+/// it: the fast append commits with the HIGHER id while the late one still
+/// holds the lower, the tailer delivers the higher one on its own, and the
+/// sweep behind the cursor brings the lower one in afterwards, exactly once.
+/// A naive `WHERE id > last` would have lost it forever (invariant 4).
+/// SQLite has one writer at a time, so a second append cannot even START
+/// until the late transaction ends, and the low id commits first by
+/// construction; there the test proves that ordering instead: the fast
+/// append blocks behind the late one, lands with the HIGHER id, and both are
+/// delivered exactly once. The overlap window and the dedupe set are the
+/// same code on both engines; Postgres is where they earn their keep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lower_id_cannot_commit_late_because_writers_are_serialised() {
     let mut h = Harness::new("bus_late_commit").await;
@@ -265,6 +269,44 @@ async fn a_lower_id_cannot_commit_late_because_writers_are_serialised() {
             ev
         })
     };
+    if h.db().engine() == hive_db::Engine::Postgres {
+        // Two writers at once. The fast append commits while the late
+        // transaction is still open, so the tailer sees the higher id with
+        // the lower one invisible to it.
+        let fast = fast.await.unwrap();
+        let got = collect(&mut sub, 1, Duration::from_secs(5)).await;
+        let ids: Vec<i64> = got.iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![fast.id],
+            "the fast append was not delivered on its own: {ids:?}"
+        );
+        let late_id = late.commit().await;
+        assert!(
+            late_id < fast.id,
+            "the late insert did not take the lower id ({late_id} < {})",
+            fast.id
+        );
+        // The sweep behind the cursor is the only thing that can find it.
+        let got = collect(&mut sub, 1, Duration::from_secs(10)).await;
+        let ids: Vec<i64> = got.iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            vec![late_id],
+            "the late lower id was not swept in after the higher one: {ids:?}"
+        );
+        // And then nothing: the dedupe set keeps the next sweeps from
+        // re-delivering either row. Six polls at this interval.
+        let extra = collect(&mut sub, 1, Duration::from_millis(600)).await;
+        assert!(
+            extra.is_empty(),
+            "re-delivered after the sweep: {:?}",
+            extra.iter().map(|e| e.id).collect::<Vec<_>>()
+        );
+        h.stop().await;
+        return;
+    }
+
     // The fast append is queued behind the open write transaction: nothing
     // reaches the subscriber while the late one is open.
     let got = collect(&mut sub, 1, Duration::from_millis(500)).await;

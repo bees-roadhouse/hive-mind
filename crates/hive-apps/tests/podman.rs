@@ -209,17 +209,17 @@ mod tier {
         );
 
         let c = store.conn().await.unwrap();
-        let live = |c: &hive_db::Conn| async move {
+        async fn live(c: &hive_db::Connection, install_id: Uuid) -> i64 {
             hive_db::query(
                 "SELECT count(*) FROM credentials WHERE install_id = ?1 AND revoked_at IS NULL",
             )
             .bind(install_id)
-            .fetch_scalar::<i64>(&**c)
+            .fetch_scalar::<i64>(c)
             .await
             .unwrap()
-        };
+        }
         assert_eq!(
-            live(&c).await,
+            live(&c, install_id).await,
             1,
             "one live credential while the container runs"
         );
@@ -234,7 +234,11 @@ mod tier {
 
         apps.stop(install_id).await.expect("stop");
         assert!(!container_exists(&name), "the container outlived stop");
-        assert_eq!(live(&c).await, 0, "the credential outlived the container");
+        assert_eq!(
+            live(&c, install_id).await,
+            0,
+            "the credential outlived the container"
+        );
         assert!(!apps.is_running(install_id));
     }
 }

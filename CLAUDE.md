@@ -205,6 +205,7 @@ version.
 
 ```bash
 cargo run -p hive-sandbox -- --data-dir ./data --plain-http   # every role, :7979; creates data/hive.db
+cargo run -p hive-sandbox -- --database-url "$URL" --blob-root ./data/blobs --plain-http   # the same on Postgres (D43); the URL comes from ./scripts/db-up.sh --quiet
 curl localhost:7979/healthz
 
 cargo test -p hive-store --test grants -- --nocapture       # one suite

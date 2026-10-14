@@ -335,8 +335,11 @@ packages/hive-app/     @hive/app, the TypeScript SDK a process app is written ag
                        `bun test` in the sdk CI job
 guest/                 the SDK a WASM guest links against, and the root of the guest workspace
                        (wasm32-wasip1 only; the release profile every guest builds with is here)
-apps/                  first-party guest apps, members of the guest workspace. apps/hello is
-                       the reference one
+apps/                  first-party apps. apps/hello is the reference WASM guest (the frozen
+                       tier, D53 §5); apps/hello-bun is the reference process app on @hive/app
+                       (D53 §3), built by scripts/app-build.sh from docker/app-bun/Containerfile
+                       and run in the container tier. package.json at the root is the Bun
+                       workspace for the process side
 docs/                  per-topic docs (development.md installs the toolchain from nothing);
                        docs/design/ holds the decision snapshots, D24 onward
 test/e2e/              Playwright end-to-end tests that drive a real daemon over HTTP

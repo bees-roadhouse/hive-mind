@@ -42,4 +42,5 @@ test/e2e/.playwright/
 docker/harness/digests.json
 docker/egress/digest.json
 docker/app-test/digest.json
+apps/*/image.json
 

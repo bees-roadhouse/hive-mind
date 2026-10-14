@@ -1,0 +1,34 @@
+{
+  "kind": "app",
+  "name": "hello_bun",
+  "version": 1,
+  "storage": {
+    "collections": [
+      { "name": "notes", "crud": true, "indexes": [] }
+    ]
+  },
+  "functions": [
+    { "name": "add", "doc": "Adds two numbers: {a, b} -> {sum}." },
+    { "name": "whoami", "doc": "Reports who called and what the app can see of its sandbox." },
+    { "name": "remember", "doc": "Writes a note through the host: {title} -> the created document." },
+    { "name": "greet", "doc": "GET /greet/{name}: a greeting." },
+    { "name": "on_note", "doc": "Acknowledges a note event." }
+  ],
+  "tools": [
+    { "name": "add", "function": "add", "description": "Adds two numbers." },
+    { "name": "whoami", "function": "whoami", "description": "Who is calling, as the app sees it." },
+    { "name": "remember", "function": "remember", "description": "Stores a note in the app's own collection." }
+  ],
+  "routes": [
+    { "method": "GET", "path": "/greet/{name}", "function": "greet" }
+  ],
+  "subscriptions": [
+    { "kind": "hello_bun.notes.created", "function": "on_note" }
+  ],
+  "capabilities": [],
+  "process": {
+    "runtime": "bun",
+    "entry": "src/app.ts",
+    "idle_timeout_secs": 300
+  }
+}

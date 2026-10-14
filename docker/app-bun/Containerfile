@@ -1,0 +1,40 @@
+# The image a `runtime: bun` app runs as (D53 §1 and §2, #168 slice 3). One
+# Containerfile for every Bun app: the app's directory is a build argument,
+# the SDK comes from this repository, and the entry the manifest named is
+# read from the environment the launcher sets, so the image controls
+# userland only and nothing about the sandbox (D35 §6's rule, kept).
+#
+# Built by scripts/app-build.sh <app-dir>, which pins the digest into
+# <app-dir>/image.json the way the harness and egress images are pinned.
+#
+# The base is pinned by digest, not tag (D12.5): oven/bun 1.4.3 on alpine,
+# the same Bun the sdk CI job runs the SDK's tests with.
+FROM docker.io/oven/bun@sha256:3cab0e73b1e5f6d4431a03ef7d66e5dc139a41979dccb5672fedcd778df2aeed
+
+ARG APP_DIR
+
+# The workspace: the SDK and the one app, at their workspace paths, so the
+# lockfile the root was installed with is the lockfile here and
+# --frozen-lockfile means what it says. Bun installs each member's
+# dependencies inside that member's directory as links relative to the
+# workspace root (its isolated layout), which is why the app is not moved
+# afterwards: /app is a link to its workspace path, and the links resolve.
+# --production leaves the test tooling out of the image. The build context's
+# own node_modules are kept out by .containerignore.
+WORKDIR /src
+COPY package.json bun.lock ./
+COPY packages/hive-app ./packages/hive-app
+COPY ${APP_DIR} ./${APP_DIR}
+RUN bun install --frozen-lockfile --production \
+    && ln -s "/src/${APP_DIR}" /app
+
+# The app's root, where HIVE_APP_ENTRY is resolved (hive-harness app.rs,
+# CONTAINER_APP_ROOT). Read-only at run time; the socket directory is the
+# only writable mount and /tmp the only scratch.
+WORKDIR /app
+
+# uid 1001 is what the launcher maps (hive-harness podman.rs).
+USER 1001:1001
+
+# The entry comes from the environment, so one image shape serves every app.
+CMD ["sh", "-c", "exec bun run \"/app/${HIVE_APP_ENTRY}\""]

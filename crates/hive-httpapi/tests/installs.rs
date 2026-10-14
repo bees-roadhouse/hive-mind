@@ -5,7 +5,7 @@ mod common;
 
 use common::{Api, Setup, decode, do_req, get, post_json, text};
 use hive_manifest::{Collection, Function, Kind, Manifest, Storage, ToolDef, Use, UseAccess};
-use hive_store::{attach_owner, owner_table};
+use hive_store::attach_owner;
 use sha2::{Digest, Sha256};
 
 const HELLO: &[u8] = include_bytes!("../../hive-wasmhost/testdata/hello.wasm");
@@ -124,9 +124,11 @@ async fn install_a_host_only_app() {
     let alias = attach_owner(&conn, hive_identity::Owner::user(a.root))
         .await
         .unwrap();
+    // The table's name is the engine's (a schema per install on Postgres,
+    // the owner's file on SQLite); the store says which, the test does not.
     let n: i64 = hive_db::query(&format!(
         "SELECT count(*) FROM {}",
-        owner_table(&alias, &format!("{schema}__items"))
+        hive_store::collection_table(conn.engine(), &alias, &schema, "items")
     ))
     .fetch_scalar(&conn)
     .await

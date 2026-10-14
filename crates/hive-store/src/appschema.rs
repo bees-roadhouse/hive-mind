@@ -410,7 +410,10 @@ pub(crate) fn is_virtual(sql: &str) -> bool {
 /// module doc says why they differ): `"<alias>"."<schema>__<collection>"` in
 /// the owner's file on SQLite, `"<schema>"."<collection>"` on Postgres, where
 /// the alias names nothing and is accepted so every caller is written once.
-pub(crate) fn table_name(engine: Engine, alias: &str, schema: &str, collection: &str) -> String {
+/// Public (as `hive_store::collection_table`) for the one reason a caller
+/// outside the store has to name the table: a test reading the catalogue to
+/// prove a collection was provisioned. Nothing outside the store writes it.
+pub fn table_name(engine: Engine, alias: &str, schema: &str, collection: &str) -> String {
     match engine {
         Engine::Sqlite => owner_table(alias, &format!("{schema}__{collection}")),
         Engine::Postgres => format!("{}.{}", quote_ident(schema), quote_ident(collection)),

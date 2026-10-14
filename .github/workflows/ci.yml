@@ -247,7 +247,7 @@ jobs:
       - name: database tests, where a skip is a failure
         run: |
           log=$(mktemp)
-          cargo test -p hive-db -p hive-schema -p hive-testdb -p hive-store -p hive-blob -p hive-chat -p hive-bus -p hive-models -p hive-surfaces -- --nocapture 2>&1 | tee "$log"
+          cargo test -p hive-db -p hive-schema -p hive-testdb -p hive-store -p hive-blob -p hive-chat -p hive-bus -p hive-models -p hive-surfaces -p hive-httpapi -- --nocapture 2>&1 | tee "$log"
           status=${PIPESTATUS[0]}
           if grep -E '^SKIPPED: ' "$log"; then
             echo "a database test skipped in the job that promised a database" >&2

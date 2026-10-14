@@ -43,6 +43,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "model_jobs",
         sql: include_str!("../migrations/0002_model_jobs.sql"),
     },
+    Migration {
+        version: "0003",
+        name: "install_actor",
+        sql: include_str!("../migrations/0003_install_actor.sql"),
+    },
 ];
 
 /// Every Postgres migration this binary carries, in order (D43): the same
@@ -60,6 +65,11 @@ pub const PG_MIGRATIONS: &[Migration] = &[
         version: "0002",
         name: "model_jobs",
         sql: include_str!("../migrations-pg/0002_model_jobs.sql"),
+    },
+    Migration {
+        version: "0003",
+        name: "install_actor",
+        sql: include_str!("../migrations-pg/0003_install_actor.sql"),
     },
 ];
 
@@ -364,7 +374,10 @@ mod tests {
     async fn migration_one_applies_to_a_fresh_file_and_is_idempotent() {
         let (_d, db) = fresh().await;
         let ran = migrate(&db).await.expect("first migrate");
-        assert_eq!(ran, vec!["0001".to_string(), "0002".to_string()]);
+        assert_eq!(
+            ran,
+            vec!["0001".to_string(), "0002".to_string(), "0003".to_string()]
+        );
         let again = migrate(&db).await.expect("second migrate");
         assert!(again.is_empty(), "nothing to apply the second time");
         let c = db.conn().await.unwrap();
@@ -533,7 +546,10 @@ mod tests {
         assert!(matches!(err, MigrateError::AuditMissing(_)), "{err}");
 
         let ran = migrate(s.db()).await.expect("first migrate");
-        assert_eq!(ran, vec!["0001".to_string(), "0002".to_string()]);
+        assert_eq!(
+            ran,
+            vec!["0001".to_string(), "0002".to_string(), "0003".to_string()]
+        );
         let again = migrate(s.db()).await.expect("second migrate");
         assert!(again.is_empty(), "nothing to apply the second time");
         assert!(migrate_audit(s.db()).await.expect("audit check").is_empty());

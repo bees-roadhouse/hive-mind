@@ -35,6 +35,7 @@
 
 mod actors;
 mod agentruns;
+mod appcred;
 mod appdata;
 mod appschema;
 mod bootstrap;
@@ -54,6 +55,10 @@ mod predicate;
 
 pub use actors::{Actor, actor_by_id};
 pub use agentruns::{AgentRunStore, RunWriter, reclaim_abandoned_runs};
+pub use appcred::{
+    INSTALL_CREDENTIAL_LABEL, ensure_install_actor, install_of_actor, install_persona,
+    issue_install_credential, revoke_all_install_credentials, revoke_install_credentials,
+};
 pub use appdata::{AppData, IndexDecl, InstallInfo, resolve_active_install};
 pub use appschema::{apply_schema_plan, drop_schema_plan, table_name as collection_table};
 pub use bootstrap::{BootstrapConfig, BootstrapResult, bootstrap};

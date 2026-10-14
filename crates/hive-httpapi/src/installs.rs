@@ -21,7 +21,8 @@ use hive_httpauth::Authed;
 use hive_manifest::Manifest;
 use hive_registry::prepare;
 use hive_store::{
-    BuildSpec, InstallSpec, StoreError, activate_install, register_build, stage_install,
+    BuildSpec, InstallSpec, StoreError, activate_install, ensure_install_actor, register_build,
+    stage_install,
 };
 use hive_trust::Level;
 use hive_wasmhost::{BytesSource, CapabilitySet, Exports, Module, hash_module};
@@ -287,6 +288,16 @@ pub(crate) async fn install(
         Ok(i) => i,
         Err(e) => return install_failure(&cred, &m.name, "stage", e),
     };
+    // A process app (D53) gets its actor now, in the same transaction and by
+    // the same human: the container will start later with nobody's
+    // credential in scope, so this is the only moment the database's rule
+    // about who may create an AI acting for the owner (D19.2) can be met. A
+    // guest install has no process and gets none.
+    if m.process.is_some()
+        && let Err(e) = ensure_install_actor(&tx, install, &cred).await
+    {
+        return install_failure(&cred, &m.name, "actor", e);
+    }
     if let Err(e) = activate_install(&tx, install, &cred).await {
         return install_failure(&cred, &m.name, "activate", e);
     }
